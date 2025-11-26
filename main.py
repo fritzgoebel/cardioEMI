@@ -374,16 +374,16 @@ if params["save_output"]:
     out_name = params.get("out_name", "").strip().lstrip("_")
 
     # potentials xdmf
-    out_sol = dfx.io.XDMFFile(comm, "output/" + out_name + "/solution.xdmf", "w")
+    out_sol = dfx.io.XDMFFile(comm, out_name + "/solution.xdmf", "w")
     out_sol.write_mesh(mesh)            
         
     # memebrane potential xdmf
-    out_v = dfx.io.XDMFFile(comm, "output/" + out_name + "/v.xdmf" , "w")
+    out_v = dfx.io.XDMFFile(comm, out_name + "/v.xdmf" , "w")
     out_v.write_mesh(mesh)
     out_v.write_function(v, t)
 
     # save subdomain data, needed for parallel visualizaiton
-    with dfx.io.XDMFFile(comm, "output/" + out_name + "/tags.xdmf", "w") as out_tags:                     
+    with dfx.io.XDMFFile(comm, out_name + "/tags.xdmf", "w") as out_tags:                     
         out_tags.write_mesh(mesh)            
         out_tags.write_meshtags(subdomains, mesh.geometry)
         out_tags.write_meshtags(boundaries, mesh.geometry)        
