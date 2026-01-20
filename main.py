@@ -60,6 +60,16 @@ with open(params["tags_dictionary_file"], "rb") as f:
 TAGS   = sorted(membrane_tags.keys())
 N_TAGS = len(TAGS)
 
+# Create facet_tag -> (i, j) mapping for visualization
+# This maps each membrane facet tag to the cell pair it separates
+facet_tag_to_pair = {}
+for i in TAGS:
+    for j in TAGS:
+        if i < j:
+            shared_tags = membrane_tags[i].intersection(membrane_tags[j])
+            for tag in shared_tags:
+                facet_tag_to_pair[tag] = (i, j)
+
 # Read mesh
 with dfx.io.XDMFFile(MPI.COMM_WORLD, mesh_file, 'r') as xdmf:
     # Read mesh and cell tags
@@ -368,26 +378,43 @@ t = 0.0
 if params["save_output"]:
 
     # rename solutions
-    for i in TAGS:        
+    for i in TAGS:
         uh_dict[i].name  = "u_" + str(i)
-    
+
+    # rename vij functions for output
+    for (i, j), vij in vij_dict.items():
+        vij.name = f"v_{i}_{j}"
+
     out_name = params.get("out_name", "").strip().lstrip("_")
 
     # potentials xdmf
     out_sol = dfx.io.XDMFFile(comm, out_name + "/solution.xdmf", "w")
-    out_sol.write_mesh(mesh)            
-        
-    # memebrane potential xdmf
+    out_sol.write_mesh(mesh)
+
+    # membrane potential xdmf (summed, for backwards compatibility)
     out_v = dfx.io.XDMFFile(comm, out_name + "/v.xdmf" , "w")
     out_v.write_mesh(mesh)
     out_v.write_function(v, t)
 
+    # per-membrane voltages xdmf (for accurate visualization)
+    out_vij_dict = {}
+    for (i, j), vij in vij_dict.items():
+        out_vij = dfx.io.XDMFFile(comm, out_name + f"/v_{i}_{j}.xdmf", "w")
+        out_vij.write_mesh(mesh)
+        out_vij.write_function(vij, t)
+        out_vij_dict[(i, j)] = out_vij
+
     # save subdomain data, needed for parallel visualizaiton
-    with dfx.io.XDMFFile(comm, out_name + "/tags.xdmf", "w") as out_tags:                     
-        out_tags.write_mesh(mesh)            
+    with dfx.io.XDMFFile(comm, out_name + "/tags.xdmf", "w") as out_tags:
+        out_tags.write_mesh(mesh)
         out_tags.write_meshtags(subdomains, mesh.geometry)
-        out_tags.write_meshtags(boundaries, mesh.geometry)        
+        out_tags.write_meshtags(boundaries, mesh.geometry)
         out_tags.close()
+
+    # save facet tag to cell pair mapping for visualization
+    if comm.rank == 0:
+        with open(out_name + "/facet_tag_to_pair.pickle", "wb") as f:
+            pickle.dump(facet_tag_to_pair, f)
 
 
 #---------------------------------#
@@ -428,7 +455,7 @@ if comm.rank == 0: print("\n#-----------SOLVE----------#")
 
 for time_step in range(params["time_steps"]):
 
-    if comm.rank == 0: update_status(f'Time stepping: {int(100*time_step/params["time_steps"])}%')
+    if comm.rank == 0: update_status(time_step, params["time_steps"])
 
     # physical time at current step (before advancing)
     t_n = float(time_step) * float(dt)
@@ -554,14 +581,19 @@ for time_step in range(params["time_steps"]):
     solve_time += time.perf_counter() - t1 # Add time lapsed to total solver time
 
     # save xdmf output
-    if params["save_output"] and time_step % params["save_interval"] == 0:               
+    if params["save_output"] and time_step % params["save_interval"] == 0:
         for i in TAGS:
-            out_sol.write_function(uh_dict[i], t)        
+            out_sol.write_function(uh_dict[i], t)
 
         out_v.write_function(v, t)
 
+        # save per-membrane voltages
+        for (i, j), vij in vij_dict.items():
+            out_vij_dict[(i, j)].write_function(vij, t)
 
-if comm.rank == 0: update_status(f'Time stepping: 100%')        
+
+if comm.rank == 0:
+    update_status(100)
 
 #------------------------------#
 #         POST PROCESS         #
@@ -603,12 +635,16 @@ if comm.rank == 0:
     print(f"Total time:       {total_time:.3f} seconds")    
     
 
-if params["save_output"]:    
+if params["save_output"]:
 
     out_sol.close()
     out_v.close()
 
-    if comm.rank == 0: 
-        print("\nSolution saved in output folder")    
+    # close per-membrane voltage files
+    for out_vij in out_vij_dict.values():
+        out_vij.close()
+
+    if comm.rank == 0:
+        print("\nSolution saved in output folder")
         print(f"Total script time (with output): {time.perf_counter() - start_time:.3f} seconds\n")
 

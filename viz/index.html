@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cardiac EMI Simulation Configurator</title>
+    <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <h1>Cardiac EMI Simulation</h1>
+            <p>Configure initial excitation region and run simulation</p>
+        </header>
+
+        <!-- Main content -->
+        <div class="main-content">
+            <!-- 3D Viewer -->
+            <div class="viewer-panel">
+                <div id="viewer-container">
+                    <!-- Colorbar overlay -->
+                    <div id="colorbar">
+                        <div class="colorbar-gradient"></div>
+                        <div class="colorbar-labels">
+                            <span id="colorbar-max">40 mV</span>
+                            <span id="colorbar-mid">-20 mV</span>
+                            <span id="colorbar-min">-80 mV</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="viewer-controls">
+                    <button id="reset-camera">Reset Camera</button>
+                    <label>
+                        <input type="checkbox" id="show-box" checked>
+                        Show Bounding Box
+                    </label>
+                    <label>
+                        <input type="checkbox" id="show-excited" checked>
+                        Highlight Voltage
+                    </label>
+                </div>
+            </div>
+
+            <!-- Control Panel -->
+            <div class="control-panel">
+                <!-- Mesh Selection -->
+                <section class="section">
+                    <h2>Mesh Selection</h2>
+                    <div class="param-row">
+                        <label>Mesh file:</label>
+                        <select id="mesh-selector" class="mesh-dropdown">
+                            <option value="">Loading...</option>
+                        </select>
+                    </div>
+                    <div id="mesh-status" class="mesh-status"></div>
+                    <button id="convert-mesh" class="btn btn-secondary" style="display:none; width: 100%; margin-top: 8px;">
+                        Convert Mesh
+                    </button>
+                    <div id="conversion-progress" class="progress-bar" style="display:none; margin-top: 8px;">
+                        <div class="progress-fill"></div>
+                        <span class="progress-text">0%</span>
+                    </div>
+                </section>
+
+                <!-- Simulation Parameters -->
+                <section class="section">
+                    <h2>Simulation Parameters</h2>
+
+                    <div class="param-row">
+                        <label>Time step (dt):</label>
+                        <input type="number" id="dt" value="0.001" step="0.0001" min="0.0001" max="0.1">
+                        <span class="unit">ms</span>
+                    </div>
+
+                    <div class="param-row">
+                        <label>Number of steps:</label>
+                        <input type="number" id="time-steps" value="1000" step="100" min="10" max="10000">
+                    </div>
+
+                    <div class="param-row">
+                        <label>Total time:</label>
+                        <span id="total-time">1.0</span>
+                        <span class="unit">ms</span>
+                    </div>
+
+                    <div class="param-row">
+                        <label>MPI Ranks:</label>
+                        <input type="number" id="mpi-ranks" value="8" min="1" max="32" step="1">
+                        <span class="unit" id="cpu-info"></span>
+                    </div>
+                </section>
+
+                <!-- Bounding Box Controls -->
+                <section class="section">
+                    <h2>Excitation Bounding Box (um)</h2>
+                    <p class="hint">Region inside box starts depolarized</p>
+
+                    <div class="slider-group">
+                        <label>X Range</label>
+                        <div class="dual-slider">
+                            <input type="range" id="x-min" class="slider">
+                            <input type="range" id="x-max" class="slider">
+                        </div>
+                        <div class="slider-values">
+                            <span id="x-min-val">-62</span> to <span id="x-max-val">15</span> um
+                        </div>
+                    </div>
+
+                    <div class="slider-group">
+                        <label>Y Range</label>
+                        <div class="dual-slider">
+                            <input type="range" id="y-min" class="slider">
+                            <input type="range" id="y-max" class="slider">
+                        </div>
+                        <div class="slider-values">
+                            <span id="y-min-val">-19</span> to <span id="y-max-val">68</span> um
+                        </div>
+                    </div>
+
+                    <div class="slider-group">
+                        <label>Z Range</label>
+                        <div class="dual-slider">
+                            <input type="range" id="z-min" class="slider">
+                            <input type="range" id="z-max" class="slider">
+                        </div>
+                        <div class="slider-values">
+                            <span id="z-min-val">-20</span> to <span id="z-max-val">118</span> um
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Excitation Strength -->
+                <section class="section">
+                    <h2>Initial Voltage (mV)</h2>
+
+                    <div class="slider-group">
+                        <label>Excited region: <span id="v-excited-val">0</span> mV</label>
+                        <input type="range" id="v-excited" class="slider" min="-40" max="40" value="0" step="1">
+                    </div>
+
+                    <div class="slider-group">
+                        <label>Resting region: <span id="v-resting-val">-80</span> mV</label>
+                        <input type="range" id="v-resting" class="slider" min="-100" max="-40" value="-80" step="1">
+                    </div>
+                </section>
+
+                <!-- Generated Expression Preview -->
+                <section class="section">
+                    <h2>Generated v_init Expression</h2>
+                    <pre id="v-init-preview" class="code-preview"></pre>
+                </section>
+
+                <!-- Actions -->
+                <section class="section actions">
+                    <button id="run-simulation" class="btn btn-success">
+                        Run Simulation
+                    </button>
+                </section>
+
+                <!-- Simulation Output -->
+                <section class="section">
+                    <h2>Simulation Output</h2>
+                    <div id="simulation-status" class="status"></div>
+                    <pre id="simulation-output" class="output-console"></pre>
+                </section>
+
+                <!-- Results Visualization -->
+                <section class="section" id="results-section">
+                    <h2>Results Visualization</h2>
+                    <div class="param-row">
+                        <label>Simulation:</label>
+                        <select id="simulation-selector" class="mesh-dropdown">
+                            <option value="">Select simulation...</option>
+                        </select>
+                    </div>
+                    <div class="param-row">
+                        <label>Time:</label>
+                        <input type="range" id="result-time" class="slider" min="0" max="100" value="0">
+                        <span id="result-time-val">0.0</span>
+                        <span class="unit">ms</span>
+                    </div>
+                    <div class="param-row">
+                        <label>V range:</label>
+                        <span id="v-min-result">-80</span> to <span id="v-max-result">40</span> mV
+                    </div>
+                    <button id="load-results" class="btn btn-primary" style="width: 100%;">
+                        Load Results
+                    </button>
+                    <div id="results-status" class="mesh-status" style="display:none;"></div>
+                </section>
+
+                <!-- Video Export -->
+                <section class="section" id="video-export-section">
+                    <h2>Video Export</h2>
+                    <div class="param-row">
+                        <label>Resolution:</label>
+                        <select id="video-resolution" class="mesh-dropdown">
+                            <option value="1280x720">720p (1280x720)</option>
+                            <option value="1920x1080" selected>1080p (1920x1080)</option>
+                            <option value="2560x1440">1440p (2560x1440)</option>
+                        </select>
+                    </div>
+                    <div class="param-row">
+                        <label>Frame rate:</label>
+                        <input type="number" id="video-fps" value="30" min="10" max="60" step="5">
+                        <span class="unit">fps</span>
+                    </div>
+                    <button id="export-video" class="btn btn-primary" style="width: 100%;">
+                        Export Video
+                    </button>
+                    <div id="video-progress" class="progress-bar" style="display:none; margin-top: 8px;">
+                        <div class="progress-fill"></div>
+                        <span class="progress-text">0%</span>
+                    </div>
+                    <div id="video-status" class="mesh-status" style="display:none;"></div>
+                    <a id="video-download" href="#" class="btn btn-success" style="display:none; width: 100%; text-align: center; margin-top: 8px; text-decoration: none;">
+                        Download Video
+                    </a>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <!-- Three.js from CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+    <!-- Application -->
+    <script src="js/mesh-loader.js"></script>
+    <script src="js/viewer.js"></script>
+    <script src="js/config-manager.js"></script>
+    <script src="js/simulation-runner.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>

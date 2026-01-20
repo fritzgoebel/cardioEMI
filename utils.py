@@ -249,8 +249,23 @@ def read_input_file(input_yml_file):
         return input_parameters
      
 
-def update_status(message):
-    sys.stdout.write(f'\r{message}')
+def update_status(progress, total=None, width=40):
+    """Display a progress bar in the terminal.
+
+    Args:
+        progress: Current progress value (0-100 if total is None, otherwise current step)
+        total: Total number of steps (optional, if provided progress is treated as current step)
+        width: Width of the progress bar in characters
+    """
+    if total is not None:
+        percent = int(100 * progress / total)
+    else:
+        percent = int(progress)
+
+    filled = int(width * percent / 100)
+    bar = '█' * filled + '░' * (width - filled)
+    # Output with newline so it gets flushed, use special prefix for frontend detection
+    sys.stdout.write(f'PROGRESS:{percent}:[{bar}] {percent:3d}%\n')
     sys.stdout.flush()
 
 
