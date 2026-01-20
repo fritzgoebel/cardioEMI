@@ -29,12 +29,44 @@ To install dependencies:
 pip install --no-build-isolation -r requirements.txt
 ```
 
-### Testing the installation
+### Running a Simulation
 
 ```
-mpirun -n 1 python3 -u main.py input.yml
+mpirun -n 8 python3 -u main.py input.yml
 ```
-modifying `input.yml` for different input data. Parallel execution can be obtain with `mpirun -n X`.
+Modify `input.yml` for different input data. Parallel execution with `mpirun -n X`.
+
+### Web Visualization Tool
+
+A web-based interface for configuring and running simulations with 3D visualization.
+
+**Start the server:**
+```bash
+cd viz
+pip install flask h5py numpy scipy pyvista "imageio[ffmpeg]" Pillow
+python server.py
+```
+
+**Open in browser:** http://localhost:8000
+
+**Features:**
+- 3D membrane mesh visualization (Three.js)
+- Bounding box selection for excitation region
+- Configurable simulation parameters (dt, time_steps, voltage)
+- Live simulation output with progress bar
+- Results visualization with time slider
+- Video export of simulation results
+- Mesh file browser and converter
+
+### Mesh Conversion
+
+Convert pts/elem format meshes to XDMF with optional graph coloring optimization:
+
+```bash
+python geometry/convert_pts_elem.py input.pts input.elem output.xdmf --colored
+```
+
+Graph coloring reduces the number of volume tags by grouping non-adjacent cells, significantly improving assembly performance (up to 38x speedup observed).
 
 ### Geometry and tagging
 In the input .yml file two input files have to be provided:
@@ -53,6 +85,31 @@ python3 create_square_mesh.py
 ```
 in *create_square_mesh.py* geometric settings (#elements and #cells) can be modified.
 
+### Experimental: Ginkgo Backend
+
+An experimental GPU-accelerated solver backend using [Ginkgo](https://ginkgo-project.github.io/) is available in `dolfinx-ginkgo/`.
+
+**Features:**
+- Distributed matrix/vector conversion from PETSc to Ginkgo
+- Krylov solvers: CG, FCG, GMRES, BiCGSTAB, CGS
+- Preconditioners: Jacobi, Block Jacobi, ILU, IC, ISAI, AMG
+- GPU backends: CUDA, HIP, SYCL, OpenMP
+
+**Build the Docker image:**
+```bash
+cd dolfinx-ginkgo
+docker build -t dolfinx-ginkgo:latest .
+```
+
+**Run tests:**
+```bash
+docker run --rm -v "$(pwd):/home/fenics/dolfinx-ginkgo" \
+  -w /home/fenics/dolfinx-ginkgo/build dolfinx-ginkgo:latest \
+  mpirun -n 2 ./tests/test_solver
+```
+
+See `docs/GINKGO_INTEGRATION_DESIGN.md` for the full design document.
+
 ###  Visualize output in Paraview
 In Paraview `File > Load State...` of `output/bulk_state.pvsm`, selecting the correct path in *Load State Options*, to visualise the bulk potential evolution.
 
@@ -63,6 +120,7 @@ Similarly with `output/membrane_state.pvsm` to visualise ECS-ICS membrane potent
 * Pietro Benedusi
 * Edoardo Centofanti
 * Joshua Steyer
+* Fritz Goebel
 
 ### Cite
 ```
