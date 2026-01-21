@@ -213,86 +213,68 @@ private:
         }
     }
 
-    /// Build AMG preconditioner factory
+    /// Build AMG preconditioner factory for distributed matrices
+    /// Based on Ginkgo's distributed-multigrid-preconditioned-solver example
     std::shared_ptr<gko::LinOpFactory> build_amg_factory() {
         const auto& amg_cfg = config_.amg;
 
-        // Build PGM coarsening factory
-        auto pgm_factory = gko::multigrid::Pgm<ValueType, LocalIndexType>::build()
-            .with_deterministic(amg_cfg.deterministic)
-            .on(exec_);
-
-        // Build smoother factory
-        std::shared_ptr<gko::LinOpFactory> smoother_factory;
+        // Build local smoother factory (wrapped in Schwarz for distributed)
+        std::shared_ptr<gko::LinOpFactory> schwarz_smoother;
         switch (amg_cfg.smoother) {
             case AMGConfig::Smoother::JACOBI: {
-                auto jacobi = gko::preconditioner::Jacobi<ValueType, LocalIndexType>::build()
-                    .with_max_block_size(1u)
-                    .on(exec_);
-                smoother_factory = gko::solver::Ir<ValueType>::build()
-                    .with_solver(std::move(jacobi))
-                    .with_relaxation_factor(amg_cfg.relaxation_factor)
-                    .with_criteria(gko::stop::Iteration::build()
-                        .with_max_iters(static_cast<gko::size_type>(amg_cfg.pre_smooth_steps))
-                        .on(exec_))
-                    .on(exec_);
+                schwarz_smoother = gko::share(schwarz_type::build()
+                    .with_local_solver(
+                        gko::preconditioner::Jacobi<ValueType, LocalIndexType>::build()
+                            .with_max_block_size(1u))
+                    .on(exec_));
                 break;
             }
             case AMGConfig::Smoother::GAUSS_SEIDEL: {
-                // Gauss-Seidel approximated via lower triangular solve
-                smoother_factory = gko::solver::LowerTrs<ValueType, LocalIndexType>::build()
-                    .on(exec_);
+                schwarz_smoother = gko::share(schwarz_type::build()
+                    .with_local_solver(
+                        gko::solver::LowerTrs<ValueType, LocalIndexType>::build())
+                    .on(exec_));
                 break;
             }
             case AMGConfig::Smoother::ILU: {
-                auto ilu = gko::factorization::ParIlu<ValueType, LocalIndexType>::build()
-                    .on(exec_);
-                smoother_factory = gko::solver::Ir<ValueType>::build()
-                    .with_solver(std::move(ilu))
-                    .with_criteria(gko::stop::Iteration::build()
-                        .with_max_iters(static_cast<gko::size_type>(amg_cfg.pre_smooth_steps))
-                        .on(exec_))
-                    .on(exec_);
+                schwarz_smoother = gko::share(schwarz_type::build()
+                    .with_local_solver(
+                        gko::factorization::ParIlu<ValueType, LocalIndexType>::build())
+                    .on(exec_));
                 break;
             }
         }
 
-        // Build coarse solver factory
+        // Use build_smoother helper for proper smoother setup
+        auto smoother_factory = gko::share(gko::solver::build_smoother(
+            schwarz_smoother,
+            static_cast<gko::size_type>(amg_cfg.pre_smooth_steps),
+            static_cast<ValueType>(amg_cfg.relaxation_factor)));
+
+        // Build coarse solver factory - must work with distributed matrices
+        // Direct solvers don't work, so we use iterative solvers with limited iterations
         std::shared_ptr<gko::LinOpFactory> coarse_factory;
         switch (amg_cfg.coarse_solver) {
-            case AMGConfig::CoarseSolver::DIRECT: {
-                coarse_factory = gko::experimental::solver::Direct<ValueType, LocalIndexType>::build()
-                    .with_factorization(
-                        gko::experimental::factorization::Lu<ValueType, LocalIndexType>::build()
-                            .on(exec_))
-                    .on(exec_);
-                break;
-            }
+            case AMGConfig::CoarseSolver::DIRECT:
+                // Direct solver not supported for distributed - fall back to CG
+                [[fallthrough]];
             case AMGConfig::CoarseSolver::CG: {
-                coarse_factory = gko::solver::Cg<ValueType>::build()
+                coarse_factory = gko::share(gko::solver::Cg<ValueType>::build()
                     .with_criteria(
                         gko::stop::Iteration::build()
                             .with_max_iters(static_cast<gko::size_type>(amg_cfg.coarse_max_iterations))
-                            .on(exec_),
-                        gko::stop::ResidualNorm<ValueType>::build()
-                            .with_baseline(gko::stop::mode::rhs_norm)
-                            .with_reduction_factor(amg_cfg.coarse_tolerance)
                             .on(exec_))
-                    .on(exec_);
+                    .on(exec_));
                 break;
             }
             case AMGConfig::CoarseSolver::GMRES: {
-                coarse_factory = gko::solver::Gmres<ValueType>::build()
+                coarse_factory = gko::share(gko::solver::Gmres<ValueType>::build()
                     .with_krylov_dim(30u)
                     .with_criteria(
                         gko::stop::Iteration::build()
                             .with_max_iters(static_cast<gko::size_type>(amg_cfg.coarse_max_iterations))
-                            .on(exec_),
-                        gko::stop::ResidualNorm<ValueType>::build()
-                            .with_baseline(gko::stop::mode::rhs_norm)
-                            .with_reduction_factor(amg_cfg.coarse_tolerance)
                             .on(exec_))
-                    .on(exec_);
+                    .on(exec_));
                 break;
             }
         }
@@ -312,14 +294,18 @@ private:
         }
 
         // Build multigrid factory
+        // When used as preconditioner, typically run 1 iteration
         return gko::solver::Multigrid::build()
-            .with_mg_level(std::move(pgm_factory))
+            .with_mg_level(gko::multigrid::Pgm<ValueType, LocalIndexType>::build()
+                .with_deterministic(amg_cfg.deterministic))
             .with_pre_smoother(smoother_factory)
-            .with_post_smoother(smoother_factory)
             .with_coarsest_solver(coarse_factory)
             .with_max_levels(static_cast<gko::size_type>(amg_cfg.max_levels))
             .with_min_coarse_rows(static_cast<gko::size_type>(amg_cfg.min_coarse_rows))
             .with_cycle(cycle_type)
+            .with_criteria(gko::stop::Iteration::build()
+                .with_max_iters(1u)
+                .on(exec_))
             .on(exec_);
     }
 

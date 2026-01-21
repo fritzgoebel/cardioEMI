@@ -38,7 +38,7 @@ template<typename LocalIndexType = std::int32_t,
          typename GlobalIndexType = std::int64_t>
 std::shared_ptr<gko_dist::Partition<LocalIndexType, GlobalIndexType>>
 create_partition_from_index_map(
-    std::shared_ptr<gko::Executor> exec,
+    std::shared_ptr<const gko::Executor> exec,
     std::shared_ptr<gko::experimental::mpi::communicator> gko_comm,
     const dolfinx::common::IndexMap& index_map)
 {
@@ -96,7 +96,7 @@ template<typename LocalIndexType = std::int32_t,
          typename GlobalIndexType = std::int64_t>
 std::shared_ptr<gko_dist::Partition<LocalIndexType, GlobalIndexType>>
 create_partition_from_ranges(
-    std::shared_ptr<gko::Executor> exec,
+    std::shared_ptr<const gko::Executor> exec,
     const std::vector<GlobalIndexType>& ranges)
 {
     auto ranges_array = gko::array<GlobalIndexType>::view(
@@ -125,7 +125,7 @@ template<typename LocalIndexType = std::int32_t,
          typename GlobalIndexType = std::int64_t>
 std::shared_ptr<gko_dist::Partition<LocalIndexType, GlobalIndexType>>
 create_uniform_partition(
-    std::shared_ptr<gko::Executor> exec,
+    std::shared_ptr<const gko::Executor> exec,
     std::shared_ptr<gko::experimental::mpi::communicator> gko_comm,
     GlobalIndexType global_size)
 {

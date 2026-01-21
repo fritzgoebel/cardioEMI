@@ -202,9 +202,9 @@ create_distributed_matrix_from_csr(
 
 /// Update values of an existing Ginkgo distributed matrix from PETSc
 ///
-/// This is more efficient than recreating the matrix when only values change
-/// (same sparsity pattern). Useful in time-stepping where the matrix structure
-/// is fixed but values are updated.
+/// This re-reads the matrix data from PETSc. For time-stepping where the
+/// matrix structure is fixed but values change, consider caching the partition
+/// to avoid re-computing it.
 ///
 /// @tparam ValueType Matrix value type
 /// @tparam LocalIndexType Local index type
@@ -213,8 +213,7 @@ create_distributed_matrix_from_csr(
 /// @param gko_mat Ginkgo distributed matrix to update
 /// @param petsc_mat Source PETSc matrix with new values
 ///
-/// @note The sparsity pattern must match exactly. This function does not
-///       verify pattern compatibility.
+/// @note The sparsity pattern must match for correct results.
 template<typename ValueType = double,
          typename LocalIndexType = std::int32_t,
          typename GlobalIndexType = std::int64_t>
@@ -222,20 +221,49 @@ void update_matrix_values_from_petsc(
     std::shared_ptr<gko_dist::Matrix<ValueType, LocalIndexType, GlobalIndexType>> gko_mat,
     Mat petsc_mat)
 {
-    // Extract CSR data
+    using partition_type = gko_dist::Partition<LocalIndexType, GlobalIndexType>;
+
+    auto exec = gko_mat->get_executor();
+    auto gko_comm = std::make_shared<gko::experimental::mpi::communicator>(
+        gko_mat->get_communicator());
+
+    MPI_Comm comm = gko_comm->get();
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+
+    // Extract CSR data from PETSc matrix
     auto csr_data = extract_petsc_csr<ValueType, LocalIndexType, GlobalIndexType>(petsc_mat);
 
-    // Get the local matrix from the distributed matrix
-    auto local_mat = gko_mat->get_local_matrix();
-    auto exec = gko_mat->get_executor();
+    // Build partition from row distribution
+    std::vector<GlobalIndexType> ranges(size + 1);
+    GlobalIndexType my_row_start = csr_data.row_start;
+    MPI_Allgather(&my_row_start, 1, MPI_INT64_T,
+                  ranges.data(), 1, MPI_INT64_T, comm);
+    ranges[size] = csr_data.global_rows;
 
-    // Update values array
-    // Note: This assumes the sparsity pattern hasn't changed
-    auto values_view = local_mat->get_values();
-    exec->copy_from(exec->get_master(),
-                    csr_data.values.size(),
-                    csr_data.values.data(),
-                    values_view);
+    auto row_partition = create_partition_from_ranges<LocalIndexType, GlobalIndexType>(
+        exec->get_master(), ranges
+    );
+    auto col_partition = row_partition;
+
+    // Convert to COO/matrix_data format
+    size_t nnz = csr_data.values.size();
+    gko::matrix_data<ValueType, GlobalIndexType> mat_data{
+        gko::dim<2>{static_cast<size_t>(csr_data.global_rows),
+                   static_cast<size_t>(csr_data.global_cols)}
+    };
+    mat_data.nonzeros.reserve(nnz);
+
+    for (LocalIndexType local_row = 0; local_row < csr_data.local_rows; ++local_row) {
+        GlobalIndexType global_row = csr_data.row_start + local_row;
+        for (LocalIndexType j = csr_data.row_ptrs[local_row]; j < csr_data.row_ptrs[local_row + 1]; ++j) {
+            mat_data.nonzeros.emplace_back(global_row, csr_data.col_idxs[j], csr_data.values[j]);
+        }
+    }
+
+    // Re-read the matrix data
+    gko_mat->read_distributed(mat_data, row_partition, col_partition);
 }
 
 } // namespace dolfinx_ginkgo

@@ -79,11 +79,39 @@ if(DOLFINX_GINKGO_BUILD_PYTHON)
         list(APPEND CMAKE_PREFIX_PATH "${nanobind_ROOT}")
         find_package(nanobind CONFIG REQUIRED)
 
+        # Find petsc4py include directory
+        execute_process(
+            COMMAND "${Python_EXECUTABLE}" -c "import petsc4py; print(petsc4py.get_include())"
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            OUTPUT_VARIABLE PETSC4PY_INCLUDE_DIR
+            RESULT_VARIABLE PETSC4PY_RESULT
+        )
+        if(NOT PETSC4PY_RESULT EQUAL 0)
+            message(FATAL_ERROR "petsc4py not found. Install with: pip install petsc4py")
+        endif()
+        message(STATUS "petsc4py include: ${PETSC4PY_INCLUDE_DIR}")
+
+        # Find mpi4py include directory
+        execute_process(
+            COMMAND "${Python_EXECUTABLE}" -c "import mpi4py; print(mpi4py.get_include())"
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            OUTPUT_VARIABLE MPI4PY_INCLUDE_DIR
+            RESULT_VARIABLE MPI4PY_RESULT
+        )
+        if(NOT MPI4PY_RESULT EQUAL 0)
+            message(FATAL_ERROR "mpi4py not found. Install with: pip install mpi4py")
+        endif()
+        message(STATUS "mpi4py include: ${MPI4PY_INCLUDE_DIR}")
+
         nanobind_add_module(_cpp
             python/dolfinx_ginkgo/_cpp.cpp
         )
 
         target_link_libraries(_cpp PRIVATE dolfinx_ginkgo)
+        target_include_directories(_cpp PRIVATE
+            ${PETSC4PY_INCLUDE_DIR}
+            ${MPI4PY_INCLUDE_DIR}
+        )
 
         install(TARGETS _cpp LIBRARY DESTINATION dolfinx_ginkgo)
     else()

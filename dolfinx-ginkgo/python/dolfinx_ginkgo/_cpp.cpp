@@ -18,6 +18,12 @@
 namespace nb = nanobind;
 using namespace dolfinx_ginkgo;
 
+// Type aliases for commonly used Ginkgo types
+using GkoExecutor = gko::Executor;
+using GkoCommunicator = gko::experimental::mpi::communicator;
+using GkoDistMatrix = gko_dist::Matrix<double, std::int32_t, std::int64_t>;
+using GkoDistVector = gko_dist::Vector<double>;
+
 // Helper to convert mpi4py communicator to MPI_Comm
 MPI_Comm get_mpi_comm(nb::object comm_obj) {
     PyObject* py_comm = comm_obj.ptr();
@@ -95,6 +101,24 @@ NB_MODULE(_cpp, m) {
         .value("ISAI", PreconditionerType::ISAI, "Approximate sparse inverse")
         .value("AMG", PreconditionerType::AMG, "Algebraic multigrid")
         .export_values();
+
+    // =========================================================================
+    // Ginkgo Type Wrappers (opaque handles)
+    // =========================================================================
+
+    // These are opaque handles - users don't interact with them directly,
+    // they just pass them to functions. nanobind handles shared_ptr automatically.
+    nb::class_<GkoExecutor>(m, "Executor",
+        "Ginkgo executor (opaque handle)");
+
+    nb::class_<GkoCommunicator>(m, "Communicator",
+        "Ginkgo MPI communicator (opaque handle)");
+
+    nb::class_<GkoDistMatrix>(m, "DistributedMatrix",
+        "Ginkgo distributed matrix (opaque handle)");
+
+    nb::class_<GkoDistVector>(m, "DistributedVector",
+        "Ginkgo distributed vector (opaque handle)");
 
     // =========================================================================
     // AMG Configuration
