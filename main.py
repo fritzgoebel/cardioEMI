@@ -14,6 +14,29 @@ from petsc4py import PETSc
 from utils             import *
 from ionic_model       import *
 
+# Optional Ginkgo solver backend
+try:
+    import sys
+    sys.path.insert(0, 'dolfinx-ginkgo/python')
+    sys.path.insert(0, 'dolfinx-ginkgo/build')
+    # Import _cpp directly from build directory
+    import importlib.util
+    import glob
+    _cpp_modules = glob.glob('dolfinx-ginkgo/build/_cpp*.so')
+    if _cpp_modules:
+        spec = importlib.util.spec_from_file_location("_cpp", _cpp_modules[0])
+        _cpp = importlib.util.module_from_spec(spec)
+        sys.modules["dolfinx_ginkgo._cpp"] = _cpp
+        spec.loader.exec_module(_cpp)
+        import dolfinx_ginkgo
+        dolfinx_ginkgo._cpp = _cpp
+        from dolfinx_ginkgo import GinkgoSolver
+        GINKGO_AVAILABLE = True
+    else:
+        GINKGO_AVAILABLE = False
+except ImportError:
+    GINKGO_AVAILABLE = False
+
 # Options for the fenicsx form compiler optimization
 cache_dir       = f"{str(Path.cwd())}/.cache"
 compile_options = ["-Ofast","-march=native"]
@@ -346,30 +369,79 @@ if not Dirichletbc:
 #      CONFIGURE SOLVER           #
 #---------------------------------#
 
-# Configure solver
-ksp = PETSc.KSP().create(comm)
-ksp.setOperators(A)
+# Check solver backend
+solver_backend = params.get("solver_backend", "petsc").lower()
+use_ginkgo = solver_backend == "ginkgo" and GINKGO_AVAILABLE
 
-# Set solver
-ksp.setType(params["ksp_type"])
-ksp.getPC().setType(params["pc_type"])
-if params['pc_type'] == "lu":
-    ksp.getPC().setFactorSolverType("mumps")
-opts = PETSc.Options()
+if use_ginkgo:
+    if comm.rank == 0:
+        print(f"Using Ginkgo solver backend")
 
-if params["verbose"]:
-    opts.setValue('ksp_view', None)
-    opts.setValue('ksp_monitor_true_residual', None)
+    # Get Ginkgo-specific configuration
+    ginkgo_cfg = params.get("ginkgo", {})
+    gko_backend = ginkgo_cfg.get("backend", "omp")
+    gko_solver = ginkgo_cfg.get("solver", "cg")
+    gko_precond = ginkgo_cfg.get("preconditioner", "jacobi")
+    gko_rtol = float(ginkgo_cfg.get("rtol", params.get("ksp_rtol", 1e-8)))
+    gko_atol = float(ginkgo_cfg.get("atol", params.get("ksp_atol", 1e-12)))
+    gko_max_iter = int(ginkgo_cfg.get("max_iterations", 1000))
 
-# for iterative solvers set tolerance
-if params['pc_type'] != "lu" and params['ksp_type'] != "preonly":
-    opts.setValue('ksp_rtol', params["ksp_rtol"])
-    opts.setValue('ksp_converged_reason', None)
+    # AMG configuration
+    amg_config = None
+    if gko_precond == "amg":
+        amg_cfg = ginkgo_cfg.get("amg", {})
+        amg_config = {
+            "max_levels": int(amg_cfg.get("max_levels", 10)),
+            "cycle": amg_cfg.get("cycle", "v"),
+            "smoother": amg_cfg.get("smoother", "jacobi"),
+            "relaxation_factor": float(amg_cfg.get("relaxation_factor", 0.9)),
+        }
 
-if params['pc_type'] == "hypre" and mesh.geometry.dim == 3:
-    opts.setValue('pc_hypre_boomeramg_strong_threshold', 0.7)
+    # Create Ginkgo solver
+    ginkgo_solver = GinkgoSolver(
+        A,
+        comm=comm,
+        backend=gko_backend,
+        solver=gko_solver,
+        preconditioner=gko_precond,
+        rtol=gko_rtol,
+        atol=gko_atol,
+        max_iter=gko_max_iter,
+        amg_config=amg_config,
+        verbose=params.get("verbose", False)
+    )
+    ksp = None  # Not using PETSc KSP
+else:
+    if comm.rank == 0:
+        print(f"Using PETSc solver backend")
 
-ksp.setFromOptions()
+    # Configure PETSc solver
+    ksp = PETSc.KSP().create(comm)
+    ksp.setOperators(A)
+
+    # Set solver
+    ksp.setType(params["ksp_type"])
+    ksp.getPC().setType(params["pc_type"])
+    if params['pc_type'] == "lu":
+        ksp.getPC().setFactorSolverType("mumps")
+    opts = PETSc.Options()
+
+    if params["verbose"]:
+        opts.setValue('ksp_view', None)
+        opts.setValue('ksp_monitor_true_residual', None)
+
+    # for iterative solvers set tolerance
+    if params['pc_type'] != "lu" and params['ksp_type'] != "preonly":
+        opts.setValue('ksp_rtol', params.get("ksp_rtol", 1e-8))
+        opts.setValue('ksp_atol', params.get("ksp_atol", 1e-12))
+        # Note: ksp_converged_reason removed to avoid interfering with progress bar
+        # Iteration counts are now tracked separately via ITERATIONS output
+
+    if params['pc_type'] == "hypre" and mesh.geometry.dim == 3:
+        opts.setValue('pc_hypre_boomeramg_strong_threshold', 0.7)
+
+    ksp.setFromOptions()
+    ginkgo_solver = None  # Not using Ginkgo
 
 # intial time
 t = 0.0
@@ -416,6 +488,43 @@ if params["save_output"]:
         with open(out_name + "/facet_tag_to_pair.pickle", "wb") as f:
             pickle.dump(facet_tag_to_pair, f)
 
+    # Save MPI rank ownership for each DOF (for partition visualization)
+    # Each rank computes which DOFs it owns and gathers to rank 0
+    imap = V.dofmap.index_map
+    num_local_owned = imap.size_local  # Number of DOFs owned by this rank (not ghosts)
+    first_global = imap.local_range[0]
+
+    # Create array of (global_dof_index, rank) pairs for owned DOFs only
+    local_dof_ranks = np.column_stack([
+        np.arange(first_global, first_global + num_local_owned, dtype=np.int64),
+        np.full(num_local_owned, comm.rank, dtype=np.int32)
+    ])
+
+    # Gather all rank ownership info to rank 0
+    all_dof_ranks = comm.gather(local_dof_ranks, root=0)
+
+    if comm.rank == 0:
+        # Combine all arrays
+        all_dof_ranks = np.vstack(all_dof_ranks)
+        # Sort by global DOF index
+        sorted_indices = np.argsort(all_dof_ranks[:, 0])
+        all_dof_ranks = all_dof_ranks[sorted_indices]
+
+        # Create a simple array: dof_ranks[global_dof] = rank
+        global_size = imap.size_global
+        dof_ranks = np.zeros(global_size, dtype=np.int32)
+        for global_dof, rank in all_dof_ranks:
+            dof_ranks[int(global_dof)] = int(rank)
+
+        # Save rank ownership
+        with open(out_name + "/dof_ranks.pickle", "wb") as f:
+            pickle.dump({
+                'ranks': dof_ranks,
+                'num_ranks': comm.size,
+                'global_size': global_size
+            }, f)
+        print(f"Saved DOF rank ownership ({global_size} DOFs, {comm.size} ranks)")
+
 
 #---------------------------------#
 #        STIMULUS SETUP           #
@@ -449,6 +558,8 @@ I_ion = {}
 
 # init auxiliary data structures
 ksp_iterations = []
+residual_abs = []  # Absolute residual norms
+residual_rel = []  # Relative residual norms (||r|| / ||b||)
 #I_ion = dict()
 
 if comm.rank == 0: print("\n#-----------SOLVE----------#")
@@ -549,10 +660,29 @@ for time_step in range(params["time_steps"]):
     
     # Solve the system
     t1 = time.perf_counter() # Timestamp for solver time-lapse
-    ksp.solve(b, sol_vec)
 
-    # store iterisons 
-    ksp_iterations.append(ksp.getIterationNumber())
+    # Get RHS norm for relative residual calculation
+    b_norm = b.norm()
+
+    if use_ginkgo:
+        ginkgo_solver.solve(b, sol_vec)
+        ksp_iterations.append(ginkgo_solver.iterations)
+        res_abs = ginkgo_solver.residual_norm
+    else:
+        ksp.solve(b, sol_vec)
+        ksp_iterations.append(ksp.getIterationNumber())
+        res_abs = ksp.getResidualNorm()
+
+    # Compute relative residual
+    res_rel = res_abs / b_norm if b_norm > 0 else res_abs
+    residual_abs.append(res_abs)
+    residual_rel.append(res_rel)
+
+    # Output iteration count and residuals for real-time plotting (filtered by server)
+    if comm.rank == 0:
+        sys.stdout.write(f"ITERATIONS:{time_step}:{ksp_iterations[-1]}\n")
+        sys.stdout.write(f"RESIDUAL:{time_step}:{res_abs:.6e}:{res_rel:.6e}\n")
+        sys.stdout.flush()
 
     # Update ghost values
     sol_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
@@ -614,10 +744,22 @@ if comm.rank == 0:
     print("time steps   =", params["time_steps"])
     print("T            =", dt * params["time_steps"])
     print("P (FE order) =", params["P"])
-    print("ksp_type     =", params["ksp_type"])
-    print("pc_type      =", params["pc_type"] )
+    print("Solver backend =", "ginkgo" if use_ginkgo else "petsc")
+    if use_ginkgo:
+        ginkgo_cfg = params.get("ginkgo", {})
+        print("ginkgo solver =", ginkgo_cfg.get("solver", "cg"))
+        print("ginkgo precond =", ginkgo_cfg.get("preconditioner", "jacobi"))
+    else:
+        print("ksp_type     =", params["ksp_type"])
+        print("pc_type      =", params["pc_type"] )
     print("Global #DoFs =", b.getSize())
-    print("Average KSP iterations =", sum(ksp_iterations)/len(ksp_iterations))
+    print("Average iterations =", sum(ksp_iterations)/len(ksp_iterations))
+
+    # Save iterations and residuals to file for visualization
+    with open(out_name + "/iterations.pickle", "wb") as f:
+        pickle.dump(ksp_iterations, f)
+    with open(out_name + "/residuals.pickle", "wb") as f:
+        pickle.dump({'abs': residual_abs, 'rel': residual_rel}, f)
     
     if isinstance(params["ionic_model"], dict):
         print("Ionic models:")

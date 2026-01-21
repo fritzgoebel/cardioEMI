@@ -1,6 +1,7 @@
 # Outptut data
 output/*.h5
 output/*.xdmf
+viz/data/
 
 # input file for tests
 input_test.yml

@@ -8,6 +8,8 @@ class Viewer {
         this.renderer = null;
         this.controls = null;
         this.meshObject = null;
+        this.ecsMeshObject = null;  // ECS (exterior) mesh
+        this.cutMeshObject = null;  // Partition cut mesh (internal facets at partition boundaries)
         this.boundingBoxHelper = null;
         this.meshData = null;
         this.showExcitedHighlight = true;
@@ -15,6 +17,51 @@ class Viewer {
         // Voltage range for colormap
         this.vMin = -80;
         this.vMax = 0;
+
+        // Rank coloring
+        this.numRanks = 1;
+        this.colorMode = 'voltage'; // 'voltage' or 'rank'
+
+        // Explosion effect
+        this.explosionFactor = 0;
+        this.originalVertices = null;      // Original membrane vertex positions
+        this.originalEcsVertices = null;   // Original ECS vertex positions
+        this.originalCutVertices = null;   // Original cut vertex positions
+        this.rankCentroids = null;
+        this.globalCentroid = null;
+        this.ranksData = null;
+        this.ecsRanksData = null;
+        this.cutRanksData = null;
+
+        // Categorical colormap for ranks (Tableau 20-like)
+        this.rankColors = [
+            { r: 0.12, g: 0.47, b: 0.71 },  // Blue
+            { r: 1.00, g: 0.50, b: 0.05 },  // Orange
+            { r: 0.17, g: 0.63, b: 0.17 },  // Green
+            { r: 0.84, g: 0.15, b: 0.16 },  // Red
+            { r: 0.58, g: 0.40, b: 0.74 },  // Purple
+            { r: 0.55, g: 0.34, b: 0.29 },  // Brown
+            { r: 0.89, g: 0.47, b: 0.76 },  // Pink
+            { r: 0.50, g: 0.50, b: 0.50 },  // Gray
+            { r: 0.74, g: 0.74, b: 0.13 },  // Olive
+            { r: 0.09, g: 0.75, b: 0.81 },  // Cyan
+            { r: 0.68, g: 0.78, b: 0.91 },  // Light Blue
+            { r: 1.00, g: 0.73, b: 0.47 },  // Light Orange
+            { r: 0.60, g: 0.87, b: 0.54 },  // Light Green
+            { r: 1.00, g: 0.60, b: 0.59 },  // Light Red
+            { r: 0.77, g: 0.69, b: 0.84 },  // Light Purple
+            { r: 0.77, g: 0.61, b: 0.58 },  // Light Brown
+            { r: 0.97, g: 0.71, b: 0.82 },  // Light Pink
+            { r: 0.78, g: 0.78, b: 0.78 },  // Light Gray
+            { r: 0.86, g: 0.86, b: 0.55 },  // Light Olive
+            { r: 0.62, g: 0.85, b: 0.90 },  // Light Cyan
+        ];
+    }
+
+    // Get color for a rank (categorical)
+    rankToColor(rank) {
+        const colorIndex = rank % this.rankColors.length;
+        return this.rankColors[colorIndex];
     }
 
     // Blue to Red colormap (like ParaView's "Cool to Warm")
@@ -81,6 +128,16 @@ class Viewer {
         // Create mesh geometry
         this.createMembraneMesh(meshData);
 
+        // Create ECS mesh if available
+        if (meshData.ecsVertices && meshData.ecsFacets) {
+            this.createEcsMesh(meshData);
+        }
+
+        // Create partition cut mesh if available
+        if (meshData.cutVertices && meshData.cutFacets) {
+            this.createCutMesh(meshData);
+        }
+
         // Position camera
         this.resetCamera();
 
@@ -93,6 +150,9 @@ class Viewer {
 
     createMembraneMesh(meshData) {
         const { vertices, facets, metadata } = meshData;
+
+        // Store original vertices for explosion effect
+        this.originalVertices = new Float32Array(vertices);
 
         // Create BufferGeometry
         const geometry = new THREE.BufferGeometry();
@@ -130,21 +190,291 @@ class Viewer {
         this.scene.add(this.meshObject);
     }
 
+    createEcsMesh(meshData) {
+        const { ecsVertices, ecsFacets } = meshData;
+
+        // Store original ECS vertices for explosion effect
+        this.originalEcsVertices = new Float32Array(ecsVertices);
+
+        // Create BufferGeometry
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(ecsVertices), 3));
+        geometry.setIndex(new THREE.BufferAttribute(ecsFacets, 1));
+        geometry.computeVertexNormals();
+
+        // Create translucent material with vertex colors
+        const material = new THREE.MeshPhongMaterial({
+            vertexColors: true,
+            side: THREE.DoubleSide,
+            flatShading: false,
+            transparent: true,
+            opacity: 0.15,
+            shininess: 10,
+            depthWrite: false  // Prevent z-fighting with membrane
+        });
+
+        // Initialize vertex colors (light gray for ECS)
+        const colors = new Float32Array(ecsVertices.length);
+        for (let i = 0; i < ecsVertices.length; i += 3) {
+            colors[i] = 0.7;      // R
+            colors[i + 1] = 0.7;  // G
+            colors[i + 2] = 0.8;  // B - slightly blue tint
+        }
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+        // Create mesh (hidden by default)
+        this.ecsMeshObject = new THREE.Mesh(geometry, material);
+        this.ecsMeshObject.visible = false;
+        this.scene.add(this.ecsMeshObject);
+
+        console.log(`ECS mesh created: ${ecsVertices.length / 3} vertices`);
+    }
+
+    setEcsVisible(visible) {
+        if (this.ecsMeshObject) {
+            this.ecsMeshObject.visible = visible;
+        }
+    }
+
+    setEcsOpacity(opacity) {
+        if (this.ecsMeshObject) {
+            this.ecsMeshObject.material.opacity = opacity;
+        }
+    }
+
+    createCutMesh(meshData) {
+        const { cutVertices, cutFacets } = meshData;
+
+        // Store original cut vertices for explosion effect
+        this.originalCutVertices = new Float32Array(cutVertices);
+
+        // Create BufferGeometry
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(cutVertices), 3));
+        geometry.setIndex(new THREE.BufferAttribute(cutFacets, 1));
+        geometry.computeVertexNormals();
+
+        // Create material with vertex colors (opaque, shows internal cuts)
+        const material = new THREE.MeshPhongMaterial({
+            vertexColors: true,
+            side: THREE.DoubleSide,
+            flatShading: false,
+            transparent: false,
+            shininess: 30
+        });
+
+        // Initialize vertex colors (will be set by rank)
+        const colors = new Float32Array(cutVertices.length);
+        for (let i = 0; i < cutVertices.length; i += 3) {
+            colors[i] = 0.5;
+            colors[i + 1] = 0.5;
+            colors[i + 2] = 0.5;
+        }
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+        // Create mesh (hidden by default, only shown in partition mode)
+        this.cutMeshObject = new THREE.Mesh(geometry, material);
+        this.cutMeshObject.visible = false;
+        this.scene.add(this.cutMeshObject);
+
+        console.log(`Cut mesh created: ${cutVertices.length / 3} vertices`);
+    }
+
+    setCutVisible(visible) {
+        if (this.cutMeshObject) {
+            this.cutMeshObject.visible = visible;
+        }
+    }
+
+    updateCutRankColors(cutRanks) {
+        if (!this.cutMeshObject) return;
+
+        const geometry = this.cutMeshObject.geometry;
+        const colors = geometry.attributes.color.array;
+
+        // Note: boundary facets are already duplicated in the mesh data,
+        // with each copy having uniform rank assignment for all 3 vertices
+        for (let i = 0; i < cutRanks.length; i++) {
+            const color = this.rankToColor(cutRanks[i]);
+            colors[i * 3] = color.r;
+            colors[i * 3 + 1] = color.g;
+            colors[i * 3 + 2] = color.b;
+        }
+
+        geometry.attributes.color.needsUpdate = true;
+    }
+
     async reloadMesh(meshData) {
-        // Remove old mesh
+        // Remove old membrane mesh
         if (this.meshObject) {
             this.scene.remove(this.meshObject);
             this.meshObject.geometry.dispose();
             this.meshObject.material.dispose();
         }
 
+        // Remove old ECS mesh
+        if (this.ecsMeshObject) {
+            this.scene.remove(this.ecsMeshObject);
+            this.ecsMeshObject.geometry.dispose();
+            this.ecsMeshObject.material.dispose();
+            this.ecsMeshObject = null;
+        }
+
+        // Remove old cut mesh
+        if (this.cutMeshObject) {
+            this.scene.remove(this.cutMeshObject);
+            this.cutMeshObject.geometry.dispose();
+            this.cutMeshObject.material.dispose();
+            this.cutMeshObject = null;
+        }
+
         // Update mesh data reference
         this.meshData = meshData;
 
-        // Create new mesh
+        // Create new membrane mesh
         this.createMembraneMesh(meshData);
 
+        // Create new ECS mesh if available
+        if (meshData.ecsVertices && meshData.ecsFacets) {
+            this.createEcsMesh(meshData);
+        }
+
+        // Create new cut mesh if available
+        if (meshData.cutVertices && meshData.cutFacets) {
+            this.createCutMesh(meshData);
+        }
+
+        // Reset explosion
+        this.explosionFactor = 0;
+        this.originalVertices = new Float32Array(meshData.vertices);
+        if (meshData.ecsVertices) {
+            this.originalEcsVertices = new Float32Array(meshData.ecsVertices);
+        }
+        if (meshData.cutVertices) {
+            this.originalCutVertices = new Float32Array(meshData.cutVertices);
+        }
+
         console.log(`Mesh reloaded: ${meshData.metadata.vertex_count} vertices, ${meshData.metadata.facet_count} facets`);
+    }
+
+    // Set explosion data (rank centroids for calculating offsets)
+    setExplosionData(ranksData, ecsRanksData, cutRanksData, rankCentroids, globalCentroid) {
+        this.ranksData = ranksData;
+        this.ecsRanksData = ecsRanksData;
+        this.cutRanksData = cutRanksData;
+        this.rankCentroids = rankCentroids;
+        this.globalCentroid = globalCentroid;
+    }
+
+    // Apply explosion effect - moves each rank's vertices away from center
+    setExplosionFactor(factor) {
+        this.explosionFactor = factor;
+
+        if (!this.ranksData || !this.rankCentroids || !this.globalCentroid) {
+            return;
+        }
+
+        const gc = this.globalCentroid;
+
+        // Update membrane mesh vertices
+        if (this.meshObject && this.originalVertices) {
+            const positions = this.meshObject.geometry.attributes.position.array;
+
+            for (let i = 0; i < this.ranksData.length; i++) {
+                const rank = this.ranksData[i];
+                const centroid = this.rankCentroids[rank];
+
+                // Direction from global centroid to rank centroid
+                const dx = centroid[0] - gc[0];
+                const dy = centroid[1] - gc[1];
+                const dz = centroid[2] - gc[2];
+
+                // Apply offset
+                positions[i * 3] = this.originalVertices[i * 3] + dx * factor;
+                positions[i * 3 + 1] = this.originalVertices[i * 3 + 1] + dy * factor;
+                positions[i * 3 + 2] = this.originalVertices[i * 3 + 2] + dz * factor;
+            }
+
+            this.meshObject.geometry.attributes.position.needsUpdate = true;
+            this.meshObject.geometry.computeVertexNormals();
+        }
+
+        // Update ECS mesh vertices
+        if (this.ecsMeshObject && this.originalEcsVertices && this.ecsRanksData) {
+            const positions = this.ecsMeshObject.geometry.attributes.position.array;
+
+            for (let i = 0; i < this.ecsRanksData.length; i++) {
+                const rank = this.ecsRanksData[i];
+                const centroid = this.rankCentroids[rank];
+
+                const dx = centroid[0] - gc[0];
+                const dy = centroid[1] - gc[1];
+                const dz = centroid[2] - gc[2];
+
+                positions[i * 3] = this.originalEcsVertices[i * 3] + dx * factor;
+                positions[i * 3 + 1] = this.originalEcsVertices[i * 3 + 1] + dy * factor;
+                positions[i * 3 + 2] = this.originalEcsVertices[i * 3 + 2] + dz * factor;
+            }
+
+            this.ecsMeshObject.geometry.attributes.position.needsUpdate = true;
+            this.ecsMeshObject.geometry.computeVertexNormals();
+        }
+
+        // Update cut mesh vertices
+        if (this.cutMeshObject && this.originalCutVertices && this.cutRanksData) {
+            const positions = this.cutMeshObject.geometry.attributes.position.array;
+
+            for (let i = 0; i < this.cutRanksData.length; i++) {
+                const rank = this.cutRanksData[i];
+                const centroid = this.rankCentroids[rank];
+
+                const dx = centroid[0] - gc[0];
+                const dy = centroid[1] - gc[1];
+                const dz = centroid[2] - gc[2];
+
+                positions[i * 3] = this.originalCutVertices[i * 3] + dx * factor;
+                positions[i * 3 + 1] = this.originalCutVertices[i * 3 + 1] + dy * factor;
+                positions[i * 3 + 2] = this.originalCutVertices[i * 3 + 2] + dz * factor;
+            }
+
+            this.cutMeshObject.geometry.attributes.position.needsUpdate = true;
+            this.cutMeshObject.geometry.computeVertexNormals();
+        }
+    }
+
+    // Update ECS colors based on rank
+    updateEcsRankColors(ecsRanks) {
+        if (!this.ecsMeshObject) return;
+
+        const geometry = this.ecsMeshObject.geometry;
+        const colors = geometry.attributes.color.array;
+
+        // Note: boundary facets are already duplicated in the mesh data,
+        // with each copy having uniform rank assignment for all 3 vertices
+        for (let i = 0; i < ecsRanks.length; i++) {
+            const color = this.rankToColor(ecsRanks[i]);
+            colors[i * 3] = color.r;
+            colors[i * 3 + 1] = color.g;
+            colors[i * 3 + 2] = color.b;
+        }
+
+        geometry.attributes.color.needsUpdate = true;
+    }
+
+    // Reset ECS to default gray color
+    resetEcsColors() {
+        if (!this.ecsMeshObject) return;
+
+        const geometry = this.ecsMeshObject.geometry;
+        const colors = geometry.attributes.color.array;
+
+        for (let i = 0; i < colors.length; i += 3) {
+            colors[i] = 0.7;
+            colors[i + 1] = 0.7;
+            colors[i + 2] = 0.8;
+        }
+
+        geometry.attributes.color.needsUpdate = true;
     }
 
     updateBoundingBox(box) {
@@ -234,6 +564,35 @@ class Viewer {
         }
 
         geometry.attributes.color.needsUpdate = true;
+        this.colorMode = 'voltage';
+    }
+
+    updateRankColors(ranks) {
+        if (!this.meshObject) return;
+
+        const geometry = this.meshObject.geometry;
+        const colors = geometry.attributes.color.array;
+
+        // ranks is array of rank ID per vertex
+        // Note: boundary facets are already duplicated in the mesh data,
+        // with each copy having uniform rank assignment for all 3 vertices
+        for (let i = 0; i < ranks.length; i++) {
+            const color = this.rankToColor(ranks[i]);
+            colors[i * 3] = color.r;
+            colors[i * 3 + 1] = color.g;
+            colors[i * 3 + 2] = color.b;
+        }
+
+        geometry.attributes.color.needsUpdate = true;
+        this.colorMode = 'rank';
+    }
+
+    setNumRanks(numRanks) {
+        this.numRanks = numRanks;
+    }
+
+    getColorMode() {
+        return this.colorMode;
     }
 
     setBoundingBoxVisible(visible) {

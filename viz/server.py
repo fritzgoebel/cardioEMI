@@ -89,19 +89,83 @@ def update_config():
                 if match:
                     # Preserve original formatting (indentation and key spacing)
                     indent = match.group(1)
+                    key_indent_len = len(indent)
                     # Keep simple format for updated values
                     lines[i] = f'{indent}{key}: {value}\n'
+                    # Remove any continuation lines (lines that are more indented or start with whitespace after key)
+                    # This handles multi-line YAML values that may have been set previously
+                    j = i + 1
+                    while j < len(lines):
+                        next_line = lines[j]
+                        # Check if this is a continuation line (starts with more whitespace and no key)
+                        if next_line.strip() and not next_line.lstrip().startswith('#'):
+                            next_indent = len(next_line) - len(next_line.lstrip())
+                            # If it's indented more than the key, or starts with special YAML chars, it's a continuation
+                            if next_indent > key_indent_len and ':' not in next_line.split('#')[0]:
+                                lines[j] = ''  # Mark for removal
+                                j += 1
+                                continue
+                        break
                     found = True
                     break
             if not found:
                 # Add new key at end
                 lines.append(f'{key}: {value}\n')
 
+        # Remove empty lines that were marked for deletion
+        lines = [l for l in lines if l != '']
+
         # Write back
         with open(config_path, 'w') as f:
             f.writelines(lines)
 
         return jsonify({'success': True, 'message': 'Config updated'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/config/ginkgo', methods=['POST'])
+def update_ginkgo_config():
+    """Update the nested ginkgo configuration in YAML config file."""
+    import yaml
+
+    data = request.json
+    config_file = data.get('file', 'input_pepe36_colored.yml')
+    ginkgo_config = data.get('ginkgo', {})
+
+    config_path = PROJECT_ROOT / config_file
+
+    try:
+        # Read the full YAML file
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f) or {}
+
+        # Build the ginkgo config dictionary
+        ginkgo_dict = {
+            'backend': ginkgo_config.get('backend', 'omp'),
+            'solver': ginkgo_config.get('solver', 'cg'),
+            'preconditioner': ginkgo_config.get('preconditioner', 'jacobi'),
+            'rtol': float(ginkgo_config.get('rtol', 1e-8)),
+            'atol': float(ginkgo_config.get('atol', 1e-12)),
+            'max_iterations': int(ginkgo_config.get('maxIterations', 1000))
+        }
+
+        # Add AMG config if present
+        amg_config = ginkgo_config.get('amg', {})
+        if amg_config:
+            ginkgo_dict['amg'] = {
+                'max_levels': int(amg_config.get('maxLevels', 10)),
+                'cycle': amg_config.get('cycle', 'v'),
+                'smoother': amg_config.get('smoother', 'jacobi'),
+                'relaxation_factor': float(amg_config.get('relaxationFactor', 0.9))
+            }
+
+        config['ginkgo'] = ginkgo_dict
+
+        # Write back with YAML formatting
+        with open(config_path, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+        return jsonify({'success': True, 'message': 'Ginkgo config updated'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -274,11 +338,31 @@ def get_current_mesh():
 @app.route('/api/simulation/run')
 def run_simulation():
     """Run Docker simulation with Server-Sent Events for streaming output."""
+    import yaml
+
     # Get MPI ranks from query parameter, default to 8, clamp to 1-32
     ranks = request.args.get('ranks', 8, type=int)
     ranks = max(1, min(32, ranks))
 
     config_file = request.args.get('config', 'input_pepe36_colored.yml')
+
+    # Check config file for solver backend to determine Docker image
+    config_path = PROJECT_ROOT / config_file
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f) or {}
+        solver_backend = config.get('solver_backend', 'petsc').lower()
+    except:
+        solver_backend = 'petsc'
+
+    # Select Docker image based on solver backend
+    if solver_backend == 'ginkgo':
+        docker_image = 'dolfinx-ginkgo:latest'
+        # For Ginkgo, we need to build the Python bindings first if not already done
+        setup_cmd = 'cd dolfinx-ginkgo && mkdir -p build && cd build && cmake .. -DCMAKE_PREFIX_PATH=/usr/local/dolfinx-real -DDOLFINX_GINKGO_BUILD_PYTHON=ON && make -j2 && cd /home/fenics && '
+    else:
+        docker_image = 'ghcr.io/fenics/dolfinx/dolfinx:v0.9.0'
+        setup_cmd = ''
 
     def generate():
         if simulation_state['running']:
@@ -291,12 +375,14 @@ def run_simulation():
             'docker', 'run', '-t',
             '-v', f'{PROJECT_ROOT}:/home/fenics',
             '-w', '/home/fenics',
-            'ghcr.io/fenics/dolfinx/dolfinx:v0.9.0',
+            docker_image,
             'bash', '-c',
-            f'pip install --no-build-isolation -q -r requirements.txt && mpirun -n {ranks} python3 -u main.py {config_file}'
+            f'{setup_cmd}pip install --no-build-isolation -q -r requirements.txt && mpirun -n {ranks} python3 -u main.py {config_file}'
         ]
 
         try:
+            backend_msg = f"Using {solver_backend.upper()} solver backend ({docker_image})"
+            yield f"data: {json.dumps({'type': 'output', 'text': backend_msg + '\\n'})}\n\n"
             yield f"data: {json.dumps({'type': 'output', 'text': 'Starting simulation...\\n'})}\n\n"
 
             process = subprocess.Popen(
@@ -319,6 +405,21 @@ def run_simulation():
                             percent = int(parts[1])
                             message = parts[2]
                             yield f"data: {json.dumps({'type': 'progress', 'percent': percent, 'message': message})}\n\n"
+                    # Check for iterations output (format: ITERATIONS:step:count)
+                    elif line.startswith('ITERATIONS:'):
+                        parts = line.strip().split(':')
+                        if len(parts) >= 3:
+                            step = int(parts[1])
+                            count = int(parts[2])
+                            yield f"data: {json.dumps({'type': 'iterations', 'step': step, 'count': count})}\n\n"
+                    # Check for residual output (format: RESIDUAL:step:abs:rel)
+                    elif line.startswith('RESIDUAL:'):
+                        parts = line.strip().split(':')
+                        if len(parts) >= 4:
+                            step = int(parts[1])
+                            res_abs = float(parts[2])
+                            res_rel = float(parts[3])
+                            yield f"data: {json.dumps({'type': 'residual', 'step': step, 'abs': res_abs, 'rel': res_rel})}\n\n"
                     else:
                         yield f"data: {json.dumps({'type': 'output', 'text': line})}\n\n"
 
@@ -544,6 +645,51 @@ def get_results():
         v_min = float(np.min(all_v))
         v_max = float(np.max(all_v))
 
+        # Load iterations if available
+        iterations_path = sim_output_dir / 'iterations.pickle'
+        iterations = None
+        if iterations_path.exists():
+            import pickle
+            with open(iterations_path, 'rb') as f:
+                iterations = pickle.load(f)
+
+        # Load residuals if available
+        residuals_path = sim_output_dir / 'residuals.pickle'
+        residuals = None
+        if residuals_path.exists():
+            import pickle
+            with open(residuals_path, 'rb') as f:
+                residuals = pickle.load(f)
+
+        # Load DOF rank data if available
+        dof_ranks_path = mesh_data_dir / 'dof_ranks.bin'
+        rank_metadata_path = mesh_data_dir / 'rank_metadata.json'
+        ranks_data = None
+        num_ranks = None
+        rank_centroids = None
+        global_centroid = None
+
+        if dof_ranks_path.exists():
+            ranks_data = np.fromfile(dof_ranks_path, dtype=np.int32).tolist()
+            if rank_metadata_path.exists():
+                with open(rank_metadata_path, 'r') as f:
+                    rank_meta = json.load(f)
+                    num_ranks = rank_meta.get('num_ranks')
+                    rank_centroids = rank_meta.get('rank_centroids')
+                    global_centroid = rank_meta.get('global_centroid')
+
+        # Load ECS rank data if available
+        ecs_ranks_data = None
+        ecs_ranks_path = mesh_data_dir / 'ecs_ranks.bin'
+        if ecs_ranks_path.exists():
+            ecs_ranks_data = np.fromfile(ecs_ranks_path, dtype=np.int32).tolist()
+
+        # Load partition cut rank data if available
+        cut_ranks_data = None
+        cut_ranks_path = mesh_data_dir / 'cut_ranks.bin'
+        if cut_ranks_path.exists():
+            cut_ranks_data = np.fromfile(cut_ranks_path, dtype=np.int32).tolist()
+
         return jsonify({
             'voltages': voltages,
             'times': times,
@@ -551,7 +697,15 @@ def get_results():
             'vMax': v_max,
             'numTimesteps': len(timestep_keys),
             'vizDataDir': sim_name,
-            'perFacet': use_per_facet
+            'perFacet': use_per_facet,
+            'iterations': iterations,
+            'residuals': residuals,
+            'ranks': ranks_data,
+            'numRanks': num_ranks,
+            'rankCentroids': rank_centroids,
+            'globalCentroid': global_centroid,
+            'ecsRanks': ecs_ranks_data,
+            'cutRanks': cut_ranks_data
         })
 
     except Exception as e:

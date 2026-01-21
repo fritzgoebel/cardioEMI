@@ -16,7 +16,7 @@ class SimulationRunner {
         this.configFile = configFile;
     }
 
-    async run(onOutput, onProgress) {
+    async run(onOutput, onProgress, onIterations, onResidual) {
         // Close any existing connection
         if (this.eventSource) {
             this.eventSource.close();
@@ -38,6 +38,14 @@ class SimulationRunner {
                     } else if (data.type === 'progress') {
                         if (onProgress) {
                             onProgress(data.percent, data.message);
+                        }
+                    } else if (data.type === 'iterations') {
+                        if (onIterations) {
+                            onIterations(data.step, data.count);
+                        }
+                    } else if (data.type === 'residual') {
+                        if (onResidual) {
+                            onResidual(data.step, data.abs, data.rel);
                         }
                     } else if (data.type === 'complete') {
                         this.eventSource.close();

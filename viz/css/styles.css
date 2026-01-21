@@ -153,6 +153,106 @@ header p {
     cursor: pointer;
 }
 
+/* Rank Legend */
+#rank-legend {
+    padding: 10px 15px;
+    background: #0a0a1a;
+    border-top: 1px solid #0f3460;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+}
+
+.rank-legend-title {
+    font-weight: 500;
+    color: #e94560;
+    margin-right: 5px;
+}
+
+#rank-legend-items {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.rank-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.8rem;
+    padding: 2px 6px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 3px;
+}
+
+.rank-legend-color {
+    width: 14px;
+    height: 14px;
+    border-radius: 2px;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+/* Partition Controls */
+#partition-controls {
+    padding: 10px 15px;
+    background: #0a0a1a;
+    border-top: 1px solid #0f3460;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 20px;
+}
+
+#partition-controls label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+}
+
+#partition-controls .slider-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+#partition-controls .slider {
+    width: 120px;
+}
+
+#explosion-value {
+    min-width: 30px;
+    text-align: right;
+    color: #e94560;
+}
+
+/* Iterations Chart */
+#iterations-chart-container {
+    padding: 15px;
+    background: #0a0a1a;
+    border-top: 1px solid #0f3460;
+    height: 300px;
+}
+
+#iterations-chart-container canvas {
+    width: 100% !important;
+    height: 100% !important;
+}
+
+/* Residual Chart */
+#residual-chart-container {
+    padding: 15px;
+    background: #0a0a1a;
+    border-top: 1px solid #0f3460;
+    height: 300px;
+}
+
+#residual-chart-container canvas {
+    width: 100% !important;
+    height: 100% !important;
+}
+
 /* Control Panel */
 .control-panel {
     background: #16213e;

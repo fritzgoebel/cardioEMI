@@ -60,11 +60,57 @@ class MeshLoader {
             console.log('  Tags not available');
         }
 
+        // Try to load ECS (exterior) mesh data
+        let ecsVertices = null;
+        let ecsFacets = null;
+        try {
+            const ecsVerticesResponse = await fetch(`${meshPath}/ecs_vertices.bin`);
+            if (ecsVerticesResponse.ok) {
+                const ecsVerticesBuffer = await ecsVerticesResponse.arrayBuffer();
+                ecsVertices = new Float32Array(ecsVerticesBuffer);
+                console.log(`  ECS vertices loaded: ${ecsVertices.length / 3} points`);
+
+                const ecsFacetsResponse = await fetch(`${meshPath}/ecs_facets.bin`);
+                if (ecsFacetsResponse.ok) {
+                    const ecsFacetsBuffer = await ecsFacetsResponse.arrayBuffer();
+                    ecsFacets = new Uint32Array(ecsFacetsBuffer);
+                    console.log(`  ECS facets loaded: ${ecsFacets.length / 3} triangles`);
+                }
+            }
+        } catch (e) {
+            console.log('  ECS mesh not available');
+        }
+
+        // Try to load partition cut facets (internal facets at partition boundaries)
+        let cutVertices = null;
+        let cutFacets = null;
+        try {
+            const cutVerticesResponse = await fetch(`${meshPath}/cut_vertices.bin`);
+            if (cutVerticesResponse.ok) {
+                const cutVerticesBuffer = await cutVerticesResponse.arrayBuffer();
+                cutVertices = new Float32Array(cutVerticesBuffer);
+                console.log(`  Cut vertices loaded: ${cutVertices.length / 3} points`);
+
+                const cutFacetsResponse = await fetch(`${meshPath}/cut_facets.bin`);
+                if (cutFacetsResponse.ok) {
+                    const cutFacetsBuffer = await cutFacetsResponse.arrayBuffer();
+                    cutFacets = new Uint32Array(cutFacetsBuffer);
+                    console.log(`  Cut facets loaded: ${cutFacets.length / 3} triangles`);
+                }
+            }
+        } catch (e) {
+            console.log('  Cut mesh not available');
+        }
+
         return {
             vertices,
             facets,
             tags,
-            metadata
+            metadata,
+            ecsVertices,
+            ecsFacets,
+            cutVertices,
+            cutFacets
         };
     }
 }

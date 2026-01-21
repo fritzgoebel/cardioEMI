@@ -237,9 +237,20 @@ def read_input_file(input_yml_file):
             input_parameters['out_name'] = "_" + config['out_name']
             print('WARNING: Paraview states only work with defult output names.')
         else:
-            input_parameters['out_name'] = ''            
+            input_parameters['out_name'] = ''
             # raise SyntaxError(f'INPUT ERROR: provide name of output in input .yml file.')
 
+        ######### Solver Backend #########
+        if 'solver_backend' in config:
+            input_parameters['solver_backend'] = config['solver_backend']
+        else:
+            input_parameters['solver_backend'] = 'petsc'
+
+        # Ginkgo-specific configuration (optional)
+        if 'ginkgo' in config:
+            input_parameters['ginkgo'] = config['ginkgo']
+        else:
+            input_parameters['ginkgo'] = {}
 
         # sanuty checks
         parse_nonneg_int(input_parameters['P'])

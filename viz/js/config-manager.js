@@ -39,4 +39,25 @@ class ConfigManager {
 
         return await response.json();
     }
+
+    async updateGinkgoConfig(ginkgoConfig) {
+        // Update the nested ginkgo configuration in the YAML file
+        const response = await fetch(`${this.apiBase}/config/ginkgo`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                file: this.configFile,
+                ginkgo: ginkgoConfig
+            })
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to update Ginkgo config');
+        }
+
+        return await response.json();
+    }
 }

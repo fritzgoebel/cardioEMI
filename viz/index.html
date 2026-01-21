@@ -39,6 +39,35 @@
                         <input type="checkbox" id="show-excited" checked>
                         Highlight Voltage
                     </label>
+                    <label id="show-partition-label" style="display: none;">
+                        <input type="checkbox" id="show-partition">
+                        Show MPI Partition
+                    </label>
+                </div>
+                <!-- Rank legend (shown when partition view is active) -->
+                <div id="rank-legend" style="display: none;">
+                    <span class="rank-legend-title">MPI Ranks:</span>
+                    <div id="rank-legend-items"></div>
+                </div>
+                <!-- Partition controls (shown when partition view is active) -->
+                <div id="partition-controls" style="display: none;">
+                    <label>
+                        <input type="checkbox" id="show-ecs">
+                        Show ECS
+                    </label>
+                    <label class="slider-label">
+                        Explosion:
+                        <input type="range" id="explosion-slider" class="slider" min="0" max="2" step="0.05" value="0" style="width: 120px;">
+                        <span id="explosion-value">0</span>
+                    </label>
+                </div>
+                <!-- Iterations Chart -->
+                <div id="iterations-chart-container" style="display: none;">
+                    <canvas id="iterations-chart"></canvas>
+                </div>
+                <!-- Residual Chart -->
+                <div id="residual-chart-container" style="display: none;">
+                    <canvas id="residual-chart"></canvas>
                 </div>
             </div>
 
@@ -88,6 +117,109 @@
                         <label>MPI Ranks:</label>
                         <input type="number" id="mpi-ranks" value="8" min="1" max="32" step="1">
                         <span class="unit" id="cpu-info"></span>
+                    </div>
+                </section>
+
+                <!-- Solver Configuration -->
+                <section class="section">
+                    <h2>Solver Settings</h2>
+
+                    <div class="param-row">
+                        <label>Backend:</label>
+                        <select id="solver-backend" class="mesh-dropdown">
+                            <option value="petsc">PETSc</option>
+                            <option value="ginkgo">Ginkgo (GPU)</option>
+                        </select>
+                    </div>
+
+                    <!-- PETSc Options -->
+                    <div id="petsc-options">
+                        <div class="param-row">
+                            <label>Solver:</label>
+                            <select id="petsc-ksp-type" class="mesh-dropdown">
+                                <option value="preonly">Direct (LU)</option>
+                                <option value="cg">CG</option>
+                                <option value="gmres">GMRES</option>
+                                <option value="bicg">BiCG</option>
+                            </select>
+                        </div>
+                        <div class="param-row" id="petsc-pc-row">
+                            <label>Preconditioner:</label>
+                            <select id="petsc-pc-type" class="mesh-dropdown">
+                                <option value="lu">LU (MUMPS)</option>
+                                <option value="hypre">Hypre AMG</option>
+                                <option value="jacobi">Jacobi</option>
+                                <option value="sor">SOR</option>
+                                <option value="none">None</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Ginkgo Options -->
+                    <div id="ginkgo-options" style="display: none;">
+                        <div class="param-row">
+                            <label>Compute:</label>
+                            <select id="ginkgo-backend" class="mesh-dropdown">
+                                <option value="omp">OpenMP (CPU)</option>
+                                <option value="cuda">CUDA (GPU)</option>
+                                <option value="hip">HIP (AMD GPU)</option>
+                                <option value="reference">Reference</option>
+                            </select>
+                        </div>
+                        <div class="param-row">
+                            <label>Solver:</label>
+                            <select id="ginkgo-solver" class="mesh-dropdown">
+                                <option value="cg">CG</option>
+                                <option value="fcg">Flexible CG</option>
+                                <option value="gmres">GMRES</option>
+                                <option value="bicgstab">BiCGSTAB</option>
+                                <option value="cgs">CGS</option>
+                            </select>
+                        </div>
+                        <div class="param-row">
+                            <label>Preconditioner:</label>
+                            <select id="ginkgo-precond" class="mesh-dropdown">
+                                <option value="jacobi">Jacobi</option>
+                                <option value="amg">AMG (Multigrid)</option>
+                                <option value="block_jacobi">Block Jacobi</option>
+                                <option value="ilu">ILU</option>
+                                <option value="ic">IC</option>
+                                <option value="isai">ISAI</option>
+                                <option value="none">None</option>
+                            </select>
+                        </div>
+                        <!-- AMG Options -->
+                        <div id="amg-options" style="display: none;">
+                            <div class="param-row">
+                                <label>AMG Cycle:</label>
+                                <select id="amg-cycle" class="mesh-dropdown">
+                                    <option value="v">V-cycle</option>
+                                    <option value="w">W-cycle</option>
+                                    <option value="f">F-cycle</option>
+                                </select>
+                            </div>
+                            <div class="param-row">
+                                <label>Smoother:</label>
+                                <select id="amg-smoother" class="mesh-dropdown">
+                                    <option value="jacobi">Jacobi</option>
+                                    <option value="gauss_seidel">Gauss-Seidel</option>
+                                    <option value="ilu">ILU</option>
+                                </select>
+                            </div>
+                            <div class="param-row">
+                                <label>Max levels:</label>
+                                <input type="number" id="amg-max-levels" value="10" min="2" max="20" step="1">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="param-row">
+                        <label>Rel. tol.:</label>
+                        <input type="text" id="solver-rtol" value="1e-8" style="width: 80px;">
+                    </div>
+                    <div class="param-row">
+                        <label>Abs. tol.:</label>
+                        <input type="text" id="solver-atol" value="1e-12" style="width: 80px;">
                     </div>
                 </section>
 
@@ -184,6 +316,12 @@
                         <label>V range:</label>
                         <span id="v-min-result">-80</span> to <span id="v-max-result">40</span> mV
                     </div>
+                    <div class="param-row">
+                        <label>
+                            <input type="checkbox" id="regenerate-viz">
+                            Regenerate viz data
+                        </label>
+                    </div>
                     <button id="load-results" class="btn btn-primary" style="width: 100%;">
                         Load Results
                     </button>
@@ -221,6 +359,9 @@
             </div>
         </div>
     </div>
+
+    <!-- Chart.js from CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
     <!-- Three.js from CDN -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
