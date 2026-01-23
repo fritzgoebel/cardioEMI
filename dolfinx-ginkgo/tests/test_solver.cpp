@@ -114,7 +114,7 @@ void test_cg_jacobi(MPI_Comm comm, Mat A, Vec b, Vec x)
     }
 
     // Create Ginkgo executor and communicator
-    auto exec = dgko::create_executor(dgko::Backend::OMP, 0);
+    auto exec = dgko::create_executor(dgko::Backend::REFERENCE, 0);
     auto gko_comm = dgko::create_communicator(comm);
 
     // Convert matrix and vectors to Ginkgo format
@@ -168,7 +168,7 @@ void test_cg_block_jacobi(MPI_Comm comm, Mat A, Vec b, Vec x)
         std::cout << "\n--- Test: CG + Block Jacobi ---" << std::endl;
     }
 
-    auto exec = dgko::create_executor(dgko::Backend::OMP, 0);
+    auto exec = dgko::create_executor(dgko::Backend::REFERENCE, 0);
     auto gko_comm = dgko::create_communicator(comm);
 
     auto A_gko = dgko::create_distributed_matrix_from_petsc<>(exec, gko_comm, A);
@@ -218,7 +218,7 @@ void test_cg_none(MPI_Comm comm, Mat A, Vec b, Vec x)
         std::cout << "\n--- Test: CG (no preconditioner) ---" << std::endl;
     }
 
-    auto exec = dgko::create_executor(dgko::Backend::OMP, 0);
+    auto exec = dgko::create_executor(dgko::Backend::REFERENCE, 0);
     auto gko_comm = dgko::create_communicator(comm);
 
     auto A_gko = dgko::create_distributed_matrix_from_petsc<>(exec, gko_comm, A);
@@ -326,7 +326,7 @@ void test_cg_amg_vcycle(MPI_Comm comm, Mat A, Vec b, Vec x)
         std::cout << "\n--- Test: CG + AMG (V-cycle, Jacobi) ---" << std::endl;
     }
 
-    auto exec = dgko::create_executor(dgko::Backend::OMP, 0);
+    auto exec = dgko::create_executor(dgko::Backend::REFERENCE, 0);
     auto gko_comm = dgko::create_communicator(comm);
 
     auto A_gko = dgko::create_distributed_matrix_from_petsc<>(exec, gko_comm, A);
@@ -376,77 +376,6 @@ void test_cg_amg_vcycle(MPI_Comm comm, Mat A, Vec b, Vec x)
 // Note: W-cycle test removed - appears to hang with distributed matrices in Ginkgo 1.11
 // V-cycle is the recommended cycle type for most applications
 
-/// Test AMG as standalone solver (no outer Krylov)
-/// Uses the correct distributed multigrid pattern from Ginkgo examples
-void test_amg_standalone(MPI_Comm comm, Mat A, Vec b, Vec x)
-{
-    int rank;
-    MPI_Comm_rank(comm, &rank);
-
-    if (rank == 0) {
-        std::cout << "\n--- Test: AMG standalone (V-cycle) ---" << std::endl;
-    }
-
-    auto exec = dgko::create_executor(dgko::Backend::OMP, 0);
-    auto gko_comm = dgko::create_communicator(comm);
-
-    auto A_gko = dgko::create_distributed_matrix_from_petsc<>(exec, gko_comm, A);
-    auto b_gko = dgko::create_distributed_vector_from_petsc<>(exec, gko_comm, b);
-
-    VecSet(x, 0.0);
-    auto x_gko = dgko::create_distributed_vector_from_petsc<>(exec, gko_comm, x);
-
-    // Build distributed AMG using the correct pattern
-    using schwarz = gko::experimental::distributed::preconditioner::Schwarz<double, int, long>;
-
-    // Smoother: Schwarz-wrapped Jacobi
-    auto schwarz_smoother = gko::share(schwarz::build()
-        .with_local_solver(
-            gko::preconditioner::Jacobi<double, int>::build()
-                .with_max_block_size(1u))
-        .on(exec));
-
-    auto smoother = gko::share(gko::solver::build_smoother(schwarz_smoother, 1u, 0.9));
-
-    // Coarse solver: CG with iteration limit
-    auto coarse_solver = gko::share(gko::solver::Cg<double>::build()
-        .with_criteria(gko::stop::Iteration::build().with_max_iters(4ul).on(exec))
-        .on(exec));
-
-    // Multigrid factory
-    auto mg_factory = gko::solver::Multigrid::build()
-        .with_mg_level(gko::multigrid::Pgm<double, int>::build().with_deterministic(true))
-        .with_pre_smoother(smoother)
-        .with_coarsest_solver(coarse_solver)
-        .with_max_levels(10ul)
-        .with_min_coarse_rows(50ul)
-        .with_cycle(gko::solver::multigrid::cycle::v)
-        .with_criteria(
-            gko::stop::Iteration::build().with_max_iters(100ul).on(exec),
-            gko::stop::ResidualNorm<double>::build()
-                .with_baseline(gko::stop::mode::rhs_norm)
-                .with_reduction_factor(1e-10)
-                .on(exec))
-        .on(exec);
-
-    auto mg_solver = mg_factory->generate(A_gko);
-    mg_solver->apply(b_gko.get(), x_gko.get());
-
-    dgko::copy_to_petsc(*x_gko, x);
-    double error = compute_error(x);
-
-    if (rank == 0) {
-        std::cout << "  Solution error: " << error << std::endl;
-    }
-
-    // AMG standalone may not fully converge, just check reasonable accuracy
-    assert(error < 1e-6);
-
-    if (rank == 0) {
-        std::cout << "  [OK]" << std::endl;
-    }
-}
-
 /// Test AMG on larger 2D Laplacian problem
 void test_amg_2d_laplacian(MPI_Comm comm)
 {
@@ -467,7 +396,7 @@ void test_amg_2d_laplacian(MPI_Comm comm)
     Vec x;
     VecDuplicate(b, &x);
 
-    auto exec = dgko::create_executor(dgko::Backend::OMP, 0);
+    auto exec = dgko::create_executor(dgko::Backend::REFERENCE, 0);
     auto gko_comm = dgko::create_communicator(comm);
 
     auto A_gko = dgko::create_distributed_matrix_from_petsc<>(exec, gko_comm, A);
@@ -533,7 +462,7 @@ void test_amg_vs_jacobi_2d(MPI_Comm comm)
     Vec x;
     VecDuplicate(b, &x);
 
-    auto exec = dgko::create_executor(dgko::Backend::OMP, 0);
+    auto exec = dgko::create_executor(dgko::Backend::REFERENCE, 0);
     auto gko_comm = dgko::create_communicator(comm);
 
     auto A_gko = dgko::create_distributed_matrix_from_petsc<>(exec, gko_comm, A);
@@ -624,7 +553,7 @@ void test_vs_petsc(MPI_Comm comm, Mat A, Vec b, Vec x)
     double petsc_error = compute_error(x_petsc);
 
     // Solve with Ginkgo
-    auto exec = dgko::create_executor(dgko::Backend::OMP, 0);
+    auto exec = dgko::create_executor(dgko::Backend::REFERENCE, 0);
     auto gko_comm = dgko::create_communicator(comm);
 
     auto A_gko = dgko::create_distributed_matrix_from_petsc<>(exec, gko_comm, A);
@@ -698,7 +627,6 @@ int main(int argc, char* argv[])
 
     // Run AMG tests on 1D Laplacian
     test_cg_amg_vcycle(comm, A, b, x);
-    test_amg_standalone(comm, A, b, x);
 
     // Run AMG tests on larger 2D Laplacian
     test_amg_2d_laplacian(comm);

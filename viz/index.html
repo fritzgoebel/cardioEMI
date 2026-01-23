@@ -158,6 +158,11 @@
                     <!-- Ginkgo Options -->
                     <div id="ginkgo-options" style="display: none;">
                         <div class="param-row">
+                            <label>Native Assembly:</label>
+                            <input type="checkbox" id="ginkgo-native-assembly" checked>
+                            <span class="checkbox-label">Bypass PETSc matrix</span>
+                        </div>
+                        <div class="param-row">
                             <label>Compute:</label>
                             <select id="ginkgo-backend" class="mesh-dropdown">
                                 <option value="omp">OpenMP (CPU)</option>

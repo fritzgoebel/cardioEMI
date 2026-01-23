@@ -230,6 +230,98 @@ int main(int argc, char* argv[])
         std::cout << "  Rank " << rank << ": Round-trip max diff=" << max_diff << " [OK]" << std::endl;
     }
 
+    // Test 5: Create Ginkgo matrix from local COO data (new assembly path)
+    {
+        if (rank == 0) {
+            std::cout << "\n--- Test 5: Local COO Assembly (communicate mode) ---" << std::endl;
+        }
+
+        // Build local COO data for the same tridiagonal matrix
+        // Each rank contributes its local rows in global numbering
+        PetscInt row_start, row_end;
+        MatGetOwnershipRange(A, &row_start, &row_end);
+
+        std::vector<std::int64_t> row_indices;
+        std::vector<std::int64_t> col_indices;
+        std::vector<double> values;
+
+        for (std::int64_t i = row_start; i < row_end; ++i) {
+            // Diagonal
+            row_indices.push_back(i);
+            col_indices.push_back(i);
+            values.push_back(2.0);
+
+            // Off-diagonal
+            if (i > 0) {
+                row_indices.push_back(i);
+                col_indices.push_back(i - 1);
+                values.push_back(-1.0);
+            }
+            if (i < global_size - 1) {
+                row_indices.push_back(i);
+                col_indices.push_back(i + 1);
+                values.push_back(-1.0);
+            }
+        }
+
+        // Build row_ranges for the partition
+        std::vector<std::int64_t> row_ranges(size + 1);
+        std::int64_t my_start = row_start;
+        MPI_Allgather(&my_start, 1, MPI_INT64_T, row_ranges.data(), 1, MPI_INT64_T, comm);
+        row_ranges[size] = global_size;
+
+        // Create matrix using the new local COO function
+        auto A_coo = dgko::create_distributed_matrix_from_local_coo<>(
+            exec, gko_comm,
+            row_indices, col_indices, values,
+            static_cast<std::int64_t>(global_size),
+            static_cast<std::int64_t>(global_size),
+            row_ranges
+        );
+
+        // Verify matrix was created
+        assert(A_coo != nullptr);
+
+        // Verify dimensions match
+        auto local_mat = A_coo->get_local_matrix();
+        auto local_dim = local_mat->get_size();
+        assert(static_cast<PetscInt>(local_dim[0]) == local_rows);
+
+        std::cout << "  Rank " << rank << ": COO matrix created, local size="
+                  << local_dim[0] << "x" << local_dim[1]
+                  << ", local nnz=" << values.size() << " [OK]" << std::endl;
+
+        // Test 5b: Verify SpMV gives same result as PETSc matrix
+        // Create test vectors
+        auto A_petsc = dgko::create_distributed_matrix_from_petsc<>(exec, gko_comm, A);
+        auto x_gko = dgko::create_distributed_vector_from_petsc<>(exec, gko_comm, b);
+
+        // Result vectors
+        auto y_petsc = x_gko->clone();
+        auto y_coo = x_gko->clone();
+
+        // SpMV with both matrices
+        A_petsc->apply(x_gko, y_petsc);
+        A_coo->apply(x_gko, y_coo);
+
+        // Compare results
+        auto y_petsc_local = y_petsc->get_local_vector();
+        auto y_coo_local = y_coo->get_local_vector();
+
+        auto y_petsc_vals = y_petsc_local->get_const_values();
+        auto y_coo_vals = y_coo_local->get_const_values();
+
+        double max_diff = 0.0;
+        for (size_t i = 0; i < y_petsc_local->get_size()[0]; ++i) {
+            double diff = std::abs(y_petsc_vals[i] - y_coo_vals[i]);
+            max_diff = std::max(max_diff, diff);
+        }
+
+        assert(max_diff < 1e-12);
+
+        std::cout << "  Rank " << rank << ": SpMV comparison max diff=" << max_diff << " [OK]" << std::endl;
+    }
+
     // Cleanup
     MatDestroy(&A);
     VecDestroy(&b);

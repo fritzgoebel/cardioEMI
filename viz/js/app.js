@@ -371,6 +371,7 @@ class App {
             backend: 'petsc',
             petsc: { kspType: 'preonly', pcType: 'lu' },
             ginkgo: {
+                nativeAssembly: true,  // Default to native assembly
                 backend: 'omp',
                 solver: 'cg',
                 preconditioner: 'jacobi',
@@ -406,6 +407,11 @@ class App {
         // PETSc preconditioner
         petscPcType.addEventListener('change', () => {
             this.solverConfig.petsc.pcType = petscPcType.value;
+        });
+
+        // Ginkgo native assembly
+        document.getElementById('ginkgo-native-assembly').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.nativeAssembly = e.target.checked;
         });
 
         // Ginkgo backend
@@ -904,6 +910,7 @@ class App {
             if (solverBackend === 'ginkgo') {
                 // Read Ginkgo values from DOM
                 const ginkgoConfig = {
+                    nativeAssembly: document.getElementById('ginkgo-native-assembly').checked,
                     backend: document.getElementById('ginkgo-backend').value,
                     solver: document.getElementById('ginkgo-solver').value,
                     preconditioner: document.getElementById('ginkgo-precond').value,

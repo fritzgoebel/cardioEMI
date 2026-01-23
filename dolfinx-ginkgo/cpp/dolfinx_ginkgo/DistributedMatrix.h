@@ -266,4 +266,129 @@ void update_matrix_values_from_petsc(
     gko_mat->read_distributed(mat_data, row_partition, col_partition);
 }
 
+/// Helper: Build matrix_data from COO arrays
+template<typename ValueType, typename GlobalIndexType>
+gko::matrix_data<ValueType, GlobalIndexType>
+build_matrix_data_from_coo(
+    const std::vector<GlobalIndexType>& row_indices,
+    const std::vector<GlobalIndexType>& col_indices,
+    const std::vector<ValueType>& values,
+    GlobalIndexType global_rows,
+    GlobalIndexType global_cols)
+{
+    if (row_indices.size() != col_indices.size() ||
+        row_indices.size() != values.size()) {
+        throw std::invalid_argument(
+            "row_indices, col_indices, and values must have the same size");
+    }
+
+    gko::matrix_data<ValueType, GlobalIndexType> mat_data{
+        gko::dim<2>{static_cast<size_t>(global_rows),
+                   static_cast<size_t>(global_cols)}
+    };
+    mat_data.nonzeros.reserve(values.size());
+
+    for (size_t i = 0; i < values.size(); ++i) {
+        mat_data.nonzeros.emplace_back(row_indices[i], col_indices[i], values[i]);
+    }
+
+    return mat_data;
+}
+
+/// Create a Ginkgo distributed matrix from local COO data in global numbering
+///
+/// This function is designed for direct integration with DOLFINx's native
+/// matrix assembly, bypassing PETSc. Each rank provides its local contributions
+/// (including ghost entries for rows it doesn't own), and Ginkgo handles the
+/// communication to accumulate contributions from different ranks.
+///
+/// @tparam ValueType Matrix value type (typically double)
+/// @tparam LocalIndexType Local index type (typically int32_t)
+/// @tparam GlobalIndexType Global index type (typically int64_t)
+///
+/// @param exec Ginkgo executor (determines where computation happens)
+/// @param gko_comm Ginkgo MPI communicator wrapper
+/// @param row_indices Global row indices of non-zeros (one per entry)
+/// @param col_indices Global column indices of non-zeros (one per entry)
+/// @param values Non-zero values (same length as row_indices and col_indices)
+/// @param global_rows Total number of rows in the global matrix
+/// @param global_cols Total number of columns in the global matrix
+/// @param row_ranges Partition ranges [r0, r1, ..., r_nprocs] defining row ownership
+///                   Rank i owns rows [row_ranges[i], row_ranges[i+1])
+///
+/// @return Shared pointer to the Ginkgo distributed matrix
+///
+/// @note This function uses Ginkgo's assembly::communicate mode, which means:
+///       - Multiple ranks can contribute to the same matrix entry
+///       - Contributions are automatically summed across ranks
+///       - Ghost row entries are communicated to the owning rank
+template<typename ValueType = double,
+         typename LocalIndexType = std::int32_t,
+         typename GlobalIndexType = std::int64_t>
+std::shared_ptr<gko_dist::Matrix<ValueType, LocalIndexType, GlobalIndexType>>
+create_distributed_matrix_from_local_coo(
+    std::shared_ptr<gko::Executor> exec,
+    std::shared_ptr<gko::experimental::mpi::communicator> gko_comm,
+    const std::vector<GlobalIndexType>& row_indices,
+    const std::vector<GlobalIndexType>& col_indices,
+    const std::vector<ValueType>& values,
+    GlobalIndexType global_rows,
+    GlobalIndexType global_cols,
+    const std::vector<GlobalIndexType>& row_ranges)
+{
+    using matrix_type = gko_dist::Matrix<ValueType, LocalIndexType, GlobalIndexType>;
+
+    int size;
+    MPI_Comm_size(gko_comm->get(), &size);
+
+    if (row_ranges.size() != static_cast<size_t>(size + 1)) {
+        throw std::invalid_argument("row_ranges must have size nprocs + 1");
+    }
+
+    auto row_partition = create_partition_from_ranges<LocalIndexType, GlobalIndexType>(
+        exec->get_master(), row_ranges);
+    auto col_partition = row_partition;  // Square matrix
+
+    auto mat_data = build_matrix_data_from_coo<ValueType, GlobalIndexType>(
+        row_indices, col_indices, values, global_rows, global_cols);
+
+    auto dist_mat = matrix_type::create(exec, *gko_comm);
+    dist_mat->read_distributed(mat_data, row_partition, col_partition,
+                               gko::experimental::distributed::assembly_mode::communicate);
+
+    return dist_mat;
+}
+
+/// Update values of an existing Ginkgo distributed matrix from local COO data
+///
+/// Similar to create_distributed_matrix_from_local_coo but updates an existing
+/// matrix. Useful for time-stepping where the sparsity pattern is fixed.
+template<typename ValueType = double,
+         typename LocalIndexType = std::int32_t,
+         typename GlobalIndexType = std::int64_t>
+void update_matrix_from_local_coo(
+    std::shared_ptr<gko_dist::Matrix<ValueType, LocalIndexType, GlobalIndexType>> gko_mat,
+    const std::vector<GlobalIndexType>& row_indices,
+    const std::vector<GlobalIndexType>& col_indices,
+    const std::vector<ValueType>& values,
+    const std::vector<GlobalIndexType>& row_ranges)
+{
+    auto exec = gko_mat->get_executor();
+    auto gko_comm = std::make_shared<gko::experimental::mpi::communicator>(
+        gko_mat->get_communicator());
+    auto dims = gko_mat->get_size();
+
+    auto row_partition = create_partition_from_ranges<LocalIndexType, GlobalIndexType>(
+        exec->get_master(), row_ranges);
+    auto col_partition = row_partition;
+
+    auto mat_data = build_matrix_data_from_coo<ValueType, GlobalIndexType>(
+        row_indices, col_indices, values,
+        static_cast<GlobalIndexType>(dims[0]),
+        static_cast<GlobalIndexType>(dims[1]));
+
+    gko_mat->read_distributed(mat_data, row_partition, col_partition,
+                              gko::experimental::distributed::assembly_mode::communicate);
+}
+
 } // namespace dolfinx_ginkgo

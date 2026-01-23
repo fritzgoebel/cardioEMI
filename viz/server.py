@@ -141,6 +141,7 @@ def update_ginkgo_config():
 
         # Build the ginkgo config dictionary
         ginkgo_dict = {
+            'native_assembly': ginkgo_config.get('nativeAssembly', True),  # Default to native
             'backend': ginkgo_config.get('backend', 'omp'),
             'solver': ginkgo_config.get('solver', 'cg'),
             'preconditioner': ginkgo_config.get('preconditioner', 'jacobi'),

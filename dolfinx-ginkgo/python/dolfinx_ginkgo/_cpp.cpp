@@ -5,6 +5,7 @@
 /// @brief nanobind Python bindings for dolfinx-ginkgo
 
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/vector.h>
@@ -241,6 +242,59 @@ NB_MODULE(_cpp, m) {
           },
           nb::arg("gko_mat"), nb::arg("petsc_mat"),
           "Update Ginkgo matrix values from PETSc Mat");
+
+    // =========================================================================
+    // Native Assembly Functions (bypass PETSc)
+    // =========================================================================
+
+    m.def("create_distributed_matrix_from_local_coo",
+          [](std::shared_ptr<gko::Executor> exec,
+             std::shared_ptr<gko::experimental::mpi::communicator> gko_comm,
+             nb::ndarray<std::int64_t, nb::ndim<1>, nb::c_contig> row_indices,
+             nb::ndarray<std::int64_t, nb::ndim<1>, nb::c_contig> col_indices,
+             nb::ndarray<double, nb::ndim<1>, nb::c_contig> values,
+             std::int64_t global_rows,
+             std::int64_t global_cols,
+             nb::ndarray<std::int64_t, nb::ndim<1>, nb::c_contig> row_ranges) {
+              // Convert ndarray to std::vector
+              std::vector<std::int64_t> rows(row_indices.data(),
+                                              row_indices.data() + row_indices.size());
+              std::vector<std::int64_t> cols(col_indices.data(),
+                                              col_indices.data() + col_indices.size());
+              std::vector<double> vals(values.data(),
+                                       values.data() + values.size());
+              std::vector<std::int64_t> ranges(row_ranges.data(),
+                                                row_ranges.data() + row_ranges.size());
+
+              return create_distributed_matrix_from_local_coo<>(
+                  exec, gko_comm, rows, cols, vals, global_rows, global_cols, ranges);
+          },
+          nb::arg("exec"), nb::arg("comm"),
+          nb::arg("row_indices"), nb::arg("col_indices"), nb::arg("values"),
+          nb::arg("global_rows"), nb::arg("global_cols"), nb::arg("row_ranges"),
+          "Create Ginkgo distributed matrix from local COO data with communication");
+
+    m.def("update_matrix_from_local_coo",
+          [](std::shared_ptr<gko_dist::Matrix<double, std::int32_t, std::int64_t>> gko_mat,
+             nb::ndarray<std::int64_t, nb::ndim<1>, nb::c_contig> row_indices,
+             nb::ndarray<std::int64_t, nb::ndim<1>, nb::c_contig> col_indices,
+             nb::ndarray<double, nb::ndim<1>, nb::c_contig> values,
+             nb::ndarray<std::int64_t, nb::ndim<1>, nb::c_contig> row_ranges) {
+              std::vector<std::int64_t> rows(row_indices.data(),
+                                              row_indices.data() + row_indices.size());
+              std::vector<std::int64_t> cols(col_indices.data(),
+                                              col_indices.data() + col_indices.size());
+              std::vector<double> vals(values.data(),
+                                       values.data() + values.size());
+              std::vector<std::int64_t> ranges(row_ranges.data(),
+                                                row_ranges.data() + row_ranges.size());
+
+              update_matrix_from_local_coo(gko_mat, rows, cols, vals, ranges);
+          },
+          nb::arg("gko_mat"),
+          nb::arg("row_indices"), nb::arg("col_indices"), nb::arg("values"),
+          nb::arg("row_ranges"),
+          "Update Ginkgo matrix values from local COO data with communication");
 
     // =========================================================================
     // Distributed Solver

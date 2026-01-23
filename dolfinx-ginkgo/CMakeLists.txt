@@ -38,12 +38,37 @@ target_include_directories(dolfinx_ginkgo INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 
+# Find METIS and ParMETIS (via scotch) from PETSc installation
+set(PETSC_LIB_HINTS
+    $ENV{PETSC_DIR}/$ENV{PETSC_ARCH}/lib
+    /usr/local/petsc/linux-gnu-real64-32/lib
+    /usr/local/petsc/linux-gnu-complex64-32/lib
+)
+find_library(METIS_LIBRARY NAMES metis HINTS ${PETSC_LIB_HINTS})
+find_library(PTSCOTCHPARMETIS_LIBRARY NAMES ptscotchparmetisv3 HINTS ${PETSC_LIB_HINTS})
+find_library(SCOTCH_LIBRARY NAMES scotch HINTS ${PETSC_LIB_HINTS})
+find_library(SCOTCHERR_LIBRARY NAMES scotcherr HINTS ${PETSC_LIB_HINTS})
+
 target_link_libraries(dolfinx_ginkgo INTERFACE
     Ginkgo::ginkgo
     dolfinx
     MPI::MPI_CXX
     PkgConfig::PETSC
 )
+
+# Add METIS/ParMETIS if found
+if(METIS_LIBRARY)
+    target_link_libraries(dolfinx_ginkgo INTERFACE ${METIS_LIBRARY})
+endif()
+if(PTSCOTCHPARMETIS_LIBRARY)
+    target_link_libraries(dolfinx_ginkgo INTERFACE ${PTSCOTCHPARMETIS_LIBRARY})
+endif()
+if(SCOTCH_LIBRARY)
+    target_link_libraries(dolfinx_ginkgo INTERFACE ${SCOTCH_LIBRARY})
+endif()
+if(SCOTCHERR_LIBRARY)
+    target_link_libraries(dolfinx_ginkgo INTERFACE ${SCOTCHERR_LIBRARY})
+endif()
 
 # DOLFINx target may be named differently
 if(TARGET DOLFINX::dolfinx)

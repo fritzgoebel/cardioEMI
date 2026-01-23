@@ -13,6 +13,7 @@ from pathlib  import Path
 from petsc4py import PETSc
 from utils             import *
 from ionic_model       import *
+from native_assembly   import assemble_block_to_coo
 
 # Optional Ginkgo solver backend
 try:
@@ -334,12 +335,36 @@ t1 = time.perf_counter()
 # #      MATRIX ASSEMBLY      #
 # #---------------------------#
 
-# Assemble the block linear system matrix
-A = multiphenicsx.fem.petsc.assemble_matrix_block(a, bcs=bcs, restriction=(restriction, restriction))
-A.assemble()
-assemble_time += time.perf_counter() - t1 # Add time lapsed to total assembly time
+# Check if using Ginkgo with native assembly
+solver_backend = params.get("solver_backend", "petsc").lower()
+use_ginkgo = solver_backend == "ginkgo" and GINKGO_AVAILABLE
+ginkgo_cfg = params.get("ginkgo", {}) if use_ginkgo else {}
+use_native_assembly = use_ginkgo and ginkgo_cfg.get("native_assembly", False)
 
-if comm.rank == 0: print(f"Assembling matrix A:    {time.perf_counter() - t1:.2f} seconds")
+if use_native_assembly:
+    # Native assembly path - assemble directly to COO for Ginkgo
+    if comm.rank == 0:
+        print("Using native Ginkgo assembly (bypassing PETSc matrix)")
+
+    coo_data = assemble_block_to_coo(a, restriction, bcs, comm)
+    coo_row_indices, coo_col_indices, coo_values, coo_global_size, coo_row_ranges = coo_data
+    assemble_time += time.perf_counter() - t1
+
+    if comm.rank == 0:
+        print(f"Assembling matrix (native): {time.perf_counter() - t1:.2f} seconds")
+        print(f"  Global size: {coo_global_size}, Local nnz: {len(coo_values)}")
+
+    A = None  # No PETSc matrix
+else:
+    # PETSc assembly path (original)
+    A = multiphenicsx.fem.petsc.assemble_matrix_block(a, bcs=bcs, restriction=(restriction, restriction))
+    A.assemble()
+    assemble_time += time.perf_counter() - t1
+
+    if comm.rank == 0:
+        print(f"Assembling matrix A:    {time.perf_counter() - t1:.2f} seconds")
+        m, n = A.getSize()
+        print(f"  PETSc matrix size: {m} x {n}")
 
 # # Save A
 # save_petsc_matrix_to_matlab(A, 'output/A.mat','A')
@@ -351,7 +376,7 @@ if comm.rank == 0: print(f"Assembling matrix A:    {time.perf_counter() - t1:.2f
 #        CREATE NULLSPACE         #
 #---------------------------------#
 
-if not Dirichletbc:
+if not Dirichletbc and A is not None:
     # Create the PETSc nullspace vector and check that it is a valid nullspace of A
     nullspace = PETSc.NullSpace().create(constant=True,comm=comm)
     assert nullspace.test(A)
@@ -362,23 +387,18 @@ if not Dirichletbc:
     A.setOption(PETSc.Mat.Option.SYMMETRY_ETERNAL, True)
     # Set the nullspace
     A.setNullSpace(nullspace)
-    if params["ksp_type"] == "cg":        
+    if params["ksp_type"] == "cg":
         A.setNearNullSpace(nullspace)
-    
+
 #---------------------------------#
 #      CONFIGURE SOLVER           #
 #---------------------------------#
-
-# Check solver backend
-solver_backend = params.get("solver_backend", "petsc").lower()
-use_ginkgo = solver_backend == "ginkgo" and GINKGO_AVAILABLE
 
 if use_ginkgo:
     if comm.rank == 0:
         print(f"Using Ginkgo solver backend")
 
-    # Get Ginkgo-specific configuration
-    ginkgo_cfg = params.get("ginkgo", {})
+    # Get Ginkgo-specific configuration (already loaded above for native_assembly check)
     gko_backend = ginkgo_cfg.get("backend", "omp")
     gko_solver = ginkgo_cfg.get("solver", "cg")
     gko_precond = ginkgo_cfg.get("preconditioner", "jacobi")
@@ -397,9 +417,8 @@ if use_ginkgo:
             "relaxation_factor": float(amg_cfg.get("relaxation_factor", 0.9)),
         }
 
-    # Create Ginkgo solver
+    # Create Ginkgo solver (without matrix - set operator separately)
     ginkgo_solver = GinkgoSolver(
-        A,
         comm=comm,
         backend=gko_backend,
         solver=gko_solver,
@@ -410,6 +429,16 @@ if use_ginkgo:
         amg_config=amg_config,
         verbose=params.get("verbose", False)
     )
+
+    # Set operator based on assembly method
+    if use_native_assembly:
+        ginkgo_solver.set_operator_from_local_coo(
+            coo_row_indices, coo_col_indices, coo_values,
+            coo_global_size, coo_global_size, coo_row_ranges
+        )
+    else:
+        ginkgo_solver.set_operator_from_petsc(A)
+
     ksp = None  # Not using PETSc KSP
 else:
     if comm.rank == 0:

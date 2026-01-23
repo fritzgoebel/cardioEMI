@@ -114,12 +114,12 @@ class GinkgoSolver:
 
     def __init__(
         self,
-        A: Any,  # PETSc.Mat
+        A: Any = None,  # PETSc.Mat (optional for backward compatibility)
         comm: MPI.Comm = MPI.COMM_WORLD,
-        backend: Literal["reference", "omp", "cuda", "hip", "sycl"] = "cuda",
+        backend: Literal["reference", "omp", "cuda", "hip", "sycl"] = "omp",
         device_id: int = 0,
         solver: Literal["cg", "fcg", "gmres", "bicgstab", "cgs"] = "cg",
-        preconditioner: Literal["none", "jacobi", "block_jacobi", "ilu", "ic", "isai", "amg"] = "amg",
+        preconditioner: Literal["none", "jacobi", "block_jacobi", "ilu", "ic", "isai", "amg"] = "jacobi",
         rtol: float = 1e-8,
         atol: float = 1e-12,
         max_iter: int = 1000,
@@ -183,20 +183,89 @@ class GinkgoSolver:
         if preconditioner.lower() == "amg" and amg_config is not None:
             self._configure_amg(config.amg, amg_config, _cpp)
 
-        # Create Ginkgo distributed matrix from PETSc
-        self._A_gko = _cpp.create_distributed_matrix_from_petsc(
-            self._exec, self._gko_comm, A
-        )
-
-        # Create solver
-        self._solver = _cpp.DistributedSolver(self._exec, self._gko_comm, config)
-        self._solver.set_operator(self._A_gko)
-
         # Store references
         self._config = config
         self._comm = comm
         self._cpp = _cpp
+        self._A_gko = None
+        self._A_petsc = None
+        self._solver = None
+        self._row_ranges = None
+
+        # If matrix provided, set it (backward compatibility)
+        if A is not None:
+            self.set_operator_from_petsc(A)
+
+    def set_operator_from_petsc(self, A: Any) -> None:
+        """
+        Set the system matrix from a PETSc Mat.
+
+        Parameters
+        ----------
+        A : PETSc.Mat
+            System matrix (distributed MPIAIJ or sequential SEQAIJ)
+        """
+        _cpp = self._cpp
+
+        self._A_gko = _cpp.create_distributed_matrix_from_petsc(
+            self._exec, self._gko_comm, A
+        )
         self._A_petsc = A
+
+        if self._solver is None:
+            self._solver = _cpp.DistributedSolver(self._exec, self._gko_comm, self._config)
+        self._solver.set_operator(self._A_gko)
+
+    def set_operator_from_local_coo(
+        self,
+        row_indices,  # np.ndarray[int64]
+        col_indices,  # np.ndarray[int64]
+        values,       # np.ndarray[float64]
+        global_rows: int,
+        global_cols: int,
+        row_ranges,   # np.ndarray[int64]
+    ) -> None:
+        """
+        Set the system matrix from local COO data in global numbering.
+
+        Each rank provides its local contributions. Entries for the same
+        (row, col) from different ranks are automatically summed by Ginkgo.
+
+        Parameters
+        ----------
+        row_indices : ndarray[int64]
+            Global row indices of non-zeros
+        col_indices : ndarray[int64]
+            Global column indices of non-zeros
+        values : ndarray[float64]
+            Non-zero values
+        global_rows : int
+            Total number of rows in the global matrix
+        global_cols : int
+            Total number of columns in the global matrix
+        row_ranges : ndarray[int64]
+            Partition ranges [r0, r1, ..., r_nprocs] defining row ownership.
+            Rank i owns rows [row_ranges[i], row_ranges[i+1]).
+        """
+        import numpy as np
+        _cpp = self._cpp
+
+        row_indices = np.ascontiguousarray(row_indices, dtype=np.int64)
+        col_indices = np.ascontiguousarray(col_indices, dtype=np.int64)
+        values = np.ascontiguousarray(values, dtype=np.float64)
+        row_ranges = np.ascontiguousarray(row_ranges, dtype=np.int64)
+
+        self._A_gko = _cpp.create_distributed_matrix_from_local_coo(
+            self._exec, self._gko_comm,
+            row_indices, col_indices, values,
+            global_rows, global_cols, row_ranges
+        )
+        self._row_ranges = row_ranges
+        self._A_petsc = None
+
+        if self._solver is None:
+            self._solver = _cpp.DistributedSolver(self._exec, self._gko_comm, self._config)
+        self._solver.set_operator(self._A_gko)
 
     def _configure_amg(self, amg, cfg: dict, _cpp) -> None:
         """Apply user AMG configuration."""
@@ -269,6 +338,10 @@ class GinkgoSolver:
         int
             Number of iterations. Negative if not converged.
         """
+        if self._solver is None:
+            raise RuntimeError("No matrix set. Call set_operator_from_petsc() or "
+                             "set_operator_from_local_coo() first.")
+
         _cpp = self._cpp
 
         # Convert to Ginkgo vectors
@@ -283,12 +356,9 @@ class GinkgoSolver:
 
         return iters
 
-    def update_operator(self, A: Any) -> None:
+    def update_operator_from_petsc(self, A: Any) -> None:
         """
-        Update the system matrix (reuse preconditioner structure if possible).
-
-        This is useful for time-stepping where the matrix structure is fixed
-        but values change.
+        Update the system matrix from PETSc (reuse structure if possible).
 
         Parameters
         ----------
@@ -298,6 +368,48 @@ class GinkgoSolver:
         _cpp = self._cpp
         _cpp.update_matrix_values_from_petsc(self._A_gko, A)
         self._A_petsc = A
+
+    def update_operator_from_local_coo(
+        self,
+        row_indices,
+        col_indices,
+        values,
+        row_ranges=None,
+    ) -> None:
+        """
+        Update the system matrix from local COO data.
+
+        Parameters
+        ----------
+        row_indices : ndarray[int64]
+            Global row indices of non-zeros
+        col_indices : ndarray[int64]
+            Global column indices of non-zeros
+        values : ndarray[float64]
+            Non-zero values
+        row_ranges : ndarray[int64], optional
+            Partition ranges. If None, uses ranges from initial set_operator call.
+        """
+        import numpy as np
+        _cpp = self._cpp
+
+        row_indices = np.ascontiguousarray(row_indices, dtype=np.int64)
+        col_indices = np.ascontiguousarray(col_indices, dtype=np.int64)
+        values = np.ascontiguousarray(values, dtype=np.float64)
+
+        if row_ranges is None:
+            row_ranges = self._row_ranges
+        else:
+            row_ranges = np.ascontiguousarray(row_ranges, dtype=np.int64)
+
+        _cpp.update_matrix_from_local_coo(
+            self._A_gko, row_indices, col_indices, values, row_ranges
+        )
+
+    # Backward compatibility alias
+    def update_operator(self, A: Any) -> None:
+        """Alias for update_operator_from_petsc (backward compatibility)."""
+        self.update_operator_from_petsc(A)
 
     def set_tolerance(self, rtol: float, atol: float = 1e-12) -> None:
         """Update convergence tolerances."""
