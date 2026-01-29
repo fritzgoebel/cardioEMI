@@ -14,7 +14,39 @@ import re
 import h5py
 import numpy as np
 from pathlib import Path
-from flask import Flask, request, jsonify, send_from_directory, Response
+from flask import Flask, request, send_from_directory, Response
+import math
+
+
+class NaNSafeJSONEncoder(json.JSONEncoder):
+    """JSON encoder that converts NaN/Inf to null for valid JSON output."""
+    def default(self, obj):
+        if isinstance(obj, float):
+            if math.isnan(obj) or math.isinf(obj):
+                return None
+        return super().default(obj)
+
+    def encode(self, obj):
+        return super().encode(self._sanitize(obj))
+
+    def _sanitize(self, obj):
+        if isinstance(obj, float):
+            if math.isnan(obj) or math.isinf(obj):
+                return None
+        elif isinstance(obj, dict):
+            return {k: self._sanitize(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._sanitize(v) for v in obj]
+        return obj
+
+
+def jsonify(obj):
+    """Custom jsonify that handles NaN/Inf values."""
+    return Response(
+        json.dumps(obj, cls=NaNSafeJSONEncoder),
+        mimetype='application/json'
+    )
+
 
 app = Flask(__name__, static_folder='.')
 PROJECT_ROOT = Path(__file__).parent.parent.absolute()
@@ -142,6 +174,7 @@ def update_ginkgo_config():
         # Build the ginkgo config dictionary
         ginkgo_dict = {
             'native_assembly': ginkgo_config.get('nativeAssembly', True),  # Default to native
+            'dd_matrix': ginkgo_config.get('ddMatrix', False),  # Domain decomposition matrix
             'backend': ginkgo_config.get('backend', 'omp'),
             'solver': ginkgo_config.get('solver', 'cg'),
             'preconditioner': ginkgo_config.get('preconditioner', 'jacobi'),
@@ -159,6 +192,31 @@ def update_ginkgo_config():
                 'smoother': amg_config.get('smoother', 'jacobi'),
                 'relaxation_factor': float(amg_config.get('relaxationFactor', 0.9))
             }
+
+        # Add BDDC config if present
+        bddc_config = ginkgo_config.get('bddc', {})
+        if bddc_config:
+            bddc_dict = {
+                'local_solver': bddc_config.get('localSolver', 'direct'),
+                'coarse_solver': bddc_config.get('coarseSolver', 'cg'),
+                'coarse_max_iterations': int(bddc_config.get('coarseMaxIterations', 100)),
+                'vertices': bddc_config.get('vertices', True),
+                'edges': bddc_config.get('edges', True),
+                'faces': bddc_config.get('faces', True)
+            }
+
+            # Add local AMG config if present
+            local_amg_config = bddc_config.get('localAmg', {})
+            if local_amg_config:
+                bddc_dict['local_amg'] = {
+                    'smoother': local_amg_config.get('smoother', 'jacobi'),
+                    'smooth_steps': int(local_amg_config.get('smoothSteps', 1)),
+                    'max_levels': int(local_amg_config.get('maxLevels', 10)),
+                    'coarse_solver': local_amg_config.get('coarseSolver', 'direct'),
+                    'relaxation_factor': float(local_amg_config.get('relaxationFactor', 0.9))
+                }
+
+            ginkgo_dict['bddc'] = bddc_dict
 
         config['ginkgo'] = ginkgo_dict
 
@@ -358,9 +416,9 @@ def run_simulation():
 
     # Select Docker image based on solver backend
     if solver_backend == 'ginkgo':
-        docker_image = 'dolfinx-ginkgo:latest'
-        # For Ginkgo, we need to build the Python bindings first if not already done
-        setup_cmd = 'cd dolfinx-ginkgo && mkdir -p build && cd build && cmake .. -DCMAKE_PREFIX_PATH=/usr/local/dolfinx-real -DDOLFINX_GINKGO_BUILD_PYTHON=ON && make -j2 && cd /home/fenics && '
+        docker_image = 'dolfinx-ginkgo:bddc'
+        # For Ginkgo, build Python bindings only if not already built or if source changed
+        setup_cmd = 'cd dolfinx-ginkgo && if [ ! -f build/_cpp*.so ] || [ python/dolfinx_ginkgo/_cpp.cpp -nt build/_cpp*.so ]; then rm -rf build && mkdir -p build && cd build && cmake .. -DCMAKE_PREFIX_PATH=/usr/local/dolfinx-real -DDOLFINX_GINKGO_BUILD_PYTHON=ON && make -j2; else echo "Ginkgo bindings up to date"; fi && cd /home/fenics && '
     else:
         docker_image = 'ghcr.io/fenics/dolfinx/dolfinx:v0.9.0'
         setup_cmd = ''
@@ -378,7 +436,7 @@ def run_simulation():
             '-w', '/home/fenics',
             docker_image,
             'bash', '-c',
-            f'{setup_cmd}pip install --no-build-isolation -q -r requirements.txt && mpirun -n {ranks} python3 -u main.py {config_file}'
+            f'{setup_cmd}pip install --no-build-isolation -q -r requirements.txt && mpirun -n {ranks} python3 -B -u main.py {config_file}'
         ]
 
         try:
@@ -593,7 +651,9 @@ def get_results():
                     vij_data[pair] = {}
                     for key in timestep_keys:
                         if key in v_group:
-                            vij_data[pair][key] = v_group[key][:].flatten()
+                            v_arr = v_group[key][:].flatten()
+                            # Replace NaN/Inf with 0 for valid JSON
+                            vij_data[pair][key] = np.nan_to_num(v_arr, nan=0.0, posinf=0.0, neginf=0.0)
 
             # Build per-vertex voltages for expanded mesh
             num_facets = len(facet_orig_vertices)
@@ -638,13 +698,15 @@ def get_results():
                 times = []
                 for key in timestep_keys:
                     v_data = v_group[key][:].flatten()
+                    # Replace NaN/Inf with 0 for valid JSON
+                    v_data = np.nan_to_num(v_data, nan=0.0, posinf=0.0, neginf=0.0)
                     voltages.append(v_data.tolist())
                     times.append(parse_time(key))
 
-        # Compute voltage range
+        # Compute voltage range (using nan-safe functions)
         all_v = np.concatenate([np.array(v) for v in voltages])
-        v_min = float(np.min(all_v))
-        v_max = float(np.max(all_v))
+        v_min = float(np.nanmin(all_v)) if not np.all(np.isnan(all_v)) else 0.0
+        v_max = float(np.nanmax(all_v)) if not np.all(np.isnan(all_v)) else 0.0
 
         # Load iterations if available
         iterations_path = sim_output_dir / 'iterations.pickle'
@@ -691,6 +753,20 @@ def get_results():
         if cut_ranks_path.exists():
             cut_ranks_data = np.fromfile(cut_ranks_path, dtype=np.int32).tolist()
 
+        # Load DOF indices for interface highlighting
+        # The facet_orig_vertices gives the original vertex (DOF) index for each viz vertex
+        dof_indices = None
+        if facet_orig_vertices is not None:
+            # Flatten the facet vertex indices to get per-viz-vertex DOF indices
+            dof_indices = facet_orig_vertices.flatten().tolist()
+
+        # Load ECS DOF indices for interface highlighting on ECS mesh
+        ecs_dof_indices = None
+        ecs_orig_vertices_path = mesh_data_dir / 'ecs_orig_vertices.bin'
+        if ecs_orig_vertices_path.exists():
+            ecs_orig_vertices = np.fromfile(ecs_orig_vertices_path, dtype=np.uint32).reshape(-1, 3)
+            ecs_dof_indices = ecs_orig_vertices.flatten().tolist()
+
         return jsonify({
             'voltages': voltages,
             'times': times,
@@ -706,12 +782,90 @@ def get_results():
             'rankCentroids': rank_centroids,
             'globalCentroid': global_centroid,
             'ecsRanks': ecs_ranks_data,
-            'cutRanks': cut_ranks_data
+            'cutRanks': cut_ranks_data,
+            'dofIndices': dof_indices,
+            'ecsDofIndices': ecs_dof_indices
         })
 
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+# --------------------- Interface Data API ---------------------
+
+@app.route('/api/interfaces')
+def get_interfaces():
+    """Load BDDC interface data from IF_*.txt files and map to mesh vertices."""
+    import pickle
+
+    interfaces = {}
+
+    # Find all IF_*.txt files in project root
+    for if_file in PROJECT_ROOT.glob('IF_*.txt'):
+        try:
+            rank = int(if_file.stem.split('_')[1])
+            with open(if_file, 'r') as f:
+                content = f.read().strip()
+                if content:
+                    # Each line is one interface (space-separated DOF indices)
+                    rank_interfaces = []
+                    for line in content.split('\n'):
+                        line = line.strip()
+                        if line:
+                            indices = [int(x) for x in line.split()]
+                            if indices:
+                                rank_interfaces.append(indices)
+                    interfaces[rank] = rank_interfaces
+        except (ValueError, IOError) as e:
+            print(f"Warning: Could not parse {if_file}: {e}")
+            continue
+
+    if not interfaces:
+        return jsonify({'interfaces': {}, 'numRanks': 0, 'message': 'No interface files found'})
+
+    num_ranks = max(interfaces.keys()) + 1
+
+    # Load matrix-to-vertex mapping if available
+    # This maps matrix global DOF indices to mesh vertex indices
+    matrix_to_vertex = None
+    for sim_dir in PROJECT_ROOT.glob('*_sim'):
+        mapping_file = sim_dir / 'matrix_to_vertex.pickle'
+        if mapping_file.exists():
+            try:
+                with open(mapping_file, 'rb') as f:
+                    matrix_to_vertex = pickle.load(f)
+                print(f"Loaded matrix-to-vertex mapping from {mapping_file} ({len(matrix_to_vertex)} entries)")
+                break
+            except Exception as e:
+                print(f"Warning: Could not load {mapping_file}: {e}")
+
+    # Convert interface DOF indices to mesh vertex indices
+    interface_vertices = {}
+    all_interface_vertices = set()
+
+    if matrix_to_vertex:
+        for rank, rank_interfaces in interfaces.items():
+            rank_vertex_interfaces = []
+            for interface in rank_interfaces:
+                vertex_indices = []
+                for dof in interface:
+                    if dof in matrix_to_vertex:
+                        vertex_indices.append(matrix_to_vertex[dof])
+                if vertex_indices:
+                    rank_vertex_interfaces.append(vertex_indices)
+                    all_interface_vertices.update(vertex_indices)
+            interface_vertices[rank] = rank_vertex_interfaces
+    else:
+        # No mapping available - return empty
+        print("Warning: No matrix_to_vertex.pickle found - interface visualization won't work")
+
+    return jsonify({
+        'interfaces': interface_vertices,  # Now contains mesh vertex indices
+        'numRanks': num_ranks,
+        'allInterfaceVertices': sorted(list(all_interface_vertices)),
+        'totalInterfaces': sum(len(v) for v in interface_vertices.values()),
+        'hasMappingFile': matrix_to_vertex is not None
+    })
 
 # --------------------- Video Export API ---------------------
 

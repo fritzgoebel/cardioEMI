@@ -33,6 +33,118 @@ class Viewer {
         this.ecsRanksData = null;
         this.cutRanksData = null;
 
+        // Current colormap
+        this.colormap = 'coolwarm';
+
+        // Available colormaps with their definitions
+        this.colormaps = {
+            coolwarm: {
+                name: 'Cool to Warm',
+                colors: [[0, 0, 1], [1, 1, 1], [1, 0, 0]],  // blue -> white -> red
+                positions: [0, 0.5, 1]
+            },
+            viridis: {
+                name: 'Viridis',
+                colors: [
+                    [0.267, 0.004, 0.329],
+                    [0.282, 0.140, 0.458],
+                    [0.254, 0.265, 0.530],
+                    [0.207, 0.372, 0.553],
+                    [0.164, 0.471, 0.558],
+                    [0.128, 0.567, 0.551],
+                    [0.135, 0.659, 0.518],
+                    [0.267, 0.749, 0.441],
+                    [0.478, 0.821, 0.318],
+                    [0.741, 0.873, 0.150],
+                    [0.993, 0.906, 0.144]
+                ],
+                positions: [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
+            },
+            plasma: {
+                name: 'Plasma',
+                colors: [
+                    [0.050, 0.030, 0.528],
+                    [0.294, 0.012, 0.615],
+                    [0.492, 0.012, 0.658],
+                    [0.658, 0.134, 0.588],
+                    [0.798, 0.280, 0.470],
+                    [0.899, 0.434, 0.358],
+                    [0.963, 0.600, 0.246],
+                    [0.984, 0.775, 0.154],
+                    [0.940, 0.975, 0.131]
+                ],
+                positions: [0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1]
+            },
+            inferno: {
+                name: 'Inferno',
+                colors: [
+                    [0.001, 0.000, 0.014],
+                    [0.133, 0.047, 0.298],
+                    [0.341, 0.062, 0.429],
+                    [0.550, 0.126, 0.405],
+                    [0.735, 0.216, 0.330],
+                    [0.878, 0.352, 0.218],
+                    [0.963, 0.537, 0.114],
+                    [0.988, 0.751, 0.145],
+                    [0.988, 0.998, 0.645]
+                ],
+                positions: [0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1]
+            },
+            jet: {
+                name: 'Jet (Rainbow)',
+                colors: [
+                    [0, 0, 0.5],
+                    [0, 0, 1],
+                    [0, 1, 1],
+                    [1, 1, 0],
+                    [1, 0, 0],
+                    [0.5, 0, 0]
+                ],
+                positions: [0, 0.125, 0.375, 0.625, 0.875, 1]
+            },
+            grayscale: {
+                name: 'Grayscale',
+                colors: [[0, 0, 0], [1, 1, 1]],
+                positions: [0, 1]
+            },
+            turbo: {
+                name: 'Turbo',
+                colors: [
+                    [0.190, 0.072, 0.232],
+                    [0.254, 0.265, 0.600],
+                    [0.137, 0.514, 0.855],
+                    [0.059, 0.718, 0.675],
+                    [0.318, 0.855, 0.400],
+                    [0.651, 0.929, 0.255],
+                    [0.929, 0.855, 0.200],
+                    [0.996, 0.620, 0.161],
+                    [0.957, 0.353, 0.161],
+                    [0.796, 0.118, 0.173]
+                ],
+                positions: [0, 0.11, 0.22, 0.33, 0.44, 0.55, 0.66, 0.77, 0.88, 1]
+            }
+        };
+
+        // Interface color palette - distinct from rank colors
+        this.interfaceColors = [
+            { r: 1.00, g: 0.84, b: 0.00 },  // Gold
+            { r: 0.00, g: 1.00, b: 0.50 },  // Spring Green
+            { r: 1.00, g: 0.41, b: 0.71 },  // Hot Pink
+            { r: 0.00, g: 0.80, b: 1.00 },  // Deep Sky Blue
+            { r: 1.00, g: 0.55, b: 0.00 },  // Dark Orange
+            { r: 0.58, g: 0.00, b: 0.83 },  // Dark Violet
+            { r: 0.00, g: 1.00, b: 1.00 },  // Cyan
+            { r: 1.00, g: 0.27, b: 0.00 },  // Orange Red
+            { r: 0.50, g: 1.00, b: 0.00 },  // Chartreuse
+            { r: 1.00, g: 0.08, b: 0.58 },  // Deep Pink
+            { r: 0.25, g: 0.88, b: 0.82 },  // Turquoise
+            { r: 1.00, g: 0.65, b: 0.00 },  // Orange
+            { r: 0.80, g: 0.52, b: 0.25 },  // Peru
+            { r: 0.60, g: 0.80, b: 0.20 },  // Yellow Green
+            { r: 0.94, g: 0.50, b: 0.50 },  // Light Coral
+            { r: 0.49, g: 0.99, b: 0.00 },  // Lawn Green
+        ];
+
         // Categorical colormap for ranks (Tableau 20-like)
         this.rankColors = [
             { r: 0.12, g: 0.47, b: 0.71 },  // Blue
@@ -64,28 +176,73 @@ class Viewer {
         return this.rankColors[colorIndex];
     }
 
-    // Blue to Red colormap (like ParaView's "Cool to Warm")
+    // Set the active colormap
+    setColormap(colormapName) {
+        if (this.colormaps[colormapName]) {
+            this.colormap = colormapName;
+        }
+    }
+
+    // Get the current colormap name
+    getColormap() {
+        return this.colormap;
+    }
+
+    // Get list of available colormaps
+    getAvailableColormaps() {
+        return Object.entries(this.colormaps).map(([key, val]) => ({
+            id: key,
+            name: val.name
+        }));
+    }
+
+    // Get CSS gradient for the current colormap (for colorbar)
+    getColormapGradient() {
+        const cm = this.colormaps[this.colormap];
+        const stops = cm.colors.map((color, i) => {
+            const r = Math.round(color[0] * 255);
+            const g = Math.round(color[1] * 255);
+            const b = Math.round(color[2] * 255);
+            const pos = (1 - cm.positions[i]) * 100;  // Invert for top-to-bottom
+            return `rgb(${r}, ${g}, ${b}) ${pos}%`;
+        });
+        return `linear-gradient(to bottom, ${stops.join(', ')})`;
+    }
+
+    // Map value to color using the current colormap
     voltageToColor(v) {
         // Normalize voltage to 0-1 range
         const t = Math.max(0, Math.min(1, (v - this.vMin) / (this.vMax - this.vMin)));
 
-        // Blue (cold) -> White (mid) -> Red (hot)
-        let r, g, b;
-        if (t < 0.5) {
-            // Blue to White
-            const s = t * 2;
-            r = s;
-            g = s;
-            b = 1;
-        } else {
-            // White to Red
-            const s = (t - 0.5) * 2;
-            r = 1;
-            g = 1 - s;
-            b = 1 - s;
+        const cm = this.colormaps[this.colormap];
+        const colors = cm.colors;
+        const positions = cm.positions;
+
+        // Find the two colors to interpolate between
+        let i = 0;
+        while (i < positions.length - 1 && positions[i + 1] < t) {
+            i++;
         }
 
-        return { r, g, b };
+        // Handle edge cases
+        if (i >= positions.length - 1) {
+            const c = colors[colors.length - 1];
+            return { r: c[0], g: c[1], b: c[2] };
+        }
+
+        // Interpolate between colors[i] and colors[i+1]
+        const t0 = positions[i];
+        const t1 = positions[i + 1];
+        const localT = (t - t0) / (t1 - t0);
+
+        const c0 = colors[i];
+        const c1 = colors[i + 1];
+
+        return {
+            r: c0[0] + (c1[0] - c0[0]) * localT,
+            g: c0[1] + (c1[1] - c0[1]) * localT,
+            b: c0[2] + (c1[2] - c0[2]) * localT
+        };
     }
 
     async init(meshData) {
@@ -234,6 +391,11 @@ class Viewer {
         if (this.ecsMeshObject) {
             this.ecsMeshObject.visible = visible;
         }
+        // Rebuild interface points when ECS visibility changes
+        // (to add/remove ECS interface points while keeping membrane ones)
+        if (this.highlightedInterfaceMap) {
+            this.updateInterfacePoints();
+        }
     }
 
     setEcsOpacity(opacity) {
@@ -364,6 +526,15 @@ class Viewer {
         this.cutRanksData = cutRanksData;
         this.rankCentroids = rankCentroids;
         this.globalCentroid = globalCentroid;
+
+        // Initialize visible ranks to all
+        if (ranksData) {
+            const maxRank = Math.max(...ranksData);
+            this.visibleRanks = new Set();
+            for (let i = 0; i <= maxRank; i++) {
+                this.visibleRanks.add(i);
+            }
+        }
     }
 
     // Apply explosion effect - moves each rank's vertices away from center
@@ -440,6 +611,9 @@ class Viewer {
             this.cutMeshObject.geometry.attributes.position.needsUpdate = true;
             this.cutMeshObject.geometry.computeVertexNormals();
         }
+
+        // Update interface points positions if they exist
+        this.updateInterfacePoints();
     }
 
     // Update ECS colors based on rank
@@ -663,5 +837,308 @@ class Viewer {
             up: this.camera.up.toArray(),
             fov: this.camera.fov
         };
+    }
+
+    // Set which ranks are visible (for partition view filtering)
+    setVisibleRanks(visibleRanks) {
+        this.visibleRanks = new Set(visibleRanks);
+        this.updateRankVisibility();
+    }
+
+    // Update mesh visibility based on selected ranks - actually hide geometry
+    updateRankVisibility() {
+        if (!this.meshObject || !this.ranksData || !this.visibleRanks) return;
+
+        const geometry = this.meshObject.geometry;
+        const colors = geometry.attributes.color.array;
+
+        // Store original indices if not already stored
+        if (!this.originalFacets) {
+            this.originalFacets = new Uint32Array(geometry.index.array);
+        }
+
+        // Build filtered index array - only include triangles where vertices are in visible ranks
+        const filteredIndices = [];
+        for (let i = 0; i < this.originalFacets.length; i += 3) {
+            const v0 = this.originalFacets[i];
+            const v1 = this.originalFacets[i + 1];
+            const v2 = this.originalFacets[i + 2];
+
+            // Check if any vertex of this triangle belongs to a visible rank
+            // (vertices on rank boundaries are duplicated, so checking first vertex is sufficient)
+            const rank = this.ranksData[v0];
+            if (this.visibleRanks.has(rank)) {
+                filteredIndices.push(v0, v1, v2);
+            }
+        }
+
+        // Update geometry index
+        geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(filteredIndices), 1));
+
+        // Update colors for visible vertices (with interface highlighting)
+        for (let i = 0; i < this.ranksData.length; i++) {
+            const rank = this.ranksData[i];
+            // Check if this vertex is an interface DOF that should be highlighted
+            if (this.highlightedInterfaceMap && this.dofIndices) {
+                const dofIndex = this.dofIndices[i];
+                if (this.highlightedInterfaceMap.has(dofIndex)) {
+                    // Get the interface-specific color
+                    const interfaceIdx = this.highlightedInterfaceMap.get(dofIndex);
+                    const color = this.interfaceToColor(interfaceIdx);
+                    colors[i * 3] = color.r;
+                    colors[i * 3 + 1] = color.g;
+                    colors[i * 3 + 2] = color.b;
+                } else {
+                    const color = this.rankToColor(rank);
+                    colors[i * 3] = color.r;
+                    colors[i * 3 + 1] = color.g;
+                    colors[i * 3 + 2] = color.b;
+                }
+            } else {
+                const color = this.rankToColor(rank);
+                colors[i * 3] = color.r;
+                colors[i * 3 + 1] = color.g;
+                colors[i * 3 + 2] = color.b;
+            }
+        }
+
+        geometry.attributes.color.needsUpdate = true;
+        geometry.computeVertexNormals();
+
+        // Update ECS mesh - filter by rank
+        if (this.ecsMeshObject && this.ecsRanksData) {
+            const ecsGeometry = this.ecsMeshObject.geometry;
+            if (!this.originalEcsFacets) {
+                this.originalEcsFacets = new Uint32Array(ecsGeometry.index.array);
+            }
+
+            const ecsFilteredIndices = [];
+            for (let i = 0; i < this.originalEcsFacets.length; i += 3) {
+                const v0 = this.originalEcsFacets[i];
+                const rank = this.ecsRanksData[v0];
+                if (this.visibleRanks.has(rank)) {
+                    ecsFilteredIndices.push(this.originalEcsFacets[i], this.originalEcsFacets[i + 1], this.originalEcsFacets[i + 2]);
+                }
+            }
+
+            ecsGeometry.setIndex(new THREE.BufferAttribute(new Uint32Array(ecsFilteredIndices), 1));
+
+            // Update ECS colors (with interface highlighting)
+            const ecsColors = ecsGeometry.attributes.color.array;
+            for (let i = 0; i < this.ecsRanksData.length; i++) {
+                // Check if this ECS vertex is an interface DOF
+                if (this.highlightedInterfaceMap && this.ecsDofIndices) {
+                    const dofIndex = this.ecsDofIndices[i];
+                    if (this.highlightedInterfaceMap.has(dofIndex)) {
+                        // Get the interface-specific color
+                        const interfaceIdx = this.highlightedInterfaceMap.get(dofIndex);
+                        const color = this.interfaceToColor(interfaceIdx);
+                        ecsColors[i * 3] = color.r;
+                        ecsColors[i * 3 + 1] = color.g;
+                        ecsColors[i * 3 + 2] = color.b;
+                    } else {
+                        const color = this.rankToColor(this.ecsRanksData[i]);
+                        ecsColors[i * 3] = color.r;
+                        ecsColors[i * 3 + 1] = color.g;
+                        ecsColors[i * 3 + 2] = color.b;
+                    }
+                } else {
+                    const color = this.rankToColor(this.ecsRanksData[i]);
+                    ecsColors[i * 3] = color.r;
+                    ecsColors[i * 3 + 1] = color.g;
+                    ecsColors[i * 3 + 2] = color.b;
+                }
+            }
+            ecsGeometry.attributes.color.needsUpdate = true;
+            ecsGeometry.computeVertexNormals();
+        }
+
+        // Update cut mesh - filter by rank
+        if (this.cutMeshObject && this.cutRanksData) {
+            const cutGeometry = this.cutMeshObject.geometry;
+            if (!this.originalCutFacets) {
+                this.originalCutFacets = new Uint32Array(cutGeometry.index.array);
+            }
+
+            const cutFilteredIndices = [];
+            for (let i = 0; i < this.originalCutFacets.length; i += 3) {
+                const v0 = this.originalCutFacets[i];
+                const rank = this.cutRanksData[v0];
+                if (this.visibleRanks.has(rank)) {
+                    cutFilteredIndices.push(this.originalCutFacets[i], this.originalCutFacets[i + 1], this.originalCutFacets[i + 2]);
+                }
+            }
+
+            cutGeometry.setIndex(new THREE.BufferAttribute(new Uint32Array(cutFilteredIndices), 1));
+
+            // Update cut colors
+            const cutColors = cutGeometry.attributes.color.array;
+            for (let i = 0; i < this.cutRanksData.length; i++) {
+                const color = this.rankToColor(this.cutRanksData[i]);
+                cutColors[i * 3] = color.r;
+                cutColors[i * 3 + 1] = color.g;
+                cutColors[i * 3 + 2] = color.b;
+            }
+            cutGeometry.attributes.color.needsUpdate = true;
+            cutGeometry.computeVertexNormals();
+        }
+
+        // Update interface points to reflect visible ranks
+        this.updateInterfacePoints();
+    }
+
+    // Restore full mesh (all ranks visible)
+    restoreFullMesh() {
+        if (this.meshObject && this.originalFacets) {
+            const geometry = this.meshObject.geometry;
+            geometry.setIndex(new THREE.BufferAttribute(this.originalFacets, 1));
+            geometry.computeVertexNormals();
+        }
+        if (this.ecsMeshObject && this.originalEcsFacets) {
+            const ecsGeometry = this.ecsMeshObject.geometry;
+            ecsGeometry.setIndex(new THREE.BufferAttribute(this.originalEcsFacets, 1));
+            ecsGeometry.computeVertexNormals();
+        }
+        if (this.cutMeshObject && this.originalCutFacets) {
+            const cutGeometry = this.cutMeshObject.geometry;
+            cutGeometry.setIndex(new THREE.BufferAttribute(this.originalCutFacets, 1));
+            cutGeometry.computeVertexNormals();
+        }
+
+        // Update interface points (now all ranks are visible)
+        this.updateInterfacePoints();
+    }
+
+    // Store DOF index mapping for interface highlighting
+    setDofIndices(dofIndices) {
+        this.dofIndices = dofIndices;
+    }
+
+    // Store ECS DOF index mapping for interface highlighting on ECS mesh
+    setEcsDofIndices(ecsDofIndices) {
+        this.ecsDofIndices = ecsDofIndices;
+    }
+
+    // Get color for an interface (by global interface index)
+    interfaceToColor(interfaceIndex) {
+        const colorIndex = interfaceIndex % this.interfaceColors.length;
+        return this.interfaceColors[colorIndex];
+    }
+
+    // Set interface data with per-interface coloring
+    // interfaceMap: Map from DOF index -> interface global index
+    setHighlightedInterfaceDofs(interfaceMap) {
+        this.highlightedInterfaceMap = interfaceMap;
+        // Refresh visibility to apply highlighting
+        if (this.visibleRanks) {
+            this.updateRankVisibility();
+        }
+        // Update interface points overlay
+        this.updateInterfacePoints();
+    }
+
+    // Clear interface highlighting
+    clearInterfaceHighlight() {
+        this.highlightedInterfaceMap = null;
+        if (this.visibleRanks) {
+            this.updateRankVisibility();
+        }
+        // Remove interface points overlay
+        this.removeInterfacePoints();
+    }
+
+    // Create/update opaque point cloud for interface vertices
+    updateInterfacePoints() {
+        // Remove existing interface points
+        this.removeInterfacePoints();
+
+        if (!this.highlightedInterfaceMap || this.highlightedInterfaceMap.size === 0) {
+            return;
+        }
+
+        const pointPositions = [];
+        const pointColors = [];
+
+        // Collect interface vertex positions and colors from membrane mesh
+        // Only include vertices belonging to visible ranks
+        if (this.meshObject && this.dofIndices) {
+            const membranePositions = this.meshObject.geometry.attributes.position.array;
+
+            for (let i = 0; i < this.dofIndices.length; i++) {
+                // Skip vertices not belonging to visible ranks
+                if (this.ranksData && this.visibleRanks && !this.visibleRanks.has(this.ranksData[i])) {
+                    continue;
+                }
+
+                const dofIndex = this.dofIndices[i];
+                if (this.highlightedInterfaceMap.has(dofIndex)) {
+                    // Add position
+                    pointPositions.push(
+                        membranePositions[i * 3],
+                        membranePositions[i * 3 + 1],
+                        membranePositions[i * 3 + 2]
+                    );
+                    // Add color based on interface index
+                    const interfaceIdx = this.highlightedInterfaceMap.get(dofIndex);
+                    const color = this.interfaceToColor(interfaceIdx);
+                    pointColors.push(color.r, color.g, color.b);
+                }
+            }
+        }
+
+        // Collect interface vertex positions and colors from ECS mesh
+        // Only include vertices belonging to visible ranks
+        if (this.ecsMeshObject && this.ecsDofIndices && this.ecsMeshObject.visible) {
+            const ecsPositions = this.ecsMeshObject.geometry.attributes.position.array;
+
+            for (let i = 0; i < this.ecsDofIndices.length; i++) {
+                // Skip vertices not belonging to visible ranks
+                if (this.ecsRanksData && this.visibleRanks && !this.visibleRanks.has(this.ecsRanksData[i])) {
+                    continue;
+                }
+
+                const dofIndex = this.ecsDofIndices[i];
+                if (this.highlightedInterfaceMap.has(dofIndex)) {
+                    // Add position
+                    pointPositions.push(
+                        ecsPositions[i * 3],
+                        ecsPositions[i * 3 + 1],
+                        ecsPositions[i * 3 + 2]
+                    );
+                    // Add color based on interface index
+                    const interfaceIdx = this.highlightedInterfaceMap.get(dofIndex);
+                    const color = this.interfaceToColor(interfaceIdx);
+                    pointColors.push(color.r, color.g, color.b);
+                }
+            }
+        }
+
+        // Create point cloud if we have any interface points
+        if (pointPositions.length > 0) {
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(pointPositions, 3));
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(pointColors, 3));
+
+            const material = new THREE.PointsMaterial({
+                size: 3,
+                vertexColors: true,
+                sizeAttenuation: false,  // Constant size regardless of distance
+                depthTest: true,
+                depthWrite: true
+            });
+
+            this.interfacePoints = new THREE.Points(geometry, material);
+            this.scene.add(this.interfacePoints);
+        }
+    }
+
+    // Remove interface points overlay
+    removeInterfacePoints() {
+        if (this.interfacePoints) {
+            this.scene.remove(this.interfacePoints);
+            this.interfacePoints.geometry.dispose();
+            this.interfacePoints.material.dispose();
+            this.interfacePoints = null;
+        }
     }
 }

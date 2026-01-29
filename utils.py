@@ -182,12 +182,14 @@ def read_input_file(input_yml_file):
             input_parameters['stim_end'] = 1.0
 
         # boundary conditions (default = 0 -> zero Neumann)
-        if 'Dirichlet_points' in config: 
+        if 'Dirichlet_points' in config:
             input_parameters['Dirichlet_points'] = config['Dirichlet_points']
         else:
             input_parameters['Dirichlet_points'] = 0
 
-            
+        # bc_type: "none", "one_corner", "all_corners", "all_boundary"
+        if 'bc_type' in config:
+            input_parameters['bc_type'] = config['bc_type']
 
         # ionic model 
         if 'ionic_model' in config: 

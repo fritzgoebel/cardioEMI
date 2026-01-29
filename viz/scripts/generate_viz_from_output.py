@@ -120,6 +120,14 @@ def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callb
             dof_rank_info = pickle.load(f)
         report(32, f"Loaded DOF rank ownership ({dof_rank_info['num_ranks']} ranks)")
 
+    # Load DOF contribution data if available (which ranks contribute to each DOF)
+    dof_contributors_pickle = sim_output_dir / 'dof_contributors.pickle'
+    dof_contributors_info = None
+    if dof_contributors_pickle.exists():
+        with open(dof_contributors_pickle, 'rb') as f:
+            dof_contributors_info = pickle.load(f)
+        report(32, f"Loaded DOF contribution data ({len(dof_contributors_info['contributors'])} DOFs)")
+
     # Extract partition cut facets from cell topology if we have rank data
     # These are internal facets where adjacent intracellular cells belong to different MPI ranks
     # We exclude ECS (cell tag 0) - only show cuts through intracellular space
@@ -206,13 +214,14 @@ def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callb
     unique_pairs = sorted(set(facet_tag_to_pair.values())) if facet_tag_to_pair else []
     pair_to_idx = {pair: idx for idx, pair in enumerate(unique_pairs)}
 
-    # If we have rank data, we need to duplicate boundary facets for each rank
-    # so that each partition has its own independent mesh
+    # If we have rank data, assign facets to ranks based on contribution
     if dof_rank_info is not None:
         dof_ranks = dof_rank_info['ranks']
         num_ranks = dof_rank_info['num_ranks']
 
-        # First pass: count total facets including duplicates for boundary facets
+        # Get contributors data if available
+        contributors = dof_contributors_info['contributors'] if dof_contributors_info else None
+
         expanded_vertex_list = []
         expanded_facet_list = []
         facet_pair_list = []
@@ -220,38 +229,31 @@ def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callb
         expanded_rank_list = []
         expanded_tag_list = []
 
-        boundary_facet_count = 0
+        shared_facet_count = 0
         vertex_idx = 0
 
         for facet, tag in zip(membrane_facets, membrane_tag_values):
-            # Get ranks for this facet's vertices
-            facet_ranks = [dof_ranks[v] if v < len(dof_ranks) else 0 for v in facet]
-            unique_facet_ranks = set(facet_ranks)
+            if contributors:
+                # Find ranks that contribute to ALL three vertices of this facet
+                # A rank shows this facet if it contributes to all three DOFs
+                contributing_ranks_per_vertex = [
+                    set(contributors.get(int(v), [dof_ranks[v] if v < len(dof_ranks) else 0]))
+                    for v in facet
+                ]
+                # Intersection: ranks that contribute to all three vertices
+                common_ranks = contributing_ranks_per_vertex[0] & contributing_ranks_per_vertex[1] & contributing_ranks_per_vertex[2]
 
-            if len(unique_facet_ranks) == 1:
-                # Interior facet: all vertices same rank, create once
-                rank = facet_ranks[0]
-                expanded_vertex_list.append(vertices[facet])
-                expanded_facet_list.append([vertex_idx, vertex_idx + 1, vertex_idx + 2])
-                expanded_rank_list.extend([rank, rank, rank])
-                facet_orig_verts_list.append(facet)
-                expanded_tag_list.append(tag)
+                if len(common_ranks) == 0:
+                    # Fallback to owner rank if no common contributors
+                    common_ranks = {dof_ranks[facet[0]] if facet[0] < len(dof_ranks) else 0}
 
-                # Map to pair
-                if tag in facet_tag_to_pair:
-                    pair = facet_tag_to_pair[tag]
-                    facet_pair_list.append(pair_to_idx.get(pair, 0))
-                else:
-                    facet_pair_list.append(0)
+                if len(common_ranks) > 1:
+                    shared_facet_count += 1
 
-                vertex_idx += 3
-            else:
-                # Boundary facet: duplicate for each rank that owns at least one vertex
-                boundary_facet_count += 1
-                for rank in unique_facet_ranks:
+                # Create facet for each contributing rank
+                for rank in sorted(common_ranks):
                     expanded_vertex_list.append(vertices[facet])
                     expanded_facet_list.append([vertex_idx, vertex_idx + 1, vertex_idx + 2])
-                    # Assign ALL vertices to this rank (so facet moves uniformly)
                     expanded_rank_list.extend([rank, rank, rank])
                     facet_orig_verts_list.append(facet)
                     expanded_tag_list.append(tag)
@@ -263,6 +265,23 @@ def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callb
                         facet_pair_list.append(0)
 
                     vertex_idx += 3
+            else:
+                # No contribution data: use ownership (single rank per facet)
+                rank = dof_ranks[facet[0]] if facet[0] < len(dof_ranks) else 0
+
+                expanded_vertex_list.append(vertices[facet])
+                expanded_facet_list.append([vertex_idx, vertex_idx + 1, vertex_idx + 2])
+                expanded_rank_list.extend([rank, rank, rank])
+                facet_orig_verts_list.append(facet)
+                expanded_tag_list.append(tag)
+
+                if tag in facet_tag_to_pair:
+                    pair = facet_tag_to_pair[tag]
+                    facet_pair_list.append(pair_to_idx.get(pair, 0))
+                else:
+                    facet_pair_list.append(0)
+
+                vertex_idx += 3
 
         # Convert to numpy arrays
         num_output_facets = len(expanded_facet_list)
@@ -273,7 +292,7 @@ def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callb
         expanded_ranks = np.array(expanded_rank_list, dtype=np.int32)
         expanded_tags = np.array(expanded_tag_list, dtype=np.int32)
 
-        report(50, f"Expanded to {len(expanded_vertices)} vertices ({boundary_facet_count} boundary facets duplicated)")
+        report(50, f"Expanded to {len(expanded_vertices)} vertices ({shared_facet_count} facets shared by multiple ranks)")
 
     else:
         # No rank data: simple expansion without duplication
@@ -344,58 +363,76 @@ def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callb
     if len(exterior_facets) > 0:
         report(72, "Writing exterior boundary (ECS) data...")
 
-        # If we have rank data, duplicate boundary facets for each partition
+        # If we have rank data, assign facets based on contribution
         if dof_rank_info is not None:
             dof_ranks = dof_rank_info['ranks']
+            contributors = dof_contributors_info['contributors'] if dof_contributors_info else None
+
             ext_vertex_list = []
             ext_facet_list = []
             ext_rank_list = []
-            ext_boundary_count = 0
+            ext_orig_verts_list = []  # Track original vertex indices for interface highlighting
+            ext_shared_count = 0
             vertex_idx = 0
 
             for facet in exterior_facets:
-                facet_ranks = [dof_ranks[v] if v < len(dof_ranks) else 0 for v in facet]
-                unique_facet_ranks = set(facet_ranks)
+                if contributors:
+                    # Find ranks that contribute to ALL three vertices
+                    contributing_ranks_per_vertex = [
+                        set(contributors.get(int(v), [dof_ranks[v] if v < len(dof_ranks) else 0]))
+                        for v in facet
+                    ]
+                    common_ranks = contributing_ranks_per_vertex[0] & contributing_ranks_per_vertex[1] & contributing_ranks_per_vertex[2]
 
-                if len(unique_facet_ranks) == 1:
-                    # Interior facet
-                    rank = facet_ranks[0]
-                    ext_vertex_list.append(vertices[facet])
-                    ext_facet_list.append([vertex_idx, vertex_idx + 1, vertex_idx + 2])
-                    ext_rank_list.extend([rank, rank, rank])
-                    vertex_idx += 3
-                else:
-                    # Boundary facet: duplicate for each rank
-                    ext_boundary_count += 1
-                    for rank in unique_facet_ranks:
+                    if len(common_ranks) == 0:
+                        common_ranks = {dof_ranks[facet[0]] if facet[0] < len(dof_ranks) else 0}
+
+                    if len(common_ranks) > 1:
+                        ext_shared_count += 1
+
+                    for rank in sorted(common_ranks):
                         ext_vertex_list.append(vertices[facet])
                         ext_facet_list.append([vertex_idx, vertex_idx + 1, vertex_idx + 2])
                         ext_rank_list.extend([rank, rank, rank])
+                        ext_orig_verts_list.append(facet)  # Track original vertices
                         vertex_idx += 3
+                else:
+                    # No contribution data: use ownership
+                    rank = dof_ranks[facet[0]] if facet[0] < len(dof_ranks) else 0
+                    ext_vertex_list.append(vertices[facet])
+                    ext_facet_list.append([vertex_idx, vertex_idx + 1, vertex_idx + 2])
+                    ext_rank_list.extend([rank, rank, rank])
+                    ext_orig_verts_list.append(facet)  # Track original vertices
+                    vertex_idx += 3
 
             ext_expanded_vertices = np.vstack(ext_vertex_list).astype(np.float32)
             ext_expanded_facets = np.array(ext_facet_list, dtype=np.uint32)
             ext_expanded_ranks = np.array(ext_rank_list, dtype=np.int32)
+            ext_orig_vertices = np.array(ext_orig_verts_list, dtype=np.uint32)
             num_ext_output_facets = len(ext_facet_list)
 
             ext_expanded_vertices.tofile(viz_output_dir / "ecs_vertices.bin")
             ext_expanded_facets.tofile(viz_output_dir / "ecs_facets.bin")
             ext_expanded_ranks.tofile(viz_output_dir / "ecs_ranks.bin")
+            ext_orig_vertices.tofile(viz_output_dir / "ecs_orig_vertices.bin")
 
-            report(75, f"Saved {num_ext_output_facets} ECS facets ({ext_boundary_count} boundary duplicated)")
+            report(75, f"Saved {num_ext_output_facets} ECS facets ({ext_shared_count} shared by multiple ranks)")
         else:
             # No rank data: simple expansion
             num_ext_facets = len(exterior_facets)
             ext_expanded_vertices = np.zeros((num_ext_facets * 3, 3), dtype=np.float32)
             ext_expanded_facets = np.zeros((num_ext_facets, 3), dtype=np.uint32)
+            ext_orig_vertices = np.zeros((num_ext_facets, 3), dtype=np.uint32)
 
             for facet_idx, facet in enumerate(exterior_facets):
                 base_vertex = facet_idx * 3
                 ext_expanded_vertices[base_vertex:base_vertex+3] = vertices[facet]
                 ext_expanded_facets[facet_idx] = [base_vertex, base_vertex + 1, base_vertex + 2]
+                ext_orig_vertices[facet_idx] = facet
 
             ext_expanded_vertices.tofile(viz_output_dir / "ecs_vertices.bin")
             ext_expanded_facets.tofile(viz_output_dir / "ecs_facets.bin")
+            ext_orig_vertices.tofile(viz_output_dir / "ecs_orig_vertices.bin")
             num_ext_output_facets = num_ext_facets
 
             report(75, f"Saved {num_ext_facets} ECS facets")
@@ -408,18 +445,37 @@ def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callb
     if partition_cut_facets is not None and len(partition_cut_facets) > 0 and dof_rank_info is not None:
         report(78, "Writing partition cut facets...")
         dof_ranks = dof_rank_info['ranks']
+        contributors = dof_contributors_info['contributors'] if dof_contributors_info else None
 
         cut_vertex_list = []
         cut_facet_list = []
         cut_rank_list = []
+        cut_shared_count = 0
         vertex_idx = 0
 
         for facet in partition_cut_facets:
-            facet_ranks = [dof_ranks[v] if v < len(dof_ranks) else 0 for v in facet]
-            unique_facet_ranks = set(facet_ranks)
+            if contributors:
+                # Find ranks that contribute to ALL three vertices
+                contributing_ranks_per_vertex = [
+                    set(contributors.get(int(v), [dof_ranks[v] if v < len(dof_ranks) else 0]))
+                    for v in facet
+                ]
+                common_ranks = contributing_ranks_per_vertex[0] & contributing_ranks_per_vertex[1] & contributing_ranks_per_vertex[2]
 
-            # Duplicate for each rank that has vertices on this facet
-            for rank in unique_facet_ranks:
+                if len(common_ranks) == 0:
+                    common_ranks = {dof_ranks[facet[0]] if facet[0] < len(dof_ranks) else 0}
+
+                if len(common_ranks) > 1:
+                    cut_shared_count += 1
+
+                for rank in sorted(common_ranks):
+                    cut_vertex_list.append(vertices[facet])
+                    cut_facet_list.append([vertex_idx, vertex_idx + 1, vertex_idx + 2])
+                    cut_rank_list.extend([rank, rank, rank])
+                    vertex_idx += 3
+            else:
+                # No contribution data: use ownership
+                rank = dof_ranks[facet[0]] if facet[0] < len(dof_ranks) else 0
                 cut_vertex_list.append(vertices[facet])
                 cut_facet_list.append([vertex_idx, vertex_idx + 1, vertex_idx + 2])
                 cut_rank_list.extend([rank, rank, rank])
@@ -435,7 +491,8 @@ def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callb
             cut_expanded_facets.tofile(viz_output_dir / "cut_facets.bin")
             cut_expanded_ranks.tofile(viz_output_dir / "cut_ranks.bin")
 
-            report(80, f"Saved {num_cut_output_facets} partition cut facets")
+            shared_msg = f" ({cut_shared_count} shared by multiple ranks)" if contributors else ""
+            report(80, f"Saved {num_cut_output_facets} partition cut facets{shared_msg}")
 
     # Build metadata (convert numpy types to native Python for JSON serialization)
     # Use actual output counts (which may include duplicated boundary facets)

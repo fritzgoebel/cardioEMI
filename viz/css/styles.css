@@ -153,6 +153,32 @@ header p {
     cursor: pointer;
 }
 
+.colormap-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.colormap-dropdown {
+    padding: 4px 8px;
+    background: #0f3460;
+    border: 1px solid #4a90d9;
+    border-radius: 4px;
+    color: #fff;
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+
+.colormap-dropdown:focus {
+    outline: none;
+    border-color: #e94560;
+}
+
+.colormap-dropdown option {
+    background: #0f3460;
+    color: #fff;
+}
+
 /* Rank Legend */
 #rank-legend {
     padding: 10px 15px;
@@ -225,6 +251,71 @@ header p {
     min-width: 30px;
     text-align: right;
     color: #e94560;
+}
+
+/* Rank Selector */
+#rank-selector {
+    padding: 10px 15px;
+    background: #0a0a1a;
+    border-top: 1px solid #0f3460;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+}
+
+.rank-selector-title {
+    font-weight: 500;
+    color: #e94560;
+    margin-right: 5px;
+}
+
+#rank-checkboxes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.rank-checkbox-item {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    padding: 3px 8px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.8rem;
+    transition: background 0.2s;
+}
+
+.rank-checkbox-item:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+
+.rank-checkbox-item input {
+    cursor: pointer;
+}
+
+.rank-checkbox-item .rank-color {
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+.btn-small {
+    padding: 4px 10px;
+    font-size: 0.75rem;
+    background: #16213e;
+    color: white;
+    border: 1px solid #4a90d9;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-small:hover {
+    background: #0f3460;
 }
 
 /* Iterations Chart */
@@ -376,6 +467,15 @@ header p {
 
 .btn-success:hover {
     background: #218838;
+}
+
+.btn-danger {
+    background: #dc3545;
+    color: white;
+}
+
+.btn-danger:hover {
+    background: #c82333;
 }
 
 .btn:disabled {

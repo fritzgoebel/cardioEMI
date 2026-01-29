@@ -62,6 +62,12 @@ def assemble_block_to_coo(forms, restrictions, bcs, comm):
     can be passed to Ginkgo's read_distributed with assembly_mode::communicate,
     which handles summing contributions from different ranks.
 
+    Dirichlet BCs are applied symmetrically: both rows AND columns corresponding
+    to BC DOFs are zeroed, with 1.0 on the diagonal. This preserves matrix
+    symmetry, which is important for CG solver and BDDC preconditioner.
+
+    Note: This assumes BC values are zero (no RHS modification needed for lifting).
+
     Parameters
     ----------
     forms : list of list of Form
@@ -85,6 +91,12 @@ def assemble_block_to_coo(forms, restrictions, bcs, comm):
         Total size of the global block matrix
     row_ranges : ndarray[int64]
         Partition ranges: rank i owns rows [row_ranges[i], row_ranges[i+1])
+    matrix_to_vertex : dict[int, int]
+        Mapping from matrix global DOF index to mesh global vertex index
+        (for owned DOFs on this rank only)
+    contributed_vertices : set[int]
+        Set of global mesh vertex indices where this rank contributes
+        nonzero values (used for partition visualization)
     """
     n_blocks = len(forms)
     rank = comm.rank
@@ -135,10 +147,20 @@ def assemble_block_to_coo(forms, restrictions, bcs, comm):
     # Track BC rows we've seen (to add diagonal 1.0 entries)
     bc_rows_added = set()
 
+    # Track mapping from matrix global DOF index to mesh vertex index
+    # For P1 elements, unrestricted local DOF index = mesh vertex index
+    matrix_to_vertex = {}
+
+    # Track mesh vertices where this rank contributes nonzero values
+    # This is used for partition visualization to show facets only where
+    # a rank has actual nonzero contributions to all three DOFs
+    contributed_vertices = set()
+
     for i in range(n_blocks):
         bc_dofs_i = bc_dofs_per_block[i]
 
         for j in range(n_blocks):
+            bc_dofs_j = bc_dofs_per_block[j]
             form_ij = forms[i][j]
             if form_ij is None:
                 continue
@@ -214,11 +236,22 @@ def assemble_block_to_coo(forms, restrictions, bcs, comm):
                     all_vals.append(1.0)
                     bc_rows_added.add(global_row)
 
+                    # Track matrix-to-vertex mapping for this owned row (has actual entry)
+                    test_space = form_ij.function_spaces[0]
+                    global_vertex = int(test_space.dofmap.index_map.local_to_global(np.array([local_row_unr], dtype=np.int32))[0])
+                    if local_row_restr < row_restr_imap.size_local and global_row not in matrix_to_vertex:
+                        matrix_to_vertex[global_row] = global_vertex
+                    # Track this vertex as having nonzero contribution from this rank
+                    contributed_vertices.add(global_vertex)
+
                 # Skip all other entries for BC rows
                 if is_bc_row:
                     continue
 
                 # Process columns in this row
+                row_has_entry = False
+                test_space = form_ij.function_spaces[0]
+                trial_space = form_ij.function_spaces[1]
                 for k in range(indptr[local_row_unr], indptr[local_row_unr + 1]):
                     local_col_unr = indices[k]
                     val = data[k]
@@ -229,6 +262,12 @@ def assemble_block_to_coo(forms, restrictions, bcs, comm):
                     # Map local unrestricted → local restricted
                     if local_col_unr not in col_u2r:
                         continue
+
+                    # Skip BC columns for symmetric BC application
+                    # (zeroing columns in addition to rows preserves symmetry)
+                    if local_col_unr in bc_dofs_j:
+                        continue
+
                     local_col_restr = col_u2r[local_col_unr]
 
                     # Convert local restricted → global block matrix index
@@ -244,10 +283,23 @@ def assemble_block_to_coo(forms, restrictions, bcs, comm):
                     all_rows.append(global_row)
                     all_cols.append(global_col)
                     all_vals.append(val)
+                    row_has_entry = True
+
+                    # Track column vertex as having nonzero contribution
+                    global_col_vertex = int(trial_space.dofmap.index_map.local_to_global(np.array([local_col_unr], dtype=np.int32))[0])
+                    contributed_vertices.add(global_col_vertex)
+
+                # Track matrix-to-vertex mapping only for owned rows that have actual entries
+                if row_has_entry:
+                    global_row_vertex = int(test_space.dofmap.index_map.local_to_global(np.array([local_row_unr], dtype=np.int32))[0])
+                    # Track row vertex as having nonzero contribution
+                    contributed_vertices.add(global_row_vertex)
+                    if local_row_restr < row_restr_imap.size_local and global_row not in matrix_to_vertex:
+                        matrix_to_vertex[global_row] = global_row_vertex
 
     # Convert to numpy arrays
     row_indices = np.array(all_rows, dtype=np.int64)
     col_indices = np.array(all_cols, dtype=np.int64)
     values = np.array(all_vals, dtype=np.float64)
 
-    return row_indices, col_indices, values, total_global_size, np.array(row_ranges, dtype=np.int64)
+    return row_indices, col_indices, values, total_global_size, np.array(row_ranges, dtype=np.int64), matrix_to_vertex, contributed_vertices

@@ -43,6 +43,18 @@
                         <input type="checkbox" id="show-partition">
                         Show MPI Partition
                     </label>
+                    <label class="colormap-label">
+                        Colormap:
+                        <select id="colormap-selector" class="colormap-dropdown">
+                            <option value="coolwarm">Cool to Warm</option>
+                            <option value="viridis">Viridis</option>
+                            <option value="plasma">Plasma</option>
+                            <option value="inferno">Inferno</option>
+                            <option value="turbo">Turbo</option>
+                            <option value="jet">Jet (Rainbow)</option>
+                            <option value="grayscale">Grayscale</option>
+                        </select>
+                    </label>
                 </div>
                 <!-- Rank legend (shown when partition view is active) -->
                 <div id="rank-legend" style="display: none;">
@@ -55,11 +67,22 @@
                         <input type="checkbox" id="show-ecs">
                         Show ECS
                     </label>
+                    <label>
+                        <input type="checkbox" id="show-interfaces">
+                        Show Interfaces
+                    </label>
                     <label class="slider-label">
                         Explosion:
                         <input type="range" id="explosion-slider" class="slider" min="0" max="2" step="0.05" value="0" style="width: 120px;">
                         <span id="explosion-value">0</span>
                     </label>
+                </div>
+                <!-- Rank selector (shown when partition view is active) -->
+                <div id="rank-selector" style="display: none;">
+                    <span class="rank-selector-title">Show Ranks:</span>
+                    <div id="rank-checkboxes"></div>
+                    <button id="select-all-ranks" class="btn-small">All</button>
+                    <button id="select-no-ranks" class="btn-small">None</button>
                 </div>
                 <!-- Iterations Chart -->
                 <div id="iterations-chart-container" style="display: none;">
@@ -95,6 +118,16 @@
                 <!-- Simulation Parameters -->
                 <section class="section">
                     <h2>Simulation Parameters</h2>
+
+                    <div class="param-row">
+                        <label>Boundary Cond.:</label>
+                        <select id="bc-type" class="mesh-dropdown">
+                            <option value="one_corner">One corner (grounded)</option>
+                            <option value="all_corners">All 8 corners</option>
+                            <option value="all_boundary">All boundary DOFs</option>
+                            <option value="none">Pure Neumann</option>
+                        </select>
+                    </div>
 
                     <div class="param-row">
                         <label>Time step (dt):</label>
@@ -162,6 +195,11 @@
                             <input type="checkbox" id="ginkgo-native-assembly" checked>
                             <span class="checkbox-label">Bypass PETSc matrix</span>
                         </div>
+                        <div class="param-row" id="dd-matrix-row">
+                            <label>DD Matrix:</label>
+                            <input type="checkbox" id="ginkgo-dd-matrix">
+                            <span class="checkbox-label">Domain decomposition format</span>
+                        </div>
                         <div class="param-row">
                             <label>Compute:</label>
                             <select id="ginkgo-backend" class="mesh-dropdown">
@@ -190,6 +228,7 @@
                                 <option value="ilu">ILU</option>
                                 <option value="ic">IC</option>
                                 <option value="isai">ISAI</option>
+                                <option value="bddc">BDDC (DD only)</option>
                                 <option value="none">None</option>
                             </select>
                         </div>
@@ -216,6 +255,78 @@
                                 <input type="number" id="amg-max-levels" value="10" min="2" max="20" step="1">
                             </div>
                         </div>
+                        <!-- BDDC Options -->
+                        <div id="bddc-options" style="display: none;">
+                            <div class="param-row">
+                                <label>Local Solver:</label>
+                                <select id="bddc-local-solver" class="mesh-dropdown">
+                                    <option value="direct">Direct (Cholesky)</option>
+                                    <option value="ilu">ILU</option>
+                                    <option value="ic">IC</option>
+                                    <option value="amg">AMG</option>
+                                </select>
+                            </div>
+                            <!-- Local AMG Options (shown when AMG is selected as local solver) -->
+                            <div id="bddc-local-amg-options" style="display: none; margin-left: 10px; border-left: 2px solid #444; padding-left: 10px;">
+                                <div class="param-row">
+                                    <label>Smoother:</label>
+                                    <select id="bddc-local-amg-smoother" class="mesh-dropdown">
+                                        <option value="jacobi">Jacobi</option>
+                                        <option value="gauss_seidel">Gauss-Seidel</option>
+                                        <option value="ilu">ILU</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Smooth steps:</label>
+                                    <input type="number" id="bddc-local-amg-smooth-steps" value="1" min="1" max="5" step="1">
+                                </div>
+                                <div class="param-row">
+                                    <label>Max levels:</label>
+                                    <input type="number" id="bddc-local-amg-max-levels" value="10" min="2" max="20" step="1">
+                                </div>
+                                <div class="param-row">
+                                    <label>Coarsest Solver:</label>
+                                    <select id="bddc-local-amg-coarse-solver" class="mesh-dropdown">
+                                        <option value="direct">Direct</option>
+                                        <option value="cg">CG</option>
+                                        <option value="gmres">GMRES</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Relaxation:</label>
+                                    <input type="number" id="bddc-local-amg-relaxation" value="0.9" min="0.1" max="1.0" step="0.05">
+                                </div>
+                            </div>
+                            <div class="param-row">
+                                <label>Coarse Solver:</label>
+                                <select id="bddc-coarse-solver" class="mesh-dropdown">
+                                    <option value="cg">CG</option>
+                                    <option value="gmres">GMRES</option>
+                                </select>
+                            </div>
+                            <div class="param-row">
+                                <label>Coarse Max Iter:</label>
+                                <input type="number" id="bddc-coarse-max-iter" value="100" min="10" max="1000" step="10">
+                            </div>
+                            <div class="param-row">
+                                <label>
+                                    <input type="checkbox" id="bddc-vertices" checked>
+                                    Vertex constraints
+                                </label>
+                            </div>
+                            <div class="param-row">
+                                <label>
+                                    <input type="checkbox" id="bddc-edges" checked>
+                                    Edge constraints
+                                </label>
+                            </div>
+                            <div class="param-row">
+                                <label>
+                                    <input type="checkbox" id="bddc-faces" checked>
+                                    Face constraints
+                                </label>
+                            </div>
+                        </div>
                     </div>
 
                     <div class="param-row">
@@ -225,6 +336,10 @@
                     <div class="param-row">
                         <label>Abs. tol.:</label>
                         <input type="text" id="solver-atol" value="1e-12" style="width: 80px;">
+                    </div>
+                    <div class="param-row">
+                        <label>Max iter.:</label>
+                        <input type="number" id="solver-max-iter" value="1000" min="10" max="10000" step="100" style="width: 80px;">
                     </div>
                 </section>
 
@@ -292,6 +407,9 @@
                 <section class="section actions">
                     <button id="run-simulation" class="btn btn-success">
                         Run Simulation
+                    </button>
+                    <button id="cancel-simulation" class="btn btn-danger" style="display: none;">
+                        Cancel
                     </button>
                 </section>
 

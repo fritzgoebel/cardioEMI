@@ -17,6 +17,7 @@ class App {
         // Simulation parameters
         this.dt = 0.001;
         this.timeSteps = 1000;
+        this.bcType = 'one_corner';  // Boundary condition type
 
         // Voltage parameters
         this.vExcited = 0;    // mV for excited region
@@ -49,6 +50,11 @@ class App {
         this.cutRanksData = null;
         this.rankCentroids = null;
         this.globalCentroid = null;
+
+        // Interface data for BDDC visualization
+        this.interfaceData = null;
+        this.visibleRanks = new Set();
+        this.showInterfaces = false;
     }
 
     async init() {
@@ -85,6 +91,7 @@ class App {
             this.setupVoltageControls();
             this.setupButtons();
             this.setupCheckboxes();
+            this.setupColormapSelector();
             this.setupResultsControls();
             this.setupVideoExport();
             this.setupIterationsChart();
@@ -343,6 +350,7 @@ class App {
         const dtInput = document.getElementById('dt');
         const stepsInput = document.getElementById('time-steps');
         const totalTimeSpan = document.getElementById('total-time');
+        const bcTypeSelect = document.getElementById('bc-type');
 
         const updateTotalTime = () => {
             this.dt = parseFloat(dtInput.value);
@@ -354,6 +362,12 @@ class App {
         dtInput.addEventListener('input', updateTotalTime);
         stepsInput.addEventListener('input', updateTotalTime);
         updateTotalTime();
+
+        // Boundary condition type
+        this.bcType = bcTypeSelect.value;
+        bcTypeSelect.addEventListener('change', (e) => {
+            this.bcType = e.target.value;
+        });
     }
 
     setupSolverSettings() {
@@ -361,6 +375,7 @@ class App {
         const petscOptions = document.getElementById('petsc-options');
         const ginkgoOptions = document.getElementById('ginkgo-options');
         const amgOptions = document.getElementById('amg-options');
+        const bddcOptions = document.getElementById('bddc-options');
         const ginkgoPrecond = document.getElementById('ginkgo-precond');
         const petscKspType = document.getElementById('petsc-ksp-type');
         const petscPcType = document.getElementById('petsc-pc-type');
@@ -372,13 +387,36 @@ class App {
             petsc: { kspType: 'preonly', pcType: 'lu' },
             ginkgo: {
                 nativeAssembly: true,  // Default to native assembly
+                ddMatrix: false,       // Domain decomposition matrix format
                 backend: 'omp',
                 solver: 'cg',
                 preconditioner: 'jacobi',
-                amg: { cycle: 'v', smoother: 'jacobi', maxLevels: 10 }
+                amg: { cycle: 'v', smoother: 'jacobi', maxLevels: 10 },
+                bddc: {
+                    localSolver: 'direct',
+                    coarseSolver: 'cg',
+                    coarseMaxIterations: 100,
+                    vertices: true,
+                    edges: true,
+                    faces: true,
+                    localAmg: {
+                        smoother: 'jacobi',
+                        smoothSteps: 1,
+                        maxLevels: 10,
+                        coarseSolver: 'direct',
+                        relaxationFactor: 0.9
+                    }
+                }
             },
-            rtol: '1e-7'
+            rtol: '1e-8',
+            atol: '1e-12',
+            maxIterations: 1000
         };
+
+        // Get DOM elements for DD matrix logic
+        const ddMatrixRow = document.getElementById('dd-matrix-row');
+        const ddMatrixCheckbox = document.getElementById('ginkgo-dd-matrix');
+        const precondRow = ginkgoPrecond.closest('.param-row');
 
         // Backend selection
         backendSelect.addEventListener('change', () => {
@@ -409,9 +447,37 @@ class App {
             this.solverConfig.petsc.pcType = petscPcType.value;
         });
 
-        // Ginkgo native assembly
+        // Ginkgo native assembly - also controls DD matrix visibility
         document.getElementById('ginkgo-native-assembly').addEventListener('change', (e) => {
             this.solverConfig.ginkgo.nativeAssembly = e.target.checked;
+            // DD matrix requires native assembly
+            if (!e.target.checked) {
+                ddMatrixCheckbox.checked = false;
+                this.solverConfig.ginkgo.ddMatrix = false;
+                ddMatrixRow.style.display = 'none';
+                // Restore preconditioner options
+                precondRow.style.display = 'flex';
+            } else {
+                ddMatrixRow.style.display = 'flex';
+            }
+        });
+
+        // Ginkgo DD matrix - limits preconditioner to 'none' or 'bddc'
+        ddMatrixCheckbox.addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.ddMatrix = e.target.checked;
+            if (e.target.checked) {
+                // DD matrix works with 'none' or 'bddc' preconditioner
+                // Default to BDDC when DD matrix is enabled
+                this.solverConfig.ginkgo.preconditioner = 'bddc';
+                ginkgoPrecond.value = 'bddc';
+                amgOptions.style.display = 'none';
+                bddcOptions.style.display = 'block';
+            } else {
+                // Switching off DD matrix - reset to jacobi
+                this.solverConfig.ginkgo.preconditioner = 'jacobi';
+                ginkgoPrecond.value = 'jacobi';
+                bddcOptions.style.display = 'none';
+            }
         });
 
         // Ginkgo backend
@@ -424,10 +490,17 @@ class App {
             this.solverConfig.ginkgo.solver = e.target.value;
         });
 
-        // Ginkgo preconditioner - show AMG options when AMG is selected
+        // Ginkgo preconditioner - show AMG/BDDC options when selected
         ginkgoPrecond.addEventListener('change', () => {
             this.solverConfig.ginkgo.preconditioner = ginkgoPrecond.value;
             amgOptions.style.display = ginkgoPrecond.value === 'amg' ? 'block' : 'none';
+            bddcOptions.style.display = ginkgoPrecond.value === 'bddc' ? 'block' : 'none';
+
+            // BDDC requires DD matrix
+            if (ginkgoPrecond.value === 'bddc') {
+                ddMatrixCheckbox.checked = true;
+                this.solverConfig.ginkgo.ddMatrix = true;
+            }
         });
 
         // AMG options
@@ -443,13 +516,125 @@ class App {
             this.solverConfig.ginkgo.amg.maxLevels = parseInt(e.target.value);
         });
 
-        // Tolerance
+        // BDDC options
+        const bddcLocalAmgOptions = document.getElementById('bddc-local-amg-options');
+        document.getElementById('bddc-local-solver').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localSolver = e.target.value;
+            // Show/hide local AMG options
+            bddcLocalAmgOptions.style.display = e.target.value === 'amg' ? 'block' : 'none';
+        });
+
+        document.getElementById('bddc-coarse-solver').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.coarseSolver = e.target.value;
+        });
+
+        document.getElementById('bddc-coarse-max-iter').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.coarseMaxIterations = parseInt(e.target.value);
+        });
+
+        document.getElementById('bddc-vertices').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.vertices = e.target.checked;
+        });
+
+        document.getElementById('bddc-edges').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.edges = e.target.checked;
+        });
+
+        document.getElementById('bddc-faces').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.faces = e.target.checked;
+        });
+
+        // BDDC local AMG options
+        document.getElementById('bddc-local-amg-smoother').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localAmg.smoother = e.target.value;
+        });
+
+        document.getElementById('bddc-local-amg-smooth-steps').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localAmg.smoothSteps = parseInt(e.target.value);
+        });
+
+        document.getElementById('bddc-local-amg-max-levels').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localAmg.maxLevels = parseInt(e.target.value);
+        });
+
+        document.getElementById('bddc-local-amg-coarse-solver').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localAmg.coarseSolver = e.target.value;
+        });
+
+        document.getElementById('bddc-local-amg-relaxation').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localAmg.relaxationFactor = parseFloat(e.target.value);
+        });
+
+        // Tolerance and max iterations
         document.getElementById('solver-rtol').addEventListener('change', (e) => {
             this.solverConfig.rtol = e.target.value;
         });
         document.getElementById('solver-atol').addEventListener('change', (e) => {
             this.solverConfig.atol = e.target.value;
         });
+        document.getElementById('solver-max-iter').addEventListener('change', (e) => {
+            this.solverConfig.maxIterations = parseInt(e.target.value);
+        });
+
+        // Initialize UI state based on current form values (handles browser auto-fill)
+        this.initSolverSettingsUI();
+    }
+
+    initSolverSettingsUI() {
+        // Sync UI visibility with current form values on page load
+        const backendSelect = document.getElementById('solver-backend');
+        const petscOptions = document.getElementById('petsc-options');
+        const ginkgoOptions = document.getElementById('ginkgo-options');
+        const amgOptions = document.getElementById('amg-options');
+        const bddcOptions = document.getElementById('bddc-options');
+        const bddcLocalAmgOptions = document.getElementById('bddc-local-amg-options');
+        const petscKspType = document.getElementById('petsc-ksp-type');
+        const petscPcRow = document.getElementById('petsc-pc-row');
+        const ginkgoPrecond = document.getElementById('ginkgo-precond');
+        const nativeAssemblyCheckbox = document.getElementById('ginkgo-native-assembly');
+        const ddMatrixCheckbox = document.getElementById('ginkgo-dd-matrix');
+        const ddMatrixRow = document.getElementById('dd-matrix-row');
+        const bddcLocalSolver = document.getElementById('bddc-local-solver');
+
+        // Backend visibility
+        if (backendSelect.value === 'ginkgo') {
+            petscOptions.style.display = 'none';
+            ginkgoOptions.style.display = 'block';
+        } else {
+            petscOptions.style.display = 'block';
+            ginkgoOptions.style.display = 'none';
+        }
+
+        // PETSc KSP type -> preconditioner row
+        if (petscKspType.value === 'preonly') {
+            petscPcRow.style.display = 'none';
+        } else {
+            petscPcRow.style.display = 'flex';
+        }
+
+        // Native assembly -> DD matrix row
+        if (!nativeAssemblyCheckbox.checked) {
+            ddMatrixRow.style.display = 'none';
+        } else {
+            ddMatrixRow.style.display = 'flex';
+        }
+
+        // Preconditioner -> AMG/BDDC options
+        amgOptions.style.display = ginkgoPrecond.value === 'amg' ? 'block' : 'none';
+        bddcOptions.style.display = ginkgoPrecond.value === 'bddc' ? 'block' : 'none';
+
+        // BDDC local solver -> local AMG options
+        bddcLocalAmgOptions.style.display = bddcLocalSolver.value === 'amg' ? 'block' : 'none';
+
+        // Update config state from form values
+        this.solverConfig.backend = backendSelect.value;
+        this.solverConfig.petsc.kspType = petscKspType.value;
+        this.solverConfig.petsc.pcType = document.getElementById('petsc-pc-type').value;
+        this.solverConfig.ginkgo.nativeAssembly = nativeAssemblyCheckbox.checked;
+        this.solverConfig.ginkgo.ddMatrix = ddMatrixCheckbox.checked;
+        this.solverConfig.ginkgo.backend = document.getElementById('ginkgo-backend').value;
+        this.solverConfig.ginkgo.solver = document.getElementById('ginkgo-solver').value;
+        this.solverConfig.ginkgo.preconditioner = ginkgoPrecond.value;
     }
 
     setupMpiRanks() {
@@ -556,9 +741,70 @@ class App {
             this.runSimulation();
         });
 
+        document.getElementById('cancel-simulation').addEventListener('click', () => {
+            this.cancelSimulation();
+        });
+
         document.getElementById('reset-camera').addEventListener('click', () => {
             this.viewer.resetCamera();
         });
+    }
+
+    async cancelSimulation() {
+        const cancelBtn = document.getElementById('cancel-simulation');
+        const statusEl = document.getElementById('simulation-status');
+
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = 'Cancelling...';
+
+        try {
+            const response = await fetch('/api/simulation/stop', { method: 'POST' });
+            const data = await response.json();
+
+            if (data.success) {
+                statusEl.className = 'status visible error';
+                statusEl.textContent = 'Simulation cancelled by user';
+            }
+        } catch (error) {
+            console.error('Failed to cancel simulation:', error);
+        }
+    }
+
+    setupColormapSelector() {
+        const selector = document.getElementById('colormap-selector');
+
+        selector.addEventListener('change', () => {
+            const colormap = selector.value;
+            this.viewer.setColormap(colormap);
+
+            // Update colorbar gradient
+            this.updateColorbarGradient();
+
+            // Re-render with new colormap
+            const showPartition = document.getElementById('show-partition').checked;
+            if (!showPartition) {
+                if (this.resultsData) {
+                    // If viewing results, re-render current timestep
+                    const timeSlider = document.getElementById('result-time');
+                    const idx = parseInt(timeSlider.value);
+                    this.viewer.updateVoltageColors(this.resultsData[idx]);
+                } else {
+                    // Otherwise update the excited highlight
+                    this.viewer.updateBoundingBox(this.boundingBox);
+                }
+            }
+        });
+
+        // Initialize colorbar gradient
+        this.updateColorbarGradient();
+    }
+
+    updateColorbarGradient() {
+        const gradient = this.viewer.getColormapGradient();
+        const gradientEl = document.querySelector('.colorbar-gradient');
+        if (gradientEl) {
+            gradientEl.style.background = gradient;
+        }
     }
 
     setupCheckboxes() {
@@ -581,9 +827,14 @@ class App {
         // ECS visibility toggle
         document.getElementById('show-ecs').addEventListener('change', (e) => {
             this.viewer.setEcsVisible(e.target.checked);
-            // Color ECS by rank when shown
+            // Color ECS by rank when shown, and refresh rank visibility to apply interface highlighting
             if (e.target.checked && this.ecsRanksData) {
-                this.viewer.updateEcsRankColors(this.ecsRanksData);
+                // Trigger rank visibility update which handles both rank colors and interface highlighting
+                if (this.visibleRanks && this.visibleRanks.size > 0) {
+                    this.viewer.setVisibleRanks(this.visibleRanks);
+                } else {
+                    this.viewer.updateEcsRankColors(this.ecsRanksData);
+                }
             }
         });
 
@@ -593,12 +844,110 @@ class App {
             document.getElementById('explosion-value').textContent = factor.toFixed(2);
             this.viewer.setExplosionFactor(factor);
         });
+
+        // Show interfaces toggle
+        document.getElementById('show-interfaces').addEventListener('change', (e) => {
+            this.showInterfaces = e.target.checked;
+            this.updateInterfaceHighlight();
+            // Also update ECS visibility to apply interface highlighting
+            if (document.getElementById('show-ecs').checked && this.ecsRanksData && this.visibleRanks) {
+                this.viewer.setVisibleRanks(this.visibleRanks);
+            }
+        });
+
+        // Rank selection buttons
+        document.getElementById('select-all-ranks').addEventListener('click', () => {
+            this.selectAllRanks(true);
+        });
+
+        document.getElementById('select-no-ranks').addEventListener('click', () => {
+            this.selectAllRanks(false);
+        });
+    }
+
+    selectAllRanks(selectAll) {
+        const checkboxes = document.querySelectorAll('#rank-checkboxes input[type="checkbox"]');
+        checkboxes.forEach(cb => {
+            cb.checked = selectAll;
+        });
+        this.onRankSelectionChange();
+    }
+
+    onRankSelectionChange() {
+        // Get selected ranks from checkboxes
+        const checkboxes = document.querySelectorAll('#rank-checkboxes input[type="checkbox"]');
+        this.visibleRanks = new Set();
+        checkboxes.forEach(cb => {
+            if (cb.checked) {
+                this.visibleRanks.add(parseInt(cb.dataset.rank));
+            }
+        });
+
+        // Update viewer
+        this.viewer.setVisibleRanks(this.visibleRanks);
+
+        // Update interface highlight based on visible ranks
+        this.updateInterfaceHighlight();
+    }
+
+    updateInterfaceHighlight() {
+        if (!this.interfaceData || !this.showInterfaces) {
+            this.viewer.clearInterfaceHighlight();
+            return;
+        }
+
+        // Build interface map: DOF index -> global interface index
+        // This gives each interface a unique color
+        const interfaceMap = new Map();
+        let globalInterfaceIdx = 0;
+
+        for (const rank of this.visibleRanks) {
+            const rankInterfaces = this.interfaceData[rank];
+            if (rankInterfaces) {
+                for (const interfaceList of rankInterfaces) {
+                    // Each interface (line in IF_*.txt) gets its own color
+                    for (const dof of interfaceList) {
+                        // If a DOF is in multiple interfaces, keep the first assignment
+                        // (interfaces may share vertices at corners)
+                        if (!interfaceMap.has(dof)) {
+                            interfaceMap.set(dof, globalInterfaceIdx);
+                        }
+                    }
+                    globalInterfaceIdx++;
+                }
+            }
+        }
+
+        console.log(`Highlighting ${interfaceMap.size} interface DOFs across ${globalInterfaceIdx} interfaces`);
+        this.viewer.setHighlightedInterfaceDofs(interfaceMap);
+    }
+
+    async loadInterfaceData() {
+        try {
+            const response = await fetch('/api/interfaces');
+            const data = await response.json();
+
+            if (data.interfaces && Object.keys(data.interfaces).length > 0) {
+                // Convert string keys to integers
+                this.interfaceData = {};
+                for (const [rank, interfaces] of Object.entries(data.interfaces)) {
+                    this.interfaceData[parseInt(rank)] = interfaces;
+                }
+                console.log(`Loaded interface data: ${data.totalInterfaces} interfaces across ${data.numRanks} ranks`);
+                return true;
+            }
+        } catch (error) {
+            console.warn('Could not load interface data:', error);
+        }
+        this.interfaceData = null;
+        return false;
     }
 
     onPartitionToggle(showPartition) {
         const colorbar = document.getElementById('colorbar');
         const rankLegend = document.getElementById('rank-legend');
         const partitionControls = document.getElementById('partition-controls');
+        const rankSelector = document.getElementById('rank-selector');
 
         if (showPartition && this.ranksData) {
             // Show partition coloring
@@ -606,6 +955,10 @@ class App {
             colorbar.style.display = 'none';
             rankLegend.style.display = 'flex';
             partitionControls.style.display = 'flex';
+            rankSelector.style.display = 'flex';
+
+            // Initialize viewer with all ranks visible
+            this.viewer.setVisibleRanks(this.visibleRanks);
 
             // Color ECS by rank if visible
             if (document.getElementById('show-ecs').checked && this.ecsRanksData) {
@@ -617,7 +970,15 @@ class App {
                 this.viewer.updateCutRankColors(this.cutRanksData);
                 this.viewer.setCutVisible(true);
             }
+
+            // Update interface highlight if enabled
+            if (this.showInterfaces) {
+                this.updateInterfaceHighlight();
+            }
         } else if (this.resultsData) {
+            // Restore full mesh (all ranks) before switching to voltage view
+            this.viewer.restoreFullMesh();
+
             // Restore voltage coloring
             const timeSlider = document.getElementById('result-time');
             const idx = parseInt(timeSlider.value);
@@ -625,15 +986,19 @@ class App {
             colorbar.style.display = 'flex';
             rankLegend.style.display = 'none';
             partitionControls.style.display = 'none';
+            rankSelector.style.display = 'none';
 
             // Hide ECS, cut mesh and reset explosion when leaving partition mode
             this.viewer.setEcsVisible(false);
             this.viewer.setCutVisible(false);
             this.viewer.setExplosionFactor(0);
             this.viewer.resetEcsColors();
+            this.viewer.clearInterfaceHighlight();
             document.getElementById('show-ecs').checked = false;
+            document.getElementById('show-interfaces').checked = false;
             document.getElementById('explosion-slider').value = 0;
             document.getElementById('explosion-value').textContent = '0';
+            this.showInterfaces = false;
         }
     }
 
@@ -641,8 +1006,15 @@ class App {
         // Show the partition toggle option and build the legend
         const label = document.getElementById('show-partition-label');
         const legendItems = document.getElementById('rank-legend-items');
+        const rankCheckboxes = document.getElementById('rank-checkboxes');
 
         label.style.display = 'flex';
+
+        // Initialize visible ranks to all
+        this.visibleRanks = new Set();
+        for (let i = 0; i < numRanks; i++) {
+            this.visibleRanks.add(i);
+        }
 
         // Build legend items
         legendItems.innerHTML = '';
@@ -656,23 +1028,46 @@ class App {
             `;
             legendItems.appendChild(item);
         }
+
+        // Build rank checkboxes
+        rankCheckboxes.innerHTML = '';
+        for (let i = 0; i < numRanks; i++) {
+            const color = this.viewer.rankToColor(i);
+            const item = document.createElement('label');
+            item.className = 'rank-checkbox-item';
+            item.innerHTML = `
+                <input type="checkbox" data-rank="${i}" checked>
+                <span class="rank-color" style="background-color: rgb(${Math.round(color.r*255)}, ${Math.round(color.g*255)}, ${Math.round(color.b*255)})"></span>
+                <span>${i}</span>
+            `;
+            item.querySelector('input').addEventListener('change', () => this.onRankSelectionChange());
+            rankCheckboxes.appendChild(item);
+        }
+
+        // Load interface data
+        this.loadInterfaceData();
     }
 
     hidePartitionOption() {
         const label = document.getElementById('show-partition-label');
         const rankLegend = document.getElementById('rank-legend');
         const partitionControls = document.getElementById('partition-controls');
+        const rankSelector = document.getElementById('rank-selector');
         const checkbox = document.getElementById('show-partition');
 
         label.style.display = 'none';
         rankLegend.style.display = 'none';
         partitionControls.style.display = 'none';
+        rankSelector.style.display = 'none';
         checkbox.checked = false;
 
-        // Reset ECS and explosion
+        // Reset ECS, interfaces, and explosion
         document.getElementById('show-ecs').checked = false;
+        document.getElementById('show-interfaces').checked = false;
         document.getElementById('explosion-slider').value = 0;
         document.getElementById('explosion-value').textContent = '0';
+        this.showInterfaces = false;
+        this.interfaceData = null;
     }
 
     onBoundingBoxChange() {
@@ -719,6 +1114,8 @@ class App {
         // Update viewer voltage range
         if (this.viewer) {
             this.viewer.setVoltageRange(this.vResting, this.vExcited);
+            // Update colorbar gradient (in case colormap changed)
+            this.updateColorbarGradient();
         }
     }
 
@@ -827,6 +1224,15 @@ class App {
                     data.rankCentroids,
                     data.globalCentroid
                 );
+
+                // Pass DOF indices for interface highlighting
+                if (data.dofIndices) {
+                    this.viewer.setDofIndices(data.dofIndices);
+                }
+                if (data.ecsDofIndices) {
+                    this.viewer.setEcsDofIndices(data.ecsDofIndices);
+                }
+
                 this.showPartitionOption(data.numRanks);
             } else {
                 this.ranksData = null;
@@ -893,7 +1299,8 @@ class App {
                 ksp_type: kspType,
                 pc_type: pcType,
                 ksp_rtol: rtol,
-                ksp_atol: atol
+                ksp_atol: atol,
+                bc_type: this.bcType
             };
 
             // Update local state to match
@@ -911,15 +1318,32 @@ class App {
                 // Read Ginkgo values from DOM
                 const ginkgoConfig = {
                     nativeAssembly: document.getElementById('ginkgo-native-assembly').checked,
+                    ddMatrix: document.getElementById('ginkgo-dd-matrix').checked,
                     backend: document.getElementById('ginkgo-backend').value,
                     solver: document.getElementById('ginkgo-solver').value,
                     preconditioner: document.getElementById('ginkgo-precond').value,
                     rtol: rtol,
                     atol: atol,
+                    maxIterations: parseInt(document.getElementById('solver-max-iter').value),
                     amg: {
                         cycle: document.getElementById('amg-cycle').value,
                         smoother: document.getElementById('amg-smoother').value,
                         maxLevels: parseInt(document.getElementById('amg-max-levels').value)
+                    },
+                    bddc: {
+                        localSolver: document.getElementById('bddc-local-solver').value,
+                        coarseSolver: document.getElementById('bddc-coarse-solver').value,
+                        coarseMaxIterations: parseInt(document.getElementById('bddc-coarse-max-iter').value),
+                        vertices: document.getElementById('bddc-vertices').checked,
+                        edges: document.getElementById('bddc-edges').checked,
+                        faces: document.getElementById('bddc-faces').checked,
+                        localAmg: {
+                            smoother: document.getElementById('bddc-local-amg-smoother').value,
+                            smoothSteps: parseInt(document.getElementById('bddc-local-amg-smooth-steps').value),
+                            maxLevels: parseInt(document.getElementById('bddc-local-amg-max-levels').value),
+                            coarseSolver: document.getElementById('bddc-local-amg-coarse-solver').value,
+                            relaxationFactor: parseFloat(document.getElementById('bddc-local-amg-relaxation').value)
+                        }
                     }
                 };
                 await this.configManager.updateGinkgoConfig(ginkgoConfig);
@@ -930,8 +1354,13 @@ class App {
             return;
         }
 
+        const cancelBtn = document.getElementById('cancel-simulation');
+
         try {
             runBtn.disabled = true;
+            cancelBtn.style.display = 'inline-block';
+            cancelBtn.disabled = false;
+            cancelBtn.textContent = 'Cancel';
             statusEl.className = 'status visible running';
             statusEl.textContent = 'Simulation running...';
             outputEl.textContent = '';
@@ -1000,6 +1429,7 @@ class App {
             statusEl.textContent = 'Simulation failed: ' + error.message;
         } finally {
             runBtn.disabled = false;
+            cancelBtn.style.display = 'none';
         }
     }
 

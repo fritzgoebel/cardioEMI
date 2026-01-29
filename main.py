@@ -229,48 +229,90 @@ for i in TAGS:
 
 
 ####### BC #######
-number_of_Dirichlet_points = params['Dirichlet_points']
-Dirichletbc = (number_of_Dirichlet_points > 0) 
+# BC type: "none", "one_corner", "all_corners", "all_boundary"
+# For backwards compatibility, also support Dirichlet_points integer
+bc_type = params.get('bc_type', None)
+if bc_type is None:
+    # Fallback to old Dirichlet_points parameter
+    n_points = params.get('Dirichlet_points', 1)
+    bc_type = 'none' if n_points == 0 else 'one_corner'
 
+Dirichletbc = (bc_type != 'none')
 bcs = []
+rank_has_dirichlet = False
 
 if Dirichletbc:
-
     # Apply zero Dirichlet condition
-    zero = dfx.fem.Constant(mesh, 0.0)        
+    zero = dfx.fem.Constant(mesh, 0.0)
 
-    # identify local boundary DOFs + coords
+    # Identify local boundary DOFs + coords
     boundary_facets = dfx.mesh.exterior_facet_indices(mesh.topology)
     local_bdofs = dfx.fem.locate_dofs_topological(V, mesh.topology.dim-1, boundary_facets)
     coords = V.tabulate_dof_coordinates()
-    local_coords = coords[local_bdofs]      # shape (n_loc, gdim)
+    local_coords = coords[local_bdofs]  # shape (n_loc, gdim)
 
-    # local to global
+    # Local to global mapping
     imap = V.dofmap.index_map
-    first_global = imap.local_range[0]       # first global index on this rank
+    first_global = imap.local_range[0]
     local_global_bdofs = first_global + local_bdofs
 
-    # gather everyone’s cands to rank 0
+    # Gather all boundary DOFs to rank 0 for selection
     all_globals = comm.gather(local_global_bdofs, root=0)
-    all_coords  = comm.gather(local_coords,      root=0)
+    all_coords = comm.gather(local_coords, root=0)
 
-    # on rank 0 pick the 10 “corner‐nearest” by taxi‐distance
     if comm.rank == 0:
-        G  = np.concatenate(all_globals)
-        C  = np.vstack(all_coords)
-        scores = C.sum(axis=1)
-        chosen_global = G[np.argsort(scores)[:number_of_Dirichlet_points]]
+        G = np.concatenate(all_globals)
+        C = np.vstack(all_coords)
+
+        if bc_type == 'one_corner':
+            # Select one corner (minimum taxi distance from origin)
+            scores = C.sum(axis=1)
+            chosen_global = G[np.argsort(scores)[:1]]
+
+        elif bc_type == 'all_corners':
+            # Find 8 corners of bounding box and select closest DOFs
+            bbox_min = C.min(axis=0)
+            bbox_max = C.max(axis=0)
+            corners = []
+            for i in [0, 1]:
+                for j in [0, 1]:
+                    for k in [0, 1]:
+                        corner = np.array([
+                            bbox_min[0] if i == 0 else bbox_max[0],
+                            bbox_min[1] if j == 0 else bbox_max[1],
+                            bbox_min[2] if k == 0 else bbox_max[2]
+                        ])
+                        corners.append(corner)
+
+            # For each corner, find the closest boundary DOF
+            chosen_indices = set()
+            for corner in corners:
+                dists = np.linalg.norm(C - corner, axis=1)
+                closest_idx = np.argmin(dists)
+                chosen_indices.add(closest_idx)
+
+            chosen_global = G[list(chosen_indices)]
+
+        elif bc_type == 'all_boundary':
+            # Use all boundary DOFs
+            chosen_global = G
+
+        else:
+            raise ValueError(f"Unknown bc_type: {bc_type}")
+
+        if comm.rank == 0:
+            print(f"Boundary conditions: {bc_type} ({len(chosen_global)} DOFs)")
     else:
         chosen_global = None
 
-    # broadcast the final 10 GLOBAL DOFs to everyone
+    # Broadcast chosen DOFs to all ranks
     chosen_global = comm.bcast(chosen_global, root=0)
 
-    # each rank picks from its local globals, maps back to local indices
+    # Each rank finds its local DOFs in the chosen set
     mask = np.isin(local_global_bdofs, chosen_global)
     local_chosen = local_bdofs[mask].astype(np.int32)
 
-    # impose BCs only on these local_chosen
+    # Apply Dirichlet BCs to all function spaces
     for i in TAGS:
         bc_i = dfx.fem.dirichletbc(zero, local_chosen, V_dict[i])
         bcs.append(bc_i)
@@ -341,13 +383,19 @@ use_ginkgo = solver_backend == "ginkgo" and GINKGO_AVAILABLE
 ginkgo_cfg = params.get("ginkgo", {}) if use_ginkgo else {}
 use_native_assembly = use_ginkgo and ginkgo_cfg.get("native_assembly", False)
 
+use_dd_matrix = use_ginkgo and ginkgo_cfg.get("dd_matrix", False)
+
+# Matrix-to-vertex mapping (only populated for native assembly)
+matrix_to_vertex_local = None
+
 if use_native_assembly:
     # Native assembly path - assemble directly to COO for Ginkgo
     if comm.rank == 0:
-        print("Using native Ginkgo assembly (bypassing PETSc matrix)")
+        matrix_type = "DdMatrix" if use_dd_matrix else "regular"
+        print(f"Using native Ginkgo assembly ({matrix_type}, bypassing PETSc matrix)")
 
     coo_data = assemble_block_to_coo(a, restriction, bcs, comm)
-    coo_row_indices, coo_col_indices, coo_values, coo_global_size, coo_row_ranges = coo_data
+    coo_row_indices, coo_col_indices, coo_values, coo_global_size, coo_row_ranges, matrix_to_vertex_local, contributed_vertices_local = coo_data
     assemble_time += time.perf_counter() - t1
 
     if comm.rank == 0:
@@ -360,6 +408,7 @@ else:
     A = multiphenicsx.fem.petsc.assemble_matrix_block(a, bcs=bcs, restriction=(restriction, restriction))
     A.assemble()
     assemble_time += time.perf_counter() - t1
+    contributed_vertices_local = None  # Not available for PETSc path
 
     if comm.rank == 0:
         print(f"Assembling matrix A:    {time.perf_counter() - t1:.2f} seconds")
@@ -376,19 +425,20 @@ else:
 #        CREATE NULLSPACE         #
 #---------------------------------#
 
-if not Dirichletbc and A is not None:
+if not Dirichletbc:
     # Create the PETSc nullspace vector and check that it is a valid nullspace of A
     nullspace = PETSc.NullSpace().create(constant=True,comm=comm)
-    assert nullspace.test(A)
-    # For convenience, we explicitly inform PETSc that A is symmetric, so that it automatically
-    # sets the nullspace of A^T too (see the documentation of MatSetNullSpace).
-    # Symmetry checked also by direct inspection through the plot_sparsity_pattern() function
-    A.setOption(PETSc.Mat.Option.SYMMETRIC, True)
-    A.setOption(PETSc.Mat.Option.SYMMETRY_ETERNAL, True)
-    # Set the nullspace
-    A.setNullSpace(nullspace)
-    if params["ksp_type"] == "cg":
-        A.setNearNullSpace(nullspace)
+    if A is not None:
+        assert nullspace.test(A)
+        # For convenience, we explicitly inform PETSc that A is symmetric, so that it automatically
+        # sets the nullspace of A^T too (see the documentation of MatSetNullSpace).
+        # Symmetry checked also by direct inspection through the plot_sparsity_pattern() function
+        A.setOption(PETSc.Mat.Option.SYMMETRIC, True)
+        A.setOption(PETSc.Mat.Option.SYMMETRY_ETERNAL, True)
+        # Set the nullspace
+        A.setNullSpace(nullspace)
+        if params["ksp_type"] == "cg":
+            A.setNearNullSpace(nullspace)
 
 #---------------------------------#
 #      CONFIGURE SOLVER           #
@@ -417,6 +467,34 @@ if use_ginkgo:
             "relaxation_factor": float(amg_cfg.get("relaxation_factor", 0.9)),
         }
 
+    # BDDC configuration
+    bddc_config = None
+    if gko_precond == "bddc":
+        bddc_cfg = ginkgo_cfg.get("bddc", {})
+        # constant_nullspace should be True only for pure Neumann (no Dirichlet BCs globally)
+        has_nullspace = not Dirichletbc
+        bddc_config = {
+            "local_solver": bddc_cfg.get("local_solver", "direct"),
+            "coarse_solver": bddc_cfg.get("coarse_solver", "cg"),
+            "coarse_max_iterations": int(bddc_cfg.get("coarse_max_iterations", 100)),
+            "vertices": bddc_cfg.get("vertices", True),
+            "edges": bddc_cfg.get("edges", True),
+            "faces": bddc_cfg.get("faces", True),
+            "constant_nullspace": has_nullspace,
+        }
+        if comm.rank == 0:
+            print(f"BDDC constant_nullspace: {has_nullspace} (Dirichlet BCs: {Dirichletbc})")
+        # Add local AMG config if local solver is AMG
+        local_amg_cfg = bddc_cfg.get("local_amg", {})
+        if local_amg_cfg:
+            bddc_config["local_amg"] = {
+                "smoother": local_amg_cfg.get("smoother", "jacobi"),
+                "smooth_steps": int(local_amg_cfg.get("smooth_steps", 1)),
+                "max_levels": int(local_amg_cfg.get("max_levels", 10)),
+                "coarse_solver": local_amg_cfg.get("coarse_solver", "direct"),
+                "relaxation_factor": float(local_amg_cfg.get("relaxation_factor", 0.9)),
+            }
+
     # Create Ginkgo solver (without matrix - set operator separately)
     ginkgo_solver = GinkgoSolver(
         comm=comm,
@@ -427,15 +505,22 @@ if use_ginkgo:
         atol=gko_atol,
         max_iter=gko_max_iter,
         amg_config=amg_config,
+        bddc_config=bddc_config,
         verbose=params.get("verbose", False)
     )
 
     # Set operator based on assembly method
     if use_native_assembly:
-        ginkgo_solver.set_operator_from_local_coo(
-            coo_row_indices, coo_col_indices, coo_values,
-            coo_global_size, coo_global_size, coo_row_ranges
-        )
+        if use_dd_matrix:
+            ginkgo_solver.set_operator_dd_from_local_coo(
+                coo_row_indices, coo_col_indices, coo_values,
+                coo_global_size, coo_global_size, coo_row_ranges
+            )
+        else:
+            ginkgo_solver.set_operator_from_local_coo(
+                coo_row_indices, coo_col_indices, coo_values,
+                coo_global_size, coo_global_size, coo_row_ranges
+            )
     else:
         ginkgo_solver.set_operator_from_petsc(A)
 
@@ -517,42 +602,144 @@ if params["save_output"]:
         with open(out_name + "/facet_tag_to_pair.pickle", "wb") as f:
             pickle.dump(facet_tag_to_pair, f)
 
-    # Save MPI rank ownership for each DOF (for partition visualization)
-    # Each rank computes which DOFs it owns and gathers to rank 0
+    # Save MPI rank ownership for each vertex (for partition visualization)
     imap = V.dofmap.index_map
-    num_local_owned = imap.size_local  # Number of DOFs owned by this rank (not ghosts)
-    first_global = imap.local_range[0]
+    global_size = imap.size_global
 
-    # Create array of (global_dof_index, rank) pairs for owned DOFs only
-    local_dof_ranks = np.column_stack([
-        np.arange(first_global, first_global + num_local_owned, dtype=np.int64),
-        np.full(num_local_owned, comm.rank, dtype=np.int32)
-    ])
+    # Save DOF contribution data (which ranks contribute to each DOF)
+    # For native assembly: use actual nonzero contributions from matrix assembly
+    # For PETSc path: fall back to local index set (owned OR ghost)
+    if use_native_assembly and contributed_vertices_local is not None:
+        # Native assembly: use actual nonzero contributions
+        local_contributions = np.column_stack([
+            np.array(list(contributed_vertices_local), dtype=np.int64),
+            np.full(len(contributed_vertices_local), comm.rank, dtype=np.int32)
+        ]) if contributed_vertices_local else np.empty((0, 2), dtype=np.int64)
+    else:
+        # PETSc path: use local index set (owned + ghosts)
+        num_local_owned = imap.size_local
+        first_global = imap.local_range[0]
 
-    # Gather all rank ownership info to rank 0
-    all_dof_ranks = comm.gather(local_dof_ranks, root=0)
+        # Get global indices of local DOFs (owned + ghosts)
+        local_owned_global = np.arange(first_global, first_global + num_local_owned, dtype=np.int64)
+        ghost_global = imap.ghosts.astype(np.int64)  # Global indices of ghost DOFs
+        local_dofs_global = np.concatenate([local_owned_global, ghost_global])
+
+        # Create (dof, rank) pairs for all DOFs this rank contributes to
+        local_contributions = np.column_stack([
+            local_dofs_global,
+            np.full(len(local_dofs_global), comm.rank, dtype=np.int32)
+        ])
+
+    # Gather all contributions to rank 0
+    all_contributions = comm.gather(local_contributions, root=0)
 
     if comm.rank == 0:
-        # Combine all arrays
-        all_dof_ranks = np.vstack(all_dof_ranks)
-        # Sort by global DOF index
-        sorted_indices = np.argsort(all_dof_ranks[:, 0])
-        all_dof_ranks = all_dof_ranks[sorted_indices]
+        # Build vertex -> set of contributing ranks
+        all_contributions = np.vstack(all_contributions) if all_contributions else np.empty((0, 2), dtype=np.int64)
+        vertex_contributors = {}
+        for dof, rank in all_contributions:
+            dof = int(dof)
+            rank = int(rank)
+            if dof not in vertex_contributors:
+                vertex_contributors[dof] = set()
+            vertex_contributors[dof].add(rank)
 
-        # Create a simple array: dof_ranks[global_dof] = rank
-        global_size = imap.size_global
-        dof_ranks = np.zeros(global_size, dtype=np.int32)
-        for global_dof, rank in all_dof_ranks:
-            dof_ranks[int(global_dof)] = int(rank)
+        # Convert sets to sorted lists for JSON serialization
+        vertex_contributors = {k: sorted(v) for k, v in vertex_contributors.items()}
 
-        # Save rank ownership
-        with open(out_name + "/dof_ranks.pickle", "wb") as f:
+        with open(out_name + "/dof_contributors.pickle", "wb") as f:
             pickle.dump({
-                'ranks': dof_ranks,
+                'contributors': vertex_contributors,
                 'num_ranks': comm.size,
                 'global_size': global_size
             }, f)
-        print(f"Saved DOF rank ownership ({global_size} DOFs, {comm.size} ranks)")
+        contrib_type = "nonzero matrix entries" if use_native_assembly else "local index set"
+        print(f"Saved DOF contribution data ({len(vertex_contributors)} DOFs, based on {contrib_type})")
+
+    if matrix_to_vertex_local:
+        # Native assembly: use matrix row ownership to determine vertex ranks
+        # Each rank's matrix_to_vertex_local maps matrix_row -> mesh_vertex for owned rows
+        # So we create (mesh_vertex, rank) pairs from each rank's mapping
+
+        # Create array of (mesh_vertex_index, rank) pairs for this rank's owned matrix rows
+        local_vertex_ranks = np.array([
+            [vertex, comm.rank]
+            for matrix_row, vertex in matrix_to_vertex_local.items()
+        ], dtype=np.int64) if matrix_to_vertex_local else np.empty((0, 2), dtype=np.int64)
+
+        # Gather all vertex-rank pairs to rank 0
+        all_vertex_ranks = comm.gather(local_vertex_ranks, root=0)
+
+        # Also gather and merge the matrix_to_vertex mappings
+        all_matrix_to_vertex = comm.gather(matrix_to_vertex_local, root=0)
+
+        if comm.rank == 0:
+            # Merge matrix_to_vertex mappings
+            matrix_to_vertex = {}
+            for rank_mapping in all_matrix_to_vertex:
+                matrix_to_vertex.update(rank_mapping)
+
+            with open(out_name + "/matrix_to_vertex.pickle", "wb") as f:
+                pickle.dump(matrix_to_vertex, f)
+            print(f"Saved matrix-to-vertex mapping ({len(matrix_to_vertex)} entries)")
+
+            # Build vertex -> rank mapping from gathered data
+            # Filter out empty arrays and combine
+            non_empty = [arr for arr in all_vertex_ranks if len(arr) > 0]
+            if non_empty:
+                all_vertex_ranks = np.vstack(non_empty)
+            else:
+                all_vertex_ranks = np.empty((0, 2), dtype=np.int64)
+
+            # Create array: dof_ranks[mesh_vertex] = rank
+            dof_ranks = np.full(global_size, -1, dtype=np.int32)
+            for vertex, rank in all_vertex_ranks:
+                dof_ranks[int(vertex)] = int(rank)
+
+            # Save rank ownership
+            with open(out_name + "/dof_ranks.pickle", "wb") as f:
+                pickle.dump({
+                    'ranks': dof_ranks,
+                    'num_ranks': comm.size,
+                    'global_size': global_size
+                }, f)
+            print(f"Saved DOF rank ownership ({len(all_vertex_ranks)} vertices, {comm.size} ranks)")
+
+    else:
+        # PETSc path: use DOLFINx's DOF ownership
+        num_local_owned = imap.size_local
+        first_global = imap.local_range[0]
+
+        # Create array of (global_dof_index, rank) pairs for owned DOFs only
+        local_dof_ranks = np.column_stack([
+            np.arange(first_global, first_global + num_local_owned, dtype=np.int64),
+            np.full(num_local_owned, comm.rank, dtype=np.int32)
+        ])
+
+        # Gather all rank ownership info to rank 0
+        all_dof_ranks = comm.gather(local_dof_ranks, root=0)
+
+        if comm.rank == 0:
+            # Combine all arrays
+            all_dof_ranks = np.vstack(all_dof_ranks)
+            # Sort by global DOF index
+            sorted_indices = np.argsort(all_dof_ranks[:, 0])
+            all_dof_ranks = all_dof_ranks[sorted_indices]
+
+            # Create a simple array: dof_ranks[global_dof] = rank
+            dof_ranks = np.zeros(global_size, dtype=np.int32)
+            for global_dof, rank in all_dof_ranks:
+                dof_ranks[int(global_dof)] = int(rank)
+
+            # Save rank ownership
+            with open(out_name + "/dof_ranks.pickle", "wb") as f:
+                pickle.dump({
+                    'ranks': dof_ranks,
+                    'num_ranks': comm.size,
+                    'global_size': global_size
+                }, f)
+            print(f"Saved DOF rank ownership ({global_size} DOFs, {comm.size} ranks)")
 
 
 #---------------------------------#
