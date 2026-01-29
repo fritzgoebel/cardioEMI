@@ -23,6 +23,7 @@ using namespace dolfinx_ginkgo;
 using GkoExecutor = gko::Executor;
 using GkoCommunicator = gko::experimental::mpi::communicator;
 using GkoDistMatrix = gko_dist::Matrix<double, std::int32_t, std::int64_t>;
+using GkoDdMatrix = gko_dist::DdMatrix<double, std::int32_t, std::int64_t>;
 using GkoDistVector = gko_dist::Vector<double>;
 
 // Helper to convert mpi4py communicator to MPI_Comm
@@ -101,6 +102,7 @@ NB_MODULE(_cpp, m) {
         .value("IC", PreconditionerType::IC, "Incomplete Cholesky")
         .value("ISAI", PreconditionerType::ISAI, "Approximate sparse inverse")
         .value("AMG", PreconditionerType::AMG, "Algebraic multigrid")
+        .value("BDDC", PreconditionerType::BDDC, "BDDC (requires DdMatrix)")
         .export_values();
 
     // =========================================================================
@@ -117,6 +119,9 @@ NB_MODULE(_cpp, m) {
 
     nb::class_<GkoDistMatrix>(m, "DistributedMatrix",
         "Ginkgo distributed matrix (opaque handle)");
+
+    nb::class_<GkoDdMatrix>(m, "DdMatrix",
+        "Ginkgo domain decomposition matrix (opaque handle)");
 
     nb::class_<GkoDistVector>(m, "DistributedVector",
         "Ginkgo distributed vector (opaque handle)");
@@ -162,6 +167,72 @@ NB_MODULE(_cpp, m) {
         .def_rw("mixed_precision_level", &AMGConfig::mixed_precision_level);
 
     // =========================================================================
+    // BDDC Configuration
+    // =========================================================================
+
+    nb::class_<BDDCConfig> bddc_config(m, "BDDCConfig", "BDDC preconditioner configuration");
+
+    nb::enum_<BDDCConfig::Scaling>(bddc_config, "Scaling", "Scaling type for interface weights")
+        .value("STIFFNESS", BDDCConfig::Scaling::STIFFNESS)
+        .value("DELUXE", BDDCConfig::Scaling::DELUXE)
+        .export_values();
+
+    nb::enum_<BDDCConfig::LocalSolver>(bddc_config, "LocalSolver", "Local subdomain solver")
+        .value("DIRECT", BDDCConfig::LocalSolver::DIRECT)
+        .value("ILU", BDDCConfig::LocalSolver::ILU)
+        .value("IC", BDDCConfig::LocalSolver::IC)
+        .value("AMG", BDDCConfig::LocalSolver::AMG)
+        .export_values();
+
+    nb::enum_<BDDCConfig::CoarseSolver>(bddc_config, "CoarseSolver", "Coarse level solver")
+        .value("CG", BDDCConfig::CoarseSolver::CG)
+        .value("GMRES", BDDCConfig::CoarseSolver::GMRES)
+        .export_values();
+
+    // Local AMG configuration (nested in BDDCConfig)
+    nb::class_<BDDCConfig::LocalAMGConfig> local_amg_config(bddc_config, "LocalAMGConfig",
+        "AMG configuration for local subdomain solver");
+
+    nb::enum_<BDDCConfig::LocalAMGConfig::Smoother>(local_amg_config, "Smoother", "Smoother type")
+        .value("JACOBI", BDDCConfig::LocalAMGConfig::Smoother::JACOBI)
+        .value("GAUSS_SEIDEL", BDDCConfig::LocalAMGConfig::Smoother::GAUSS_SEIDEL)
+        .value("ILU", BDDCConfig::LocalAMGConfig::Smoother::ILU)
+        .export_values();
+
+    nb::enum_<BDDCConfig::LocalAMGConfig::CoarseSolver>(local_amg_config, "CoarseSolver",
+        "Coarsest level solver for local AMG")
+        .value("DIRECT", BDDCConfig::LocalAMGConfig::CoarseSolver::DIRECT)
+        .value("CG", BDDCConfig::LocalAMGConfig::CoarseSolver::CG)
+        .value("GMRES", BDDCConfig::LocalAMGConfig::CoarseSolver::GMRES)
+        .export_values();
+
+    local_amg_config
+        .def(nb::init<>())
+        .def_rw("max_levels", &BDDCConfig::LocalAMGConfig::max_levels)
+        .def_rw("min_coarse_rows", &BDDCConfig::LocalAMGConfig::min_coarse_rows)
+        .def_rw("smoother", &BDDCConfig::LocalAMGConfig::smoother)
+        .def_rw("smooth_steps", &BDDCConfig::LocalAMGConfig::smooth_steps)
+        .def_rw("relaxation_factor", &BDDCConfig::LocalAMGConfig::relaxation_factor)
+        .def_rw("coarse_solver", &BDDCConfig::LocalAMGConfig::coarse_solver)
+        .def_rw("coarse_max_iterations", &BDDCConfig::LocalAMGConfig::coarse_max_iterations);
+
+    bddc_config
+        .def(nb::init<>())
+        .def_rw("vertices", &BDDCConfig::vertices)
+        .def_rw("edges", &BDDCConfig::edges)
+        .def_rw("faces", &BDDCConfig::faces)
+        .def_rw("scaling", &BDDCConfig::scaling)
+        .def_rw("local_solver", &BDDCConfig::local_solver)
+        .def_rw("local_max_iterations", &BDDCConfig::local_max_iterations)
+        .def_rw("local_tolerance", &BDDCConfig::local_tolerance)
+        .def_rw("local_amg", &BDDCConfig::local_amg)
+        .def_rw("coarse_solver", &BDDCConfig::coarse_solver)
+        .def_rw("coarse_max_iterations", &BDDCConfig::coarse_max_iterations)
+        .def_rw("coarse_tolerance", &BDDCConfig::coarse_tolerance)
+        .def_rw("repartition_coarse", &BDDCConfig::repartition_coarse)
+        .def_rw("constant_nullspace", &BDDCConfig::constant_nullspace);
+
+    // =========================================================================
     // Solver Configuration
     // =========================================================================
 
@@ -176,6 +247,7 @@ NB_MODULE(_cpp, m) {
         .def_rw("jacobi_block_size", &SolverConfig::jacobi_block_size)
         .def_rw("ilu_fill_level", &SolverConfig::ilu_fill_level)
         .def_rw("amg", &SolverConfig::amg)
+        .def_rw("bddc", &SolverConfig::bddc)
         .def_rw("verbose", &SolverConfig::verbose);
 
     // =========================================================================
@@ -297,6 +369,58 @@ NB_MODULE(_cpp, m) {
           "Update Ginkgo matrix values from local COO data with communication");
 
     // =========================================================================
+    // DdMatrix (Domain Decomposition Matrix) Functions
+    // =========================================================================
+
+    m.def("create_dd_matrix_from_local_coo",
+          [](std::shared_ptr<gko::Executor> exec,
+             std::shared_ptr<gko::experimental::mpi::communicator> gko_comm,
+             nb::ndarray<std::int64_t, nb::ndim<1>, nb::c_contig> row_indices,
+             nb::ndarray<std::int64_t, nb::ndim<1>, nb::c_contig> col_indices,
+             nb::ndarray<double, nb::ndim<1>, nb::c_contig> values,
+             std::int64_t global_rows,
+             std::int64_t global_cols,
+             nb::ndarray<std::int64_t, nb::ndim<1>, nb::c_contig> row_ranges) {
+              std::vector<std::int64_t> rows(row_indices.data(),
+                                              row_indices.data() + row_indices.size());
+              std::vector<std::int64_t> cols(col_indices.data(),
+                                              col_indices.data() + col_indices.size());
+              std::vector<double> vals(values.data(),
+                                       values.data() + values.size());
+              std::vector<std::int64_t> ranges(row_ranges.data(),
+                                                row_ranges.data() + row_ranges.size());
+
+              return create_dd_matrix_from_local_coo<>(
+                  exec, gko_comm, rows, cols, vals, global_rows, global_cols, ranges);
+          },
+          nb::arg("exec"), nb::arg("comm"),
+          nb::arg("row_indices"), nb::arg("col_indices"), nb::arg("values"),
+          nb::arg("global_rows"), nb::arg("global_cols"), nb::arg("row_ranges"),
+          "Create Ginkgo DdMatrix from local COO data for domain decomposition");
+
+    m.def("update_dd_matrix_from_local_coo",
+          [](std::shared_ptr<gko_dist::DdMatrix<double, std::int32_t, std::int64_t>> dd_mat,
+             nb::ndarray<std::int64_t, nb::ndim<1>, nb::c_contig> row_indices,
+             nb::ndarray<std::int64_t, nb::ndim<1>, nb::c_contig> col_indices,
+             nb::ndarray<double, nb::ndim<1>, nb::c_contig> values,
+             nb::ndarray<std::int64_t, nb::ndim<1>, nb::c_contig> row_ranges) {
+              std::vector<std::int64_t> rows(row_indices.data(),
+                                              row_indices.data() + row_indices.size());
+              std::vector<std::int64_t> cols(col_indices.data(),
+                                              col_indices.data() + col_indices.size());
+              std::vector<double> vals(values.data(),
+                                       values.data() + values.size());
+              std::vector<std::int64_t> ranges(row_ranges.data(),
+                                                row_ranges.data() + row_ranges.size());
+
+              update_dd_matrix_from_local_coo(dd_mat, rows, cols, vals, ranges);
+          },
+          nb::arg("dd_mat"),
+          nb::arg("row_indices"), nb::arg("col_indices"), nb::arg("values"),
+          nb::arg("row_ranges"),
+          "Update Ginkgo DdMatrix values from local COO data");
+
+    // =========================================================================
     // Distributed Solver
     // =========================================================================
 
@@ -307,8 +431,14 @@ NB_MODULE(_cpp, m) {
                       std::shared_ptr<gko::experimental::mpi::communicator>,
                       const SolverConfig&>(),
              nb::arg("exec"), nb::arg("comm"), nb::arg("config") = SolverConfig{})
-        .def("set_operator", &Solver::set_operator,
-             nb::arg("A"), "Set the system matrix")
+        .def("set_operator",
+             static_cast<void (Solver::*)(std::shared_ptr<GkoDistMatrix>)>(&Solver::set_operator),
+             nb::arg("A"), "Set the system matrix (DistributedMatrix)")
+        .def("set_operator_dd",
+             [](Solver& solver, std::shared_ptr<GkoDdMatrix> A) {
+                 solver.set_operator(std::static_pointer_cast<gko::LinOp>(A));
+             },
+             nb::arg("A"), "Set the system matrix (DdMatrix)")
         .def("set_tolerance", &Solver::set_tolerance,
              nb::arg("rtol"), nb::arg("atol") = 1e-12,
              "Update convergence tolerances")

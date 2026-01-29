@@ -48,6 +48,8 @@ find_library(METIS_LIBRARY NAMES metis HINTS ${PETSC_LIB_HINTS})
 find_library(PTSCOTCHPARMETIS_LIBRARY NAMES ptscotchparmetisv3 HINTS ${PETSC_LIB_HINTS})
 find_library(SCOTCH_LIBRARY NAMES scotch HINTS ${PETSC_LIB_HINTS})
 find_library(SCOTCHERR_LIBRARY NAMES scotcherr HINTS ${PETSC_LIB_HINTS})
+# Also look for system ParMETIS (needed for Ginkgo BDDC)
+find_library(PARMETIS_LIBRARY NAMES parmetis HINTS /usr/lib)
 
 target_link_libraries(dolfinx_ginkgo INTERFACE
     Ginkgo::ginkgo
@@ -57,6 +59,9 @@ target_link_libraries(dolfinx_ginkgo INTERFACE
 )
 
 # Add METIS/ParMETIS if found
+if(PARMETIS_LIBRARY)
+    target_link_libraries(dolfinx_ginkgo INTERFACE ${PARMETIS_LIBRARY})
+endif()
 if(METIS_LIBRARY)
     target_link_libraries(dolfinx_ginkgo INTERFACE ${METIS_LIBRARY})
 endif()

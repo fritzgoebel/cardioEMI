@@ -206,7 +206,8 @@ enum class PreconditionerType {
     ILU,          ///< Incomplete LU factorization
     IC,           ///< Incomplete Cholesky factorization
     ISAI,         ///< Approximate sparse inverse
-    AMG           ///< Algebraic multigrid with PGM coarsening
+    AMG,          ///< Algebraic multigrid with PGM coarsening
+    BDDC          ///< Balancing Domain Decomposition by Constraints (requires DdMatrix)
 };
 
 /// AMG-specific configuration
@@ -238,6 +239,50 @@ struct AMGConfig {
     unsigned int mixed_precision_level = 2;  ///< Switch precision after this level
 };
 
+/// BDDC-specific configuration
+struct BDDCConfig {
+    // Constraint types (which DOFs to use as primal constraints)
+    bool vertices = true;     ///< Use vertex constraints
+    bool edges = true;        ///< Use edge average constraints
+    bool faces = true;        ///< Use face average constraints
+
+    // Scaling type for weighted averages at interfaces
+    enum class Scaling { STIFFNESS, DELUXE };
+    Scaling scaling = Scaling::STIFFNESS;
+
+    // Local solver configuration
+    enum class LocalSolver { DIRECT, ILU, IC, AMG };
+    LocalSolver local_solver = LocalSolver::DIRECT;
+    int local_max_iterations = 100;       ///< Max iterations for iterative local solver
+    double local_tolerance = 1e-12;       ///< Tolerance for iterative local solver
+
+    // Local AMG configuration (used when local_solver = AMG)
+    struct LocalAMGConfig {
+        unsigned int max_levels = 10;
+        unsigned int min_coarse_rows = 50;
+
+        enum class Smoother { JACOBI, GAUSS_SEIDEL, ILU };
+        Smoother smoother = Smoother::JACOBI;
+        unsigned int smooth_steps = 1;
+        double relaxation_factor = 0.9;
+
+        enum class CoarseSolver { DIRECT, CG, GMRES };
+        CoarseSolver coarse_solver = CoarseSolver::DIRECT;
+        int coarse_max_iterations = 100;
+    };
+    LocalAMGConfig local_amg;
+
+    // Coarse solver configuration (distributed - no direct solver)
+    enum class CoarseSolver { CG, GMRES };
+    CoarseSolver coarse_solver = CoarseSolver::CG;
+    int coarse_max_iterations = 100;      ///< Max iterations for iterative coarse solver
+    double coarse_tolerance = 1e-10;      ///< Tolerance for iterative coarse solver
+
+    // Advanced options
+    bool repartition_coarse = false;      ///< Repartition coarse problem for load balance
+    bool constant_nullspace = false;      ///< Handle constant nullspace (pure Neumann BC)
+};
+
 /// Complete solver configuration
 struct SolverConfig {
     // Solver selection
@@ -258,6 +303,9 @@ struct SolverConfig {
 
     // AMG configuration
     AMGConfig amg;
+
+    // BDDC configuration
+    BDDCConfig bddc;
 
     // Output
     bool verbose = false;                 ///< Print convergence info
@@ -281,6 +329,12 @@ template<typename ValueType = DefaultValueType,
          typename LocalIndexType = DefaultLocalIndexType,
          typename GlobalIndexType = DefaultGlobalIndexType>
 using DistMatrix = gko_dist::Matrix<ValueType, LocalIndexType, GlobalIndexType>;
+
+/// Domain decomposition matrix type alias (for BDDC and related methods)
+template<typename ValueType = DefaultValueType,
+         typename LocalIndexType = DefaultLocalIndexType,
+         typename GlobalIndexType = DefaultGlobalIndexType>
+using DdMatrix = gko_dist::DdMatrix<ValueType, LocalIndexType, GlobalIndexType>;
 
 /// Distributed vector type alias
 template<typename ValueType = DefaultValueType>

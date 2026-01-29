@@ -30,8 +30,8 @@ class GinkgoSolver:
         GPU device ID (for CUDA/HIP backends). Default: 0
     solver : {"cg", "fcg", "gmres", "bicgstab", "cgs"}, optional
         Krylov solver type. Default: "cg"
-    preconditioner : {"none", "jacobi", "block_jacobi", "ilu", "ic", "isai", "amg"}, optional
-        Preconditioner type. Default: "amg"
+    preconditioner : {"none", "jacobi", "block_jacobi", "ilu", "ic", "isai", "amg", "bddc"}, optional
+        Preconditioner type. Default: "amg". BDDC requires DdMatrix (use set_operator_dd_from_local_coo).
     rtol : float, optional
         Relative tolerance. Default: 1e-8
     atol : float, optional
@@ -44,6 +44,21 @@ class GinkgoSolver:
         Block size for block Jacobi preconditioner. Default: 32
     amg_config : dict, optional
         AMG-specific configuration. See AMGConfig for options.
+    bddc_config : dict, optional
+        BDDC-specific configuration. Options:
+        - vertices: bool, use vertex constraints (default: True)
+        - edges: bool, use edge constraints (default: True)
+        - faces: bool, use face constraints (default: True)
+        - scaling: "stiffness" or "deluxe" (default: "stiffness")
+        - local_solver: "direct", "ilu", "ic", or "amg" (default: "direct")
+        - local_max_iterations: int (default: 100)
+        - local_tolerance: float (default: 1e-12)
+        - local_amg: dict with local AMG config (max_levels, smoother, coarse_solver, etc.)
+        - coarse_solver: "cg" or "gmres" (default: "cg")
+        - coarse_max_iterations: int (default: 100)
+        - coarse_tolerance: float (default: 1e-10)
+        - repartition_coarse: bool (default: False)
+        - constant_nullspace: bool (default: False)
     verbose : bool, optional
         Print convergence info. Default: False
 
@@ -110,6 +125,7 @@ class GinkgoSolver:
         "ic": "IC",
         "isai": "ISAI",
         "amg": "AMG",
+        "bddc": "BDDC",
     }
 
     def __init__(
@@ -119,13 +135,14 @@ class GinkgoSolver:
         backend: Literal["reference", "omp", "cuda", "hip", "sycl"] = "omp",
         device_id: int = 0,
         solver: Literal["cg", "fcg", "gmres", "bicgstab", "cgs"] = "cg",
-        preconditioner: Literal["none", "jacobi", "block_jacobi", "ilu", "ic", "isai", "amg"] = "jacobi",
+        preconditioner: Literal["none", "jacobi", "block_jacobi", "ilu", "ic", "isai", "amg", "bddc"] = "jacobi",
         rtol: float = 1e-8,
         atol: float = 1e-12,
         max_iter: int = 1000,
         krylov_dim: int = 30,
         jacobi_block_size: int = 32,
         amg_config: Optional[dict] = None,
+        bddc_config: Optional[dict] = None,
         verbose: bool = False,
     ):
         # Import C++ bindings
@@ -183,6 +200,10 @@ class GinkgoSolver:
         if preconditioner.lower() == "amg" and amg_config is not None:
             self._configure_amg(config.amg, amg_config, _cpp)
 
+        # Configure BDDC if selected
+        if preconditioner.lower() == "bddc" and bddc_config is not None:
+            self._configure_bddc(config.bddc, bddc_config, _cpp)
+
         # Store references
         self._config = config
         self._comm = comm
@@ -191,6 +212,7 @@ class GinkgoSolver:
         self._A_petsc = None
         self._solver = None
         self._row_ranges = None
+        self._is_dd_matrix = False
 
         # If matrix provided, set it (backward compatibility)
         if A is not None:
@@ -267,6 +289,86 @@ class GinkgoSolver:
             self._solver = _cpp.DistributedSolver(self._exec, self._gko_comm, self._config)
         self._solver.set_operator(self._A_gko)
 
+    def set_operator_dd_from_local_coo(
+        self,
+        row_indices,  # np.ndarray[int64]
+        col_indices,  # np.ndarray[int64]
+        values,       # np.ndarray[float64]
+        global_rows: int,
+        global_cols: int,
+        row_ranges,   # np.ndarray[int64]
+    ) -> None:
+        """
+        Set the system matrix as a DdMatrix from local COO data.
+
+        DdMatrix is used for domain decomposition methods like BDDC. Unlike the
+        regular distributed matrix which sums contributions from different ranks,
+        DdMatrix stores unassembled local contributions and uses restriction/
+        prolongation operators to handle subdomain interfaces.
+
+        Each rank provides its local contributions including interface DOFs.
+        Interface DOFs typically have partial contributions that are combined
+        via the restriction/prolongation operators (A = R^T * A_local * R).
+
+        Parameters
+        ----------
+        row_indices : ndarray[int64]
+            Global row indices of non-zeros
+        col_indices : ndarray[int64]
+            Global column indices of non-zeros
+        values : ndarray[float64]
+            Non-zero values
+        global_rows : int
+            Total number of rows in the global matrix
+        global_cols : int
+            Total number of columns in the global matrix
+        row_ranges : ndarray[int64]
+            Partition ranges [r0, r1, ..., r_nprocs] defining row ownership.
+            Rank i owns rows [row_ranges[i], row_ranges[i+1]).
+
+        Examples
+        --------
+        For a 3x3 tridiagonal matrix distributed to 2 ranks with interface at row 1:
+
+        >>> # Rank 0's local contribution (owns rows 0-1):
+        >>> # |  4 -2  0 |
+        >>> # | -2  2  0 |  <- interface row, partial diagonal
+        >>> # |  0  0  0 |
+        >>> if rank == 0:
+        ...     rows = [0, 0, 1, 1]
+        ...     cols = [0, 1, 0, 1]
+        ...     vals = [4.0, -2.0, -2.0, 2.0]
+        >>> # Rank 1's local contribution (owns row 2):
+        >>> # |  0  0  0 |
+        >>> # |  0  2 -2 |  <- interface row, partial diagonal
+        >>> # |  0 -2  4 |
+        >>> else:
+        ...     rows = [1, 1, 2, 2]
+        ...     cols = [1, 2, 1, 2]
+        ...     vals = [2.0, -2.0, -2.0, 4.0]
+        >>> solver.set_operator_dd_from_local_coo(rows, cols, vals, 3, 3, [0, 2, 3])
+        """
+        import numpy as np
+        _cpp = self._cpp
+
+        row_indices = np.ascontiguousarray(row_indices, dtype=np.int64)
+        col_indices = np.ascontiguousarray(col_indices, dtype=np.int64)
+        values = np.ascontiguousarray(values, dtype=np.float64)
+        row_ranges = np.ascontiguousarray(row_ranges, dtype=np.int64)
+
+        self._A_gko = _cpp.create_dd_matrix_from_local_coo(
+            self._exec, self._gko_comm,
+            row_indices, col_indices, values,
+            global_rows, global_cols, row_ranges
+        )
+        self._row_ranges = row_ranges
+        self._A_petsc = None
+        self._is_dd_matrix = True
+
+        if self._solver is None:
+            self._solver = _cpp.DistributedSolver(self._exec, self._gko_comm, self._config)
+        self._solver.set_operator_dd(self._A_gko)
+
     def _configure_amg(self, amg, cfg: dict, _cpp) -> None:
         """Apply user AMG configuration."""
         if "max_levels" in cfg:
@@ -321,6 +423,95 @@ class GinkgoSolver:
 
         if "mixed_precision_level" in cfg:
             amg.mixed_precision_level = cfg["mixed_precision_level"]
+
+    def _configure_bddc(self, bddc, cfg: dict, _cpp) -> None:
+        """Apply user BDDC configuration."""
+        if "vertices" in cfg:
+            bddc.vertices = cfg["vertices"]
+
+        if "edges" in cfg:
+            bddc.edges = cfg["edges"]
+
+        if "faces" in cfg:
+            bddc.faces = cfg["faces"]
+
+        if "scaling" in cfg:
+            scaling_map = {"stiffness": "STIFFNESS", "deluxe": "DELUXE"}
+            scaling = cfg["scaling"].lower()
+            if scaling not in scaling_map:
+                raise ValueError(f"Unknown BDDC scaling: {cfg['scaling']}. Available: stiffness, deluxe")
+            bddc.scaling = getattr(_cpp.BDDCConfig.Scaling, scaling_map[scaling])
+
+        if "local_solver" in cfg:
+            solver_map = {"direct": "DIRECT", "ilu": "ILU", "ic": "IC", "amg": "AMG"}
+            local_solver = cfg["local_solver"].lower()
+            if local_solver not in solver_map:
+                raise ValueError(f"Unknown local solver: {cfg['local_solver']}. "
+                               f"Available: direct, ilu, ic, amg")
+            bddc.local_solver = getattr(_cpp.BDDCConfig.LocalSolver, solver_map[local_solver])
+
+        if "local_max_iterations" in cfg:
+            bddc.local_max_iterations = cfg["local_max_iterations"]
+
+        if "local_tolerance" in cfg:
+            bddc.local_tolerance = cfg["local_tolerance"]
+
+        if "coarse_solver" in cfg:
+            coarse_map = {"cg": "CG", "gmres": "GMRES"}
+            coarse = cfg["coarse_solver"].lower()
+            if coarse not in coarse_map:
+                raise ValueError(f"Unknown coarse solver: {cfg['coarse_solver']}. "
+                               f"Available: cg, gmres")
+            bddc.coarse_solver = getattr(_cpp.BDDCConfig.CoarseSolver, coarse_map[coarse])
+
+        if "coarse_max_iterations" in cfg:
+            bddc.coarse_max_iterations = cfg["coarse_max_iterations"]
+
+        if "coarse_tolerance" in cfg:
+            bddc.coarse_tolerance = cfg["coarse_tolerance"]
+
+        if "repartition_coarse" in cfg:
+            bddc.repartition_coarse = cfg["repartition_coarse"]
+
+        if "constant_nullspace" in cfg:
+            bddc.constant_nullspace = cfg["constant_nullspace"]
+
+        # Configure local AMG if specified
+        if "local_amg" in cfg:
+            self._configure_local_amg(bddc.local_amg, cfg["local_amg"], _cpp)
+
+    def _configure_local_amg(self, local_amg, cfg: dict, _cpp) -> None:
+        """Apply local AMG configuration for BDDC."""
+        if "max_levels" in cfg:
+            local_amg.max_levels = cfg["max_levels"]
+
+        if "min_coarse_rows" in cfg:
+            local_amg.min_coarse_rows = cfg["min_coarse_rows"]
+
+        if "smoother" in cfg:
+            smoother_map = {"jacobi": "JACOBI", "gauss_seidel": "GAUSS_SEIDEL", "ilu": "ILU"}
+            smoother = cfg["smoother"].lower()
+            if smoother not in smoother_map:
+                raise ValueError(f"Unknown smoother: {cfg['smoother']}. "
+                               f"Available: jacobi, gauss_seidel, ilu")
+            local_amg.smoother = getattr(_cpp.BDDCConfig.LocalAMGConfig.Smoother, smoother_map[smoother])
+
+        if "smooth_steps" in cfg:
+            local_amg.smooth_steps = cfg["smooth_steps"]
+
+        if "relaxation_factor" in cfg:
+            local_amg.relaxation_factor = cfg["relaxation_factor"]
+
+        if "coarse_solver" in cfg:
+            coarse_map = {"direct": "DIRECT", "cg": "CG", "gmres": "GMRES"}
+            coarse = cfg["coarse_solver"].lower()
+            if coarse not in coarse_map:
+                raise ValueError(f"Unknown local AMG coarse solver: {cfg['coarse_solver']}. "
+                               f"Available: direct, cg, gmres")
+            local_amg.coarse_solver = getattr(_cpp.BDDCConfig.LocalAMGConfig.CoarseSolver, coarse_map[coarse])
+
+        if "coarse_max_iterations" in cfg:
+            local_amg.coarse_max_iterations = cfg["coarse_max_iterations"]
 
     def solve(self, b: Any, x: Any) -> int:
         """
@@ -403,6 +594,43 @@ class GinkgoSolver:
             row_ranges = np.ascontiguousarray(row_ranges, dtype=np.int64)
 
         _cpp.update_matrix_from_local_coo(
+            self._A_gko, row_indices, col_indices, values, row_ranges
+        )
+
+    def update_operator_dd_from_local_coo(
+        self,
+        row_indices,
+        col_indices,
+        values,
+        row_ranges=None,
+    ) -> None:
+        """
+        Update the DdMatrix from local COO data.
+
+        Parameters
+        ----------
+        row_indices : ndarray[int64]
+            Global row indices of non-zeros
+        col_indices : ndarray[int64]
+            Global column indices of non-zeros
+        values : ndarray[float64]
+            Non-zero values
+        row_ranges : ndarray[int64], optional
+            Partition ranges. If None, uses ranges from initial set_operator call.
+        """
+        import numpy as np
+        _cpp = self._cpp
+
+        row_indices = np.ascontiguousarray(row_indices, dtype=np.int64)
+        col_indices = np.ascontiguousarray(col_indices, dtype=np.int64)
+        values = np.ascontiguousarray(values, dtype=np.float64)
+
+        if row_ranges is None:
+            row_ranges = self._row_ranges
+        else:
+            row_ranges = np.ascontiguousarray(row_ranges, dtype=np.int64)
+
+        _cpp.update_dd_matrix_from_local_coo(
             self._A_gko, row_indices, col_indices, values, row_ranges
         )
 

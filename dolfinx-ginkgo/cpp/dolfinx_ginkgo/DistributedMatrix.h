@@ -391,4 +391,105 @@ void update_matrix_from_local_coo(
                               gko::experimental::distributed::assembly_mode::communicate);
 }
 
+// ============================================================================
+// Domain Decomposition Matrix (DdMatrix) Functions
+// ============================================================================
+
+/// Create a Ginkgo DdMatrix from local COO data in global numbering
+///
+/// DdMatrix is used for domain decomposition methods like BDDC. Unlike the
+/// regular distributed matrix, DdMatrix stores the local contributions in
+/// an unassembled form, with restriction and prolongation operators handling
+/// the subdomain interfaces.
+///
+/// The key difference from regular distributed matrices:
+/// - Regular: Each global DOF is owned by exactly one rank
+/// - DdMatrix: Interface DOFs can have contributions from multiple ranks,
+///            and the restriction/prolongation operators handle the overlap
+///
+/// @tparam ValueType Matrix value type (typically double)
+/// @tparam LocalIndexType Local index type (typically int32_t)
+/// @tparam GlobalIndexType Global index type (typically int64_t)
+///
+/// @param exec Ginkgo executor (determines where computation happens)
+/// @param gko_comm Ginkgo MPI communicator wrapper
+/// @param row_indices Global row indices of non-zeros (one per entry)
+/// @param col_indices Global column indices of non-zeros (one per entry)
+/// @param values Non-zero values (same length as row_indices and col_indices)
+/// @param global_rows Total number of rows in the global matrix
+/// @param global_cols Total number of columns in the global matrix
+/// @param row_ranges Partition ranges [r0, r1, ..., r_nprocs] defining row ownership
+///                   Rank i owns rows [row_ranges[i], row_ranges[i+1])
+///
+/// @return Shared pointer to the Ginkgo DdMatrix
+///
+/// @note The partition defines the vector distribution for y = A*x operations.
+///       The local matrix can contain entries for rows outside the owned range;
+///       the restriction/prolongation operators handle fetching/redistributing
+///       the corresponding vector entries.
+template<typename ValueType = double,
+         typename LocalIndexType = std::int32_t,
+         typename GlobalIndexType = std::int64_t>
+std::shared_ptr<gko_dist::DdMatrix<ValueType, LocalIndexType, GlobalIndexType>>
+create_dd_matrix_from_local_coo(
+    std::shared_ptr<gko::Executor> exec,
+    std::shared_ptr<gko::experimental::mpi::communicator> gko_comm,
+    const std::vector<GlobalIndexType>& row_indices,
+    const std::vector<GlobalIndexType>& col_indices,
+    const std::vector<ValueType>& values,
+    GlobalIndexType global_rows,
+    GlobalIndexType global_cols,
+    const std::vector<GlobalIndexType>& row_ranges)
+{
+    using dd_matrix_type = gko_dist::DdMatrix<ValueType, LocalIndexType, GlobalIndexType>;
+
+    int size;
+    MPI_Comm_size(gko_comm->get(), &size);
+
+    if (row_ranges.size() != static_cast<size_t>(size + 1)) {
+        throw std::invalid_argument("row_ranges must have size nprocs + 1");
+    }
+
+    auto partition = create_partition_from_ranges<LocalIndexType, GlobalIndexType>(
+        exec->get_master(), row_ranges);
+
+    auto mat_data = build_matrix_data_from_coo<ValueType, GlobalIndexType>(
+        row_indices, col_indices, values, global_rows, global_cols);
+
+    auto dd_mat = dd_matrix_type::create(exec, *gko_comm);
+    dd_mat->read_distributed(mat_data, partition);
+
+    return dd_mat;
+}
+
+/// Update values of an existing Ginkgo DdMatrix from local COO data
+///
+/// Similar to create_dd_matrix_from_local_coo but updates an existing
+/// matrix. Useful for time-stepping where the sparsity pattern is fixed.
+template<typename ValueType = double,
+         typename LocalIndexType = std::int32_t,
+         typename GlobalIndexType = std::int64_t>
+void update_dd_matrix_from_local_coo(
+    std::shared_ptr<gko_dist::DdMatrix<ValueType, LocalIndexType, GlobalIndexType>> dd_mat,
+    const std::vector<GlobalIndexType>& row_indices,
+    const std::vector<GlobalIndexType>& col_indices,
+    const std::vector<ValueType>& values,
+    const std::vector<GlobalIndexType>& row_ranges)
+{
+    auto exec = dd_mat->get_executor();
+    auto gko_comm = std::make_shared<gko::experimental::mpi::communicator>(
+        dd_mat->get_communicator());
+    auto dims = dd_mat->get_size();
+
+    auto partition = create_partition_from_ranges<LocalIndexType, GlobalIndexType>(
+        exec->get_master(), row_ranges);
+
+    auto mat_data = build_matrix_data_from_coo<ValueType, GlobalIndexType>(
+        row_indices, col_indices, values,
+        static_cast<GlobalIndexType>(dims[0]),
+        static_cast<GlobalIndexType>(dims[1]));
+
+    dd_mat->read_distributed(mat_data, partition);
+}
+
 } // namespace dolfinx_ginkgo

@@ -59,6 +59,17 @@ public:
         build_solver();
     }
 
+    /// Set the system operator (LinOp variant)
+    ///
+    /// This variant accepts any LinOp, enabling use with DdMatrix
+    /// and other distributed matrix types.
+    ///
+    /// @param A Ginkgo LinOp (must be a distributed operator type)
+    void set_operator(std::shared_ptr<gko::LinOp> A) {
+        A_ = A;
+        build_solver();
+    }
+
     /// Update convergence tolerances
     ///
     /// @param rtol Relative tolerance
@@ -148,7 +159,7 @@ private:
     std::shared_ptr<gko::experimental::mpi::communicator> comm_;
     SolverConfig config_;
 
-    std::shared_ptr<matrix_type> A_;
+    std::shared_ptr<gko::LinOp> A_;  // System operator (Matrix or DdMatrix)
     std::shared_ptr<gko::LinOp> solver_;
     std::shared_ptr<gko::log::Convergence<ValueType>> logger_;
 
@@ -207,6 +218,11 @@ private:
 
             case PreconditionerType::AMG:
                 return build_amg_factory();
+
+            case PreconditionerType::BDDC:
+                // BDDC is handled separately via build_bddc_factory()
+                // It requires DdMatrix and is set up in build_solver()
+                return nullptr;
 
             default:
                 return nullptr;
@@ -309,6 +325,171 @@ private:
             .on(exec_);
     }
 
+    /// Build BDDC preconditioner factory for DdMatrix
+    /// BDDC (Balancing Domain Decomposition by Constraints) is a two-level
+    /// non-overlapping domain decomposition preconditioner.
+    std::shared_ptr<gko::LinOpFactory> build_bddc_factory() {
+        using bddc_type = gko_dist::preconditioner::Bddc<ValueType, LocalIndexType, GlobalIndexType>;
+        const auto& bddc_cfg = config_.bddc;
+
+        // Build local solver factory (local problems are not distributed)
+        std::shared_ptr<gko::LinOpFactory> local_solver_factory;
+        switch (bddc_cfg.local_solver) {
+            case BDDCConfig::LocalSolver::DIRECT: {
+                // Use Cholesky factorization for SPD local problems
+                local_solver_factory = gko::experimental::solver::Direct<ValueType, LocalIndexType>::build()
+                    .with_factorization(
+                        gko::experimental::factorization::Cholesky<ValueType, LocalIndexType>::build())
+                    .on(exec_);
+                break;
+            }
+            case BDDCConfig::LocalSolver::ILU: {
+                // ILU-preconditioned GMRES
+                local_solver_factory = gko::solver::Gmres<ValueType>::build()
+                    .with_criteria(
+                        gko::stop::Iteration::build()
+                            .with_max_iters(static_cast<gko::size_type>(bddc_cfg.local_max_iterations)),
+                        gko::stop::ResidualNorm<ValueType>::build()
+                            .with_reduction_factor(bddc_cfg.local_tolerance))
+                    .with_preconditioner(
+                        gko::factorization::ParIlu<ValueType, LocalIndexType>::build())
+                    .on(exec_);
+                break;
+            }
+            case BDDCConfig::LocalSolver::IC: {
+                // IC-preconditioned CG
+                local_solver_factory = gko::solver::Cg<ValueType>::build()
+                    .with_criteria(
+                        gko::stop::Iteration::build()
+                            .with_max_iters(static_cast<gko::size_type>(bddc_cfg.local_max_iterations)),
+                        gko::stop::ResidualNorm<ValueType>::build()
+                            .with_reduction_factor(bddc_cfg.local_tolerance))
+                    .with_preconditioner(
+                        gko::factorization::ParIc<ValueType, LocalIndexType>::build())
+                    .on(exec_);
+                break;
+            }
+            case BDDCConfig::LocalSolver::AMG: {
+                // Standalone AMG for local solves
+                const auto& amg_cfg = bddc_cfg.local_amg;
+
+                // Build smoother
+                std::shared_ptr<gko::LinOpFactory> smoother_factory;
+                switch (amg_cfg.smoother) {
+                    case BDDCConfig::LocalAMGConfig::Smoother::JACOBI:
+                        smoother_factory = gko::share(
+                            gko::preconditioner::Jacobi<ValueType, LocalIndexType>::build()
+                                .with_max_block_size(1u)
+                                .on(exec_));
+                        break;
+                    case BDDCConfig::LocalAMGConfig::Smoother::GAUSS_SEIDEL:
+                        smoother_factory = gko::share(
+                            gko::solver::LowerTrs<ValueType, LocalIndexType>::build()
+                                .on(exec_));
+                        break;
+                    case BDDCConfig::LocalAMGConfig::Smoother::ILU:
+                        smoother_factory = gko::share(
+                            gko::factorization::ParIlu<ValueType, LocalIndexType>::build()
+                                .on(exec_));
+                        break;
+                }
+                auto mg_smoother = gko::share(gko::solver::build_smoother(
+                    smoother_factory,
+                    static_cast<gko::size_type>(amg_cfg.smooth_steps),
+                    static_cast<ValueType>(amg_cfg.relaxation_factor)));
+
+                // Build coarsest solver for local AMG
+                std::shared_ptr<gko::LinOpFactory> mg_coarse_factory;
+                switch (amg_cfg.coarse_solver) {
+                    case BDDCConfig::LocalAMGConfig::CoarseSolver::DIRECT:
+                        mg_coarse_factory = gko::experimental::solver::Direct<ValueType, LocalIndexType>::build()
+                            .with_factorization(
+                                gko::experimental::factorization::Cholesky<ValueType, LocalIndexType>::build())
+                            .on(exec_);
+                        break;
+                    case BDDCConfig::LocalAMGConfig::CoarseSolver::CG:
+                        mg_coarse_factory = gko::solver::Cg<ValueType>::build()
+                            .with_criteria(
+                                gko::stop::Iteration::build()
+                                    .with_max_iters(static_cast<gko::size_type>(amg_cfg.coarse_max_iterations)))
+                            .on(exec_);
+                        break;
+                    case BDDCConfig::LocalAMGConfig::CoarseSolver::GMRES:
+                        mg_coarse_factory = gko::solver::Gmres<ValueType>::build()
+                            .with_krylov_dim(30u)
+                            .with_criteria(
+                                gko::stop::Iteration::build()
+                                    .with_max_iters(static_cast<gko::size_type>(amg_cfg.coarse_max_iterations)))
+                            .on(exec_);
+                        break;
+                }
+
+                local_solver_factory = gko::solver::Multigrid::build()
+                    .with_mg_level(gko::multigrid::Pgm<ValueType, LocalIndexType>::build())
+                    .with_pre_smoother(mg_smoother)
+                    .with_coarsest_solver(mg_coarse_factory)
+                    .with_max_levels(static_cast<gko::size_type>(amg_cfg.max_levels))
+                    .with_min_coarse_rows(static_cast<gko::size_type>(amg_cfg.min_coarse_rows))
+                    .with_criteria(
+                        gko::stop::Iteration::build()
+                            .with_max_iters(static_cast<gko::size_type>(bddc_cfg.local_max_iterations)),
+                        gko::stop::ResidualNorm<ValueType>::build()
+                            .with_reduction_factor(bddc_cfg.local_tolerance))
+                    .on(exec_);
+                break;
+            }
+        }
+
+        // Build coarse solver factory (coarse system IS distributed - use iterative solver)
+        std::shared_ptr<gko::LinOpFactory> coarse_solver_factory;
+        switch (bddc_cfg.coarse_solver) {
+            case BDDCConfig::CoarseSolver::CG: {
+                coarse_solver_factory = gko::solver::Cg<ValueType>::build()
+                    .with_criteria(
+                        gko::stop::Iteration::build()
+                            .with_max_iters(static_cast<gko::size_type>(bddc_cfg.coarse_max_iterations)),
+                        gko::stop::ResidualNorm<ValueType>::build()
+                            .with_reduction_factor(bddc_cfg.coarse_tolerance))
+                    .on(exec_);
+                break;
+            }
+            case BDDCConfig::CoarseSolver::GMRES: {
+                coarse_solver_factory = gko::solver::Gmres<ValueType>::build()
+                    .with_krylov_dim(30u)
+                    .with_criteria(
+                        gko::stop::Iteration::build()
+                            .with_max_iters(static_cast<gko::size_type>(bddc_cfg.coarse_max_iterations)),
+                        gko::stop::ResidualNorm<ValueType>::build()
+                            .with_reduction_factor(bddc_cfg.coarse_tolerance))
+                    .on(exec_);
+                break;
+            }
+        }
+
+        // Determine scaling type
+        gko_dist::preconditioner::scaling_type scaling;
+        switch (bddc_cfg.scaling) {
+            case BDDCConfig::Scaling::STIFFNESS:
+                scaling = gko_dist::preconditioner::scaling_type::stiffness;
+                break;
+            case BDDCConfig::Scaling::DELUXE:
+                scaling = gko_dist::preconditioner::scaling_type::deluxe;
+                break;
+        }
+
+        // Build BDDC factory
+        return bddc_type::build()
+            .with_local_solver(local_solver_factory)
+            .with_coarse_solver(coarse_solver_factory)
+            .with_vertices(bddc_cfg.vertices)
+            .with_edges(bddc_cfg.edges)
+            .with_faces(bddc_cfg.faces)
+            .with_scaling(scaling)
+            .with_repartition_coarse(bddc_cfg.repartition_coarse)
+            .with_constant_nullspace(bddc_cfg.constant_nullspace)
+            .on(exec_);
+    }
+
     /// Build the complete solver with preconditioner
     void build_solver() {
         if (!A_) {
@@ -334,7 +515,13 @@ private:
         logger_ = gko::log::Convergence<ValueType>::create();
 
         // Build preconditioner factory
-        auto precond_factory = build_preconditioner_factory();
+        // BDDC requires special handling - it works with DdMatrix
+        std::shared_ptr<gko::LinOpFactory> precond_factory;
+        if (config_.preconditioner == PreconditionerType::BDDC) {
+            precond_factory = build_bddc_factory();
+        } else {
+            precond_factory = build_preconditioner_factory();
+        }
 
         // Build solver factory based on type
         std::shared_ptr<gko::LinOpFactory> solver_factory;

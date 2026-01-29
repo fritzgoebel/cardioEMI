@@ -27,3 +27,9 @@ target_link_libraries(test_solver PRIVATE dolfinx_ginkgo)
 add_test(NAME test_solver
     COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_solver>
 )
+
+add_executable(test_dd_matrix test_dd_matrix.cpp)
+target_link_libraries(test_dd_matrix PRIVATE dolfinx_ginkgo)
+add_test(NAME test_dd_matrix
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_dd_matrix>
+)
