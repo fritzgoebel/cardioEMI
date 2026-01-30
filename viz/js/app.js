@@ -53,8 +53,12 @@ class App {
 
         // Interface data for BDDC visualization
         this.interfaceData = null;
+        this.interfaceDofTypes = null;  // DOF -> 'vertex' | 'edge' | 'face'
         this.visibleRanks = new Set();
         this.showInterfaces = false;
+        this.showInterfaceVertices = true;
+        this.showInterfaceEdges = true;
+        this.showInterfaceFaces = true;
     }
 
     async init() {
@@ -848,11 +852,27 @@ class App {
         // Show interfaces toggle
         document.getElementById('show-interfaces').addEventListener('change', (e) => {
             this.showInterfaces = e.target.checked;
+            // Show/hide interface type controls
+            document.getElementById('interface-type-controls').style.display = this.showInterfaces ? 'block' : 'none';
             this.updateInterfaceHighlight();
             // Also update ECS visibility to apply interface highlighting
             if (document.getElementById('show-ecs').checked && this.ecsRanksData && this.visibleRanks) {
                 this.viewer.setVisibleRanks(this.visibleRanks);
             }
+        });
+
+        // Interface type toggles
+        document.getElementById('show-interface-vertices').addEventListener('change', (e) => {
+            this.showInterfaceVertices = e.target.checked;
+            this.updateInterfaceHighlight();
+        });
+        document.getElementById('show-interface-edges').addEventListener('change', (e) => {
+            this.showInterfaceEdges = e.target.checked;
+            this.updateInterfaceHighlight();
+        });
+        document.getElementById('show-interface-faces').addEventListener('change', (e) => {
+            this.showInterfaceFaces = e.target.checked;
+            this.updateInterfaceHighlight();
         });
 
         // Rank selection buttons
@@ -898,8 +918,10 @@ class App {
 
         // Build interface map: DOF index -> global interface index
         // This gives each interface a unique color
+        // Filter by interface type (vertex/edge/face) based on toggle state
         const interfaceMap = new Map();
         let globalInterfaceIdx = 0;
+        let skippedByType = { vertex: 0, edge: 0, face: 0 };
 
         for (const rank of this.visibleRanks) {
             const rankInterfaces = this.interfaceData[rank];
@@ -907,6 +929,22 @@ class App {
                 for (const interfaceList of rankInterfaces) {
                     // Each interface (line in IF_*.txt) gets its own color
                     for (const dof of interfaceList) {
+                        // Check if this DOF's type is visible
+                        if (this.interfaceDofTypes) {
+                            const dofType = this.interfaceDofTypes[dof];
+                            if (dofType === 'vertex' && !this.showInterfaceVertices) {
+                                skippedByType.vertex++;
+                                continue;
+                            }
+                            if (dofType === 'edge' && !this.showInterfaceEdges) {
+                                skippedByType.edge++;
+                                continue;
+                            }
+                            if (dofType === 'face' && !this.showInterfaceFaces) {
+                                skippedByType.face++;
+                                continue;
+                            }
+                        }
                         // If a DOF is in multiple interfaces, keep the first assignment
                         // (interfaces may share vertices at corners)
                         if (!interfaceMap.has(dof)) {
@@ -918,7 +956,7 @@ class App {
             }
         }
 
-        console.log(`Highlighting ${interfaceMap.size} interface DOFs across ${globalInterfaceIdx} interfaces`);
+        console.log(`Highlighting ${interfaceMap.size} interface DOFs across ${globalInterfaceIdx} interfaces (skipped: ${skippedByType.vertex} vertices, ${skippedByType.edge} edges, ${skippedByType.face} faces)`);
         this.viewer.setHighlightedInterfaceDofs(interfaceMap);
     }
 
@@ -933,6 +971,19 @@ class App {
                 for (const [rank, interfaces] of Object.entries(data.interfaces)) {
                     this.interfaceData[parseInt(rank)] = interfaces;
                 }
+                // Store DOF type classifications (vertex/edge/face)
+                if (data.dofTypes) {
+                    this.interfaceDofTypes = {};
+                    for (const [dof, dofType] of Object.entries(data.dofTypes)) {
+                        this.interfaceDofTypes[parseInt(dof)] = dofType;
+                    }
+                    // Count by type
+                    const typeCounts = { vertex: 0, edge: 0, face: 0 };
+                    for (const t of Object.values(this.interfaceDofTypes)) {
+                        typeCounts[t]++;
+                    }
+                    console.log(`Interface DOF types: ${typeCounts.vertex} vertices, ${typeCounts.edge} edges, ${typeCounts.face} faces`);
+                }
                 console.log(`Loaded interface data: ${data.totalInterfaces} interfaces across ${data.numRanks} ranks`);
                 return true;
             }
@@ -940,6 +991,7 @@ class App {
             console.warn('Could not load interface data:', error);
         }
         this.interfaceData = null;
+        this.interfaceDofTypes = null;
         return false;
     }
 
@@ -996,6 +1048,7 @@ class App {
             this.viewer.clearInterfaceHighlight();
             document.getElementById('show-ecs').checked = false;
             document.getElementById('show-interfaces').checked = false;
+            document.getElementById('interface-type-controls').style.display = 'none';
             document.getElementById('explosion-slider').value = 0;
             document.getElementById('explosion-value').textContent = '0';
             this.showInterfaces = false;
@@ -1064,10 +1117,12 @@ class App {
         // Reset ECS, interfaces, and explosion
         document.getElementById('show-ecs').checked = false;
         document.getElementById('show-interfaces').checked = false;
+        document.getElementById('interface-type-controls').style.display = 'none';
         document.getElementById('explosion-slider').value = 0;
         document.getElementById('explosion-value').textContent = '0';
         this.showInterfaces = false;
         this.interfaceData = null;
+        this.interfaceDofTypes = null;
     }
 
     onBoundingBoxChange() {

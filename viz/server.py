@@ -843,7 +843,42 @@ def get_interfaces():
     interface_vertices = {}
     all_interface_vertices = set()
 
+    # Track DOF classifications for BDDC interface types:
+    # - vertex: single-DOF interfaces (size 1)
+    # - face: DOFs shared between exactly 2 partitions
+    # - edge: DOFs in interfaces of size > 1 shared between 3+ partitions
+    dof_to_ranks = {}  # DOF -> set of ranks that have this DOF
+    dofs_in_size1_interfaces = set()  # DOFs that appear in any size-1 interface
+
     if matrix_to_vertex:
+        # First pass: collect DOF sharing info and identify size-1 interfaces
+        for rank, rank_interfaces in interfaces.items():
+            for interface in rank_interfaces:
+                interface_size = len(interface)
+                for dof in interface:
+                    if dof in matrix_to_vertex:
+                        vertex = matrix_to_vertex[dof]
+                        if vertex not in dof_to_ranks:
+                            dof_to_ranks[vertex] = set()
+                        dof_to_ranks[vertex].add(rank)
+                        if interface_size == 1:
+                            dofs_in_size1_interfaces.add(vertex)
+
+        # Classify each DOF
+        dof_types = {}  # vertex_index -> 'vertex' | 'edge' | 'face'
+        for vertex, ranks in dof_to_ranks.items():
+            num_ranks = len(ranks)
+            if vertex in dofs_in_size1_interfaces:
+                # Vertex: DOF in a single-DOF interface
+                dof_types[vertex] = 'vertex'
+            elif num_ranks == 2:
+                # Face: shared by exactly 2 partitions
+                dof_types[vertex] = 'face'
+            else:
+                # Edge: shared by 3+ partitions (and not a vertex)
+                dof_types[vertex] = 'edge'
+
+        # Second pass: build interface_vertices structure
         for rank, rank_interfaces in interfaces.items():
             rank_vertex_interfaces = []
             for interface in rank_interfaces:
@@ -855,16 +890,24 @@ def get_interfaces():
                     rank_vertex_interfaces.append(vertex_indices)
                     all_interface_vertices.update(vertex_indices)
             interface_vertices[rank] = rank_vertex_interfaces
+
+        # Count DOFs by type
+        type_counts = {'vertex': 0, 'edge': 0, 'face': 0}
+        for dof_type in dof_types.values():
+            type_counts[dof_type] += 1
+        print(f"Interface DOF types: {type_counts['vertex']} vertices, {type_counts['edge']} edges, {type_counts['face']} faces")
     else:
         # No mapping available - return empty
         print("Warning: No matrix_to_vertex.pickle found - interface visualization won't work")
+        dof_types = {}
 
     return jsonify({
         'interfaces': interface_vertices,  # Now contains mesh vertex indices
         'numRanks': num_ranks,
         'allInterfaceVertices': sorted(list(all_interface_vertices)),
         'totalInterfaces': sum(len(v) for v in interface_vertices.values()),
-        'hasMappingFile': matrix_to_vertex is not None
+        'hasMappingFile': matrix_to_vertex is not None,
+        'dofTypes': dof_types  # vertex_index -> 'vertex' | 'edge' | 'face'
     })
 
 # --------------------- Video Export API ---------------------
