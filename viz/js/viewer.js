@@ -269,6 +269,32 @@ class Viewer {
         this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
         this.controls.enableDamping = true;
         this.controls.dampingFactor = 0.05;
+        this.controls.enableZoom = false;  // Disable built-in zoom, we'll handle it
+
+        // Raycaster for zoom-to-cursor and dynamic rotation target
+        this.raycaster = new THREE.Raycaster();
+        this.mouse = new THREE.Vector2();
+
+        // Custom zoom towards center of visible subdomains
+        this.renderer.domElement.addEventListener('wheel', (event) => {
+            event.preventDefault();
+
+            const zoomSpeed = 0.1;
+            const targetPoint = this.getVisibleCentroid();
+
+            // Direction from camera to target
+            const direction = new THREE.Vector3().subVectors(targetPoint, this.camera.position);
+
+            if (event.deltaY < 0) {
+                // Zoom in - move camera towards target
+                this.camera.position.addScaledVector(direction, zoomSpeed);
+            } else {
+                // Zoom out - move camera away from target
+                this.camera.position.addScaledVector(direction, -zoomSpeed);
+            }
+
+            this.controls.update();
+        }, { passive: false });
 
         // Lights
         const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
@@ -843,6 +869,41 @@ class Viewer {
     setVisibleRanks(visibleRanks) {
         this.visibleRanks = new Set(visibleRanks);
         this.updateRankVisibility();
+        this.updateControlsTarget();
+    }
+
+    // Compute centroid of visible subdomains
+    getVisibleCentroid() {
+        if (this.rankCentroids && this.visibleRanks && this.visibleRanks.size > 0) {
+            let sumX = 0, sumY = 0, sumZ = 0;
+            let count = 0;
+            for (const rank of this.visibleRanks) {
+                if (this.rankCentroids[rank]) {
+                    sumX += this.rankCentroids[rank][0];
+                    sumY += this.rankCentroids[rank][1];
+                    sumZ += this.rankCentroids[rank][2];
+                    count++;
+                }
+            }
+            if (count > 0) {
+                return new THREE.Vector3(sumX / count, sumY / count, sumZ / count);
+            }
+        }
+        if (this.globalCentroid) {
+            return new THREE.Vector3(
+                this.globalCentroid[0],
+                this.globalCentroid[1],
+                this.globalCentroid[2]
+            );
+        }
+        return this.controls.target.clone();
+    }
+
+    // Update controls target to centroid of visible subdomains
+    updateControlsTarget() {
+        const centroid = this.getVisibleCentroid();
+        this.controls.target.copy(centroid);
+        this.controls.update();
     }
 
     // Update mesh visibility based on selected ranks - actually hide geometry
@@ -1019,6 +1080,11 @@ class Viewer {
         this.ecsDofIndices = ecsDofIndices;
     }
 
+    // Store DOF type mapping (vertex/edge/face) for interface visualization
+    setInterfaceDofTypes(dofTypes) {
+        this.interfaceDofTypes = dofTypes;
+    }
+
     // Get color for an interface (by global interface index)
     interfaceToColor(interfaceIndex) {
         const colorIndex = interfaceIndex % this.interfaceColors.length;
@@ -1056,8 +1122,28 @@ class Viewer {
             return;
         }
 
-        const pointPositions = [];
-        const pointColors = [];
+        // Separate arrays for vertex-type DOFs (bigger, light blue) and edge/face DOFs
+        const vertexPositions = [];
+        const vertexColors = [];
+        const otherPositions = [];
+        const otherColors = [];
+
+        // Red color for vertex-type interface DOFs
+        const vertexColor = { r: 1.0, g: 0.0, b: 0.0 };  // Red
+
+        // Helper to add a point to the appropriate array
+        const addPoint = (x, y, z, dofIndex) => {
+            const dofType = this.interfaceDofTypes ? this.interfaceDofTypes[dofIndex] : null;
+            if (dofType === 'vertex') {
+                vertexPositions.push(x, y, z);
+                vertexColors.push(vertexColor.r, vertexColor.g, vertexColor.b);
+            } else {
+                otherPositions.push(x, y, z);
+                const interfaceIdx = this.highlightedInterfaceMap.get(dofIndex);
+                const color = this.interfaceToColor(interfaceIdx);
+                otherColors.push(color.r, color.g, color.b);
+            }
+        };
 
         // Collect interface vertex positions and colors from membrane mesh
         // Only include vertices belonging to visible ranks
@@ -1072,16 +1158,12 @@ class Viewer {
 
                 const dofIndex = this.dofIndices[i];
                 if (this.highlightedInterfaceMap.has(dofIndex)) {
-                    // Add position
-                    pointPositions.push(
+                    addPoint(
                         membranePositions[i * 3],
                         membranePositions[i * 3 + 1],
-                        membranePositions[i * 3 + 2]
+                        membranePositions[i * 3 + 2],
+                        dofIndex
                     );
-                    // Add color based on interface index
-                    const interfaceIdx = this.highlightedInterfaceMap.get(dofIndex);
-                    const color = this.interfaceToColor(interfaceIdx);
-                    pointColors.push(color.r, color.g, color.b);
                 }
             }
         }
@@ -1099,30 +1181,53 @@ class Viewer {
 
                 const dofIndex = this.ecsDofIndices[i];
                 if (this.highlightedInterfaceMap.has(dofIndex)) {
-                    // Add position
-                    pointPositions.push(
+                    addPoint(
                         ecsPositions[i * 3],
                         ecsPositions[i * 3 + 1],
-                        ecsPositions[i * 3 + 2]
+                        ecsPositions[i * 3 + 2],
+                        dofIndex
                     );
-                    // Add color based on interface index
-                    const interfaceIdx = this.highlightedInterfaceMap.get(dofIndex);
-                    const color = this.interfaceToColor(interfaceIdx);
-                    pointColors.push(color.r, color.g, color.b);
                 }
             }
         }
 
-        // Create point cloud if we have any interface points
-        if (pointPositions.length > 0) {
+        // Create instanced spheres for vertex-type DOFs (3D spheres, light blue)
+        if (vertexPositions.length > 0) {
+            const sphereRadius = 0.6;  // Adjust based on mesh scale
+            const sphereGeometry = new THREE.SphereGeometry(sphereRadius, 16, 12);
+            const sphereMaterial = new THREE.MeshPhongMaterial({
+                color: new THREE.Color(vertexColor.r, vertexColor.g, vertexColor.b),
+                shininess: 50
+            });
+
+            const numVertices = vertexPositions.length / 3;
+            this.interfaceVertexPoints = new THREE.InstancedMesh(sphereGeometry, sphereMaterial, numVertices);
+
+            const dummy = new THREE.Object3D();
+            for (let i = 0; i < numVertices; i++) {
+                dummy.position.set(
+                    vertexPositions[i * 3],
+                    vertexPositions[i * 3 + 1],
+                    vertexPositions[i * 3 + 2]
+                );
+                dummy.updateMatrix();
+                this.interfaceVertexPoints.setMatrixAt(i, dummy.matrix);
+            }
+            this.interfaceVertexPoints.instanceMatrix.needsUpdate = true;
+
+            this.scene.add(this.interfaceVertexPoints);
+        }
+
+        // Create point cloud for edge/face DOFs (smaller dots, per-interface colors)
+        if (otherPositions.length > 0) {
             const geometry = new THREE.BufferGeometry();
-            geometry.setAttribute('position', new THREE.Float32BufferAttribute(pointPositions, 3));
-            geometry.setAttribute('color', new THREE.Float32BufferAttribute(pointColors, 3));
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(otherPositions, 3));
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(otherColors, 3));
 
             const material = new THREE.PointsMaterial({
                 size: 3,
                 vertexColors: true,
-                sizeAttenuation: false,  // Constant size regardless of distance
+                sizeAttenuation: false,
                 depthTest: true,
                 depthWrite: true
             });
@@ -1139,6 +1244,12 @@ class Viewer {
             this.interfacePoints.geometry.dispose();
             this.interfacePoints.material.dispose();
             this.interfacePoints = null;
+        }
+        if (this.interfaceVertexPoints) {
+            this.scene.remove(this.interfaceVertexPoints);
+            this.interfaceVertexPoints.geometry.dispose();
+            this.interfaceVertexPoints.material.dispose();
+            this.interfaceVertexPoints = null;
         }
     }
 }

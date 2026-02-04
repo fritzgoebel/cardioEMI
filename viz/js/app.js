@@ -977,6 +977,8 @@ class App {
                     for (const [dof, dofType] of Object.entries(data.dofTypes)) {
                         this.interfaceDofTypes[parseInt(dof)] = dofType;
                     }
+                    // Pass DOF types to viewer for differentiated rendering
+                    this.viewer.setInterfaceDofTypes(this.interfaceDofTypes);
                     // Count by type
                     const typeCounts = { vertex: 0, edge: 0, face: 0 };
                     for (const t of Object.values(this.interfaceDofTypes)) {
@@ -992,6 +994,7 @@ class App {
         }
         this.interfaceData = null;
         this.interfaceDofTypes = null;
+        this.viewer.setInterfaceDofTypes(null);
         return false;
     }
 
@@ -1123,6 +1126,7 @@ class App {
         this.showInterfaces = false;
         this.interfaceData = null;
         this.interfaceDofTypes = null;
+        this.viewer.setInterfaceDofTypes(null);
     }
 
     onBoundingBoxChange() {
