@@ -273,13 +273,16 @@ struct BDDCConfig {
     LocalAMGConfig local_amg;
 
     // Coarse solver configuration (distributed - no direct solver)
-    enum class CoarseSolver { CG, GMRES };
+    enum class CoarseSolver { CG, GMRES, BDDC };
     CoarseSolver coarse_solver = CoarseSolver::CG;
     int coarse_max_iterations = 100;      ///< Max iterations for iterative coarse solver
     double coarse_tolerance = 1e-10;      ///< Tolerance for iterative coarse solver
 
+    // Nested BDDC configuration (used when coarse_solver = BDDC)
+    LocalSolver coarse_bddc_local_solver = LocalSolver::DIRECT;  ///< Local solver for nested BDDC
+
     // Advanced options
-    bool repartition_coarse = false;      ///< Repartition coarse problem for load balance
+    bool repartition_coarse = true;       ///< Repartition coarse problem for load balance
     bool constant_nullspace = false;      ///< Handle constant nullspace (pure Neumann BC)
 };
 

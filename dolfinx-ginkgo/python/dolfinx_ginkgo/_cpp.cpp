@@ -187,6 +187,7 @@ NB_MODULE(_cpp, m) {
     nb::enum_<BDDCConfig::CoarseSolver>(bddc_config, "CoarseSolver", "Coarse level solver")
         .value("CG", BDDCConfig::CoarseSolver::CG)
         .value("GMRES", BDDCConfig::CoarseSolver::GMRES)
+        .value("BDDC", BDDCConfig::CoarseSolver::BDDC)
         .export_values();
 
     // Local AMG configuration (nested in BDDCConfig)
@@ -229,6 +230,7 @@ NB_MODULE(_cpp, m) {
         .def_rw("coarse_solver", &BDDCConfig::coarse_solver)
         .def_rw("coarse_max_iterations", &BDDCConfig::coarse_max_iterations)
         .def_rw("coarse_tolerance", &BDDCConfig::coarse_tolerance)
+        .def_rw("coarse_bddc_local_solver", &BDDCConfig::coarse_bddc_local_solver)
         .def_rw("repartition_coarse", &BDDCConfig::repartition_coarse)
         .def_rw("constant_nullspace", &BDDCConfig::constant_nullspace);
 
@@ -419,6 +421,42 @@ NB_MODULE(_cpp, m) {
           nb::arg("row_indices"), nb::arg("col_indices"), nb::arg("values"),
           nb::arg("row_ranges"),
           "Update Ginkgo DdMatrix values from local COO data");
+
+    // =========================================================================
+    // Apply (SpMV) Functions
+    // =========================================================================
+
+    m.def("apply_distributed",
+          [](std::shared_ptr<GkoDistMatrix> A,
+             std::shared_ptr<GkoDistVector> x,
+             std::shared_ptr<GkoDistVector> y) {
+              A->apply(x.get(), y.get());
+          },
+          nb::arg("A"), nb::arg("x"), nb::arg("y"),
+          "Compute y = A * x for a distributed matrix");
+
+    m.def("apply_dd",
+          [](std::shared_ptr<GkoDdMatrix> A,
+             std::shared_ptr<GkoDistVector> x,
+             std::shared_ptr<GkoDistVector> y) {
+              A->apply(x.get(), y.get());
+          },
+          nb::arg("A"), nb::arg("x"), nb::arg("y"),
+          "Compute y = A * x for a DdMatrix");
+
+    m.def("create_distributed_vector_from_local",
+          [](std::shared_ptr<gko::Executor> exec,
+             std::shared_ptr<gko::experimental::mpi::communicator> gko_comm,
+             nb::ndarray<double, nb::ndim<1>, nb::c_contig> local_values,
+             std::int64_t global_size) {
+              std::vector<double> vals(local_values.data(),
+                                       local_values.data() + local_values.size());
+              return create_distributed_vector_from_local<>(
+                  exec, gko_comm, vals, global_size);
+          },
+          nb::arg("exec"), nb::arg("comm"),
+          nb::arg("local_values"), nb::arg("global_size"),
+          "Create Ginkgo distributed vector from local numpy array");
 
     // =========================================================================
     // Distributed Solver

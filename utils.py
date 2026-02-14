@@ -254,6 +254,15 @@ def read_input_file(input_yml_file):
         else:
             input_parameters['ginkgo'] = {}
 
+        ######### Partitioning #########
+        # partition_mode: "default" or "component" (tag-based METIS partitioning)
+        if 'partition_mode' in config:
+            input_parameters['partition_mode'] = config['partition_mode']
+
+        # original_mesh_file: path to original (non-colored) mesh for component partitioning
+        if 'original_mesh_file' in config:
+            input_parameters['original_mesh_file'] = config['original_mesh_file']
+
         # sanuty checks
         parse_nonneg_int(input_parameters['P'])
         parse_nonneg_int(input_parameters['time_steps'])

@@ -18,6 +18,7 @@ class App {
         this.dt = 0.001;
         this.timeSteps = 1000;
         this.bcType = 'one_corner';  // Boundary condition type
+        this.partitionMode = 'default';  // Partition mode: 'default' or 'component'
 
         // Voltage parameters
         this.vExcited = 0;    // mV for excited region
@@ -372,6 +373,15 @@ class App {
         bcTypeSelect.addEventListener('change', (e) => {
             this.bcType = e.target.value;
         });
+
+        // Partition mode
+        const partitionModeSelect = document.getElementById('partition-mode');
+        if (partitionModeSelect) {
+            this.partitionMode = partitionModeSelect.value;
+            partitionModeSelect.addEventListener('change', (e) => {
+                this.partitionMode = e.target.value;
+            });
+        }
     }
 
     setupSolverSettings() {
@@ -398,11 +408,15 @@ class App {
                 amg: { cycle: 'v', smoother: 'jacobi', maxLevels: 10 },
                 bddc: {
                     localSolver: 'direct',
+                    localMaxIterations: 100,
+                    localTolerance: 1e-12,
                     coarseSolver: 'cg',
                     coarseMaxIterations: 100,
+                    coarseBddcLocalSolver: 'direct',
                     vertices: true,
                     edges: true,
                     faces: true,
+                    repartitionCoarse: true,
                     localAmg: {
                         smoother: 'jacobi',
                         smoothSteps: 1,
@@ -522,14 +536,28 @@ class App {
 
         // BDDC options
         const bddcLocalAmgOptions = document.getElementById('bddc-local-amg-options');
+        const bddcLocalStoppingOptions = document.getElementById('bddc-local-stopping-options');
         document.getElementById('bddc-local-solver').addEventListener('change', (e) => {
             this.solverConfig.ginkgo.bddc.localSolver = e.target.value;
             // Show/hide local AMG options
             bddcLocalAmgOptions.style.display = e.target.value === 'amg' ? 'block' : 'none';
+            // Show/hide local stopping criteria (for iterative solvers: ilu, ic, amg)
+            bddcLocalStoppingOptions.style.display = e.target.value !== 'direct' ? 'block' : 'none';
         });
 
+        document.getElementById('bddc-local-max-iter').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localMaxIterations = parseInt(e.target.value);
+        });
+
+        document.getElementById('bddc-local-tolerance').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localTolerance = parseFloat(e.target.value);
+        });
+
+        const bddcCoarseBddcOptions = document.getElementById('bddc-coarse-bddc-options');
         document.getElementById('bddc-coarse-solver').addEventListener('change', (e) => {
             this.solverConfig.ginkgo.bddc.coarseSolver = e.target.value;
+            // Show/hide coarse BDDC local solver options
+            bddcCoarseBddcOptions.style.display = e.target.value === 'bddc' ? 'flex' : 'none';
         });
 
         document.getElementById('bddc-coarse-max-iter').addEventListener('change', (e) => {
@@ -546,6 +574,10 @@ class App {
 
         document.getElementById('bddc-faces').addEventListener('change', (e) => {
             this.solverConfig.ginkgo.bddc.faces = e.target.checked;
+        });
+
+        document.getElementById('bddc-repartition-coarse').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.repartitionCoarse = e.target.checked;
         });
 
         // BDDC local AMG options
@@ -567,6 +599,10 @@ class App {
 
         document.getElementById('bddc-local-amg-relaxation').addEventListener('change', (e) => {
             this.solverConfig.ginkgo.bddc.localAmg.relaxationFactor = parseFloat(e.target.value);
+        });
+
+        document.getElementById('bddc-coarse-bddc-local-solver').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.coarseBddcLocalSolver = e.target.value;
         });
 
         // Tolerance and max iterations
@@ -627,8 +663,13 @@ class App {
         amgOptions.style.display = ginkgoPrecond.value === 'amg' ? 'block' : 'none';
         bddcOptions.style.display = ginkgoPrecond.value === 'bddc' ? 'block' : 'none';
 
-        // BDDC local solver -> local AMG options
+        // BDDC local solver -> local AMG options and stopping criteria
         bddcLocalAmgOptions.style.display = bddcLocalSolver.value === 'amg' ? 'block' : 'none';
+        document.getElementById('bddc-local-stopping-options').style.display = bddcLocalSolver.value !== 'direct' ? 'block' : 'none';
+
+        // BDDC coarse solver -> coarse BDDC local solver options
+        const bddcCoarseSolver = document.getElementById('bddc-coarse-solver');
+        document.getElementById('bddc-coarse-bddc-options').style.display = bddcCoarseSolver.value === 'bddc' ? 'flex' : 'none';
 
         // Update config state from form values
         this.solverConfig.backend = backendSelect.value;
@@ -1359,7 +1400,8 @@ class App {
                 pc_type: pcType,
                 ksp_rtol: rtol,
                 ksp_atol: atol,
-                bc_type: this.bcType
+                bc_type: this.bcType,
+                partition_mode: this.partitionMode
             };
 
             // Update local state to match
@@ -1391,11 +1433,15 @@ class App {
                     },
                     bddc: {
                         localSolver: document.getElementById('bddc-local-solver').value,
+                        localMaxIterations: parseInt(document.getElementById('bddc-local-max-iter').value),
+                        localTolerance: parseFloat(document.getElementById('bddc-local-tolerance').value),
                         coarseSolver: document.getElementById('bddc-coarse-solver').value,
                         coarseMaxIterations: parseInt(document.getElementById('bddc-coarse-max-iter').value),
+                        coarseBddcLocalSolver: document.getElementById('bddc-coarse-bddc-local-solver').value,
                         vertices: document.getElementById('bddc-vertices').checked,
                         edges: document.getElementById('bddc-edges').checked,
                         faces: document.getElementById('bddc-faces').checked,
+                        repartitionCoarse: document.getElementById('bddc-repartition-coarse').checked,
                         localAmg: {
                             smoother: document.getElementById('bddc-local-amg-smoother').value,
                             smoothSteps: parseInt(document.getElementById('bddc-local-amg-smooth-steps').value),

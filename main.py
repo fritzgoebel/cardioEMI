@@ -94,19 +94,52 @@ for i in TAGS:
             for tag in shared_tags:
                 facet_tag_to_pair[tag] = (i, j)
 
-# Read mesh
-with dfx.io.XDMFFile(MPI.COMM_WORLD, mesh_file, 'r') as xdmf:
-    # Read mesh and cell tags
-    mesh       = xdmf.read_mesh(ghost_mode=dfx.mesh.GhostMode.shared_facet)
-    subdomains = xdmf.read_meshtags(mesh, name="cell_tags")
+# Read mesh - optionally with component-based partitioning
+partition_mode = params.get("partition_mode", "default")
 
-    # Create facet-to-cell connectivity
-    mesh.topology.create_connectivity(mesh.topology.dim-1, mesh.topology.dim)
+if partition_mode == "component":
+    # Use component-based partitioning (keeps ECS+cell pairs together)
+    # This partitions the colored mesh based on the original 44-tag structure
+    from mesh_partition import load_mesh_with_component_partitioning
 
-    # Also the identity is needed
+    # Derive original mesh file from colored mesh file
+    original_mesh_file = params.get("original_mesh_file")
+    if original_mesh_file is None:
+        original_mesh_file = mesh_file.replace("_colored", "")
+        if original_mesh_file == mesh_file:
+            raise ValueError(
+                "Could not derive original_mesh_file from mesh_file. "
+                "Please specify original_mesh_file explicitly for component partitioning."
+            )
+
+    if comm.rank == 0:
+        print(f"Using component-based partitioning (METIS)")
+        print(f"  Colored mesh: {mesh_file}")
+        print(f"  Original mesh (for components): {original_mesh_file}")
+
+    mesh, subdomains, boundaries = load_mesh_with_component_partitioning(
+        comm,
+        colored_mesh_file=mesh_file,
+        original_mesh_file=original_mesh_file,
+        ghost_mode=dfx.mesh.GhostMode.shared_facet,
+    )
+
+    # Create additional connectivity
     mesh.topology.create_connectivity(mesh.topology.dim, mesh.topology.dim)
+else:
+    # Default DOLFINx partitioning
+    with dfx.io.XDMFFile(MPI.COMM_WORLD, mesh_file, 'r') as xdmf:
+        # Read mesh and cell tags
+        mesh       = xdmf.read_mesh(ghost_mode=dfx.mesh.GhostMode.shared_facet)
+        subdomains = xdmf.read_meshtags(mesh, name="cell_tags")
 
-    boundaries = xdmf.read_meshtags(mesh, name="facet_tags")
+        # Create facet-to-cell connectivity
+        mesh.topology.create_connectivity(mesh.topology.dim-1, mesh.topology.dim)
+
+        # Also the identity is needed
+        mesh.topology.create_connectivity(mesh.topology.dim, mesh.topology.dim)
+
+        boundaries = xdmf.read_meshtags(mesh, name="facet_tags")
     
 # Scale mesh
 mesh.geometry.x[:] *= params["mesh_conversion_factor"]
@@ -475,11 +508,15 @@ if use_ginkgo:
         has_nullspace = not Dirichletbc
         bddc_config = {
             "local_solver": bddc_cfg.get("local_solver", "direct"),
+            "local_max_iterations": int(bddc_cfg.get("local_max_iterations", 100)),
+            "local_tolerance": float(bddc_cfg.get("local_tolerance", 1e-12)),
             "coarse_solver": bddc_cfg.get("coarse_solver", "cg"),
             "coarse_max_iterations": int(bddc_cfg.get("coarse_max_iterations", 100)),
+            "coarse_bddc_local_solver": bddc_cfg.get("coarse_bddc_local_solver", "direct"),
             "vertices": bddc_cfg.get("vertices", True),
             "edges": bddc_cfg.get("edges", True),
             "faces": bddc_cfg.get("faces", True),
+            "repartition_coarse": bddc_cfg.get("repartition_coarse", False),
             "constant_nullspace": has_nullspace,
         }
         if comm.rank == 0:
@@ -972,10 +1009,11 @@ if comm.rank == 0:
     print("Average iterations =", sum(ksp_iterations)/len(ksp_iterations))
 
     # Save iterations and residuals to file for visualization
-    with open(out_name + "/iterations.pickle", "wb") as f:
-        pickle.dump(ksp_iterations, f)
-    with open(out_name + "/residuals.pickle", "wb") as f:
-        pickle.dump({'abs': residual_abs, 'rel': residual_rel}, f)
+    if params["save_output"]:
+        with open(out_name + "/iterations.pickle", "wb") as f:
+            pickle.dump(ksp_iterations, f)
+        with open(out_name + "/residuals.pickle", "wb") as f:
+            pickle.dump({'abs': residual_abs, 'rel': residual_rel}, f)
     
     if isinstance(params["ionic_model"], dict):
         print("Ionic models:")

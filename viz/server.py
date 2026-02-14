@@ -198,11 +198,15 @@ def update_ginkgo_config():
         if bddc_config:
             bddc_dict = {
                 'local_solver': bddc_config.get('localSolver', 'direct'),
+                'local_max_iterations': int(bddc_config.get('localMaxIterations', 100)),
+                'local_tolerance': float(bddc_config.get('localTolerance', 1e-12)),
                 'coarse_solver': bddc_config.get('coarseSolver', 'cg'),
                 'coarse_max_iterations': int(bddc_config.get('coarseMaxIterations', 100)),
+                'coarse_bddc_local_solver': bddc_config.get('coarseBddcLocalSolver', 'direct'),
                 'vertices': bddc_config.get('vertices', True),
                 'edges': bddc_config.get('edges', True),
-                'faces': bddc_config.get('faces', True)
+                'faces': bddc_config.get('faces', True),
+                'repartition_coarse': bddc_config.get('repartitionCoarse', True)
             }
 
             # Add local AMG config if present
@@ -430,13 +434,17 @@ def run_simulation():
 
         simulation_state['running'] = True
 
+        # Clean up old interface files to prevent stale data from previous runs
+        for old_if in PROJECT_ROOT.glob('IF_*.txt'):
+            old_if.unlink()
+
         docker_cmd = [
-            'docker', 'run', '-t',
+            'docker', 'run', '--rm', '-t',
             '-v', f'{PROJECT_ROOT}:/home/fenics',
             '-w', '/home/fenics',
             docker_image,
             'bash', '-c',
-            f'{setup_cmd}pip install --no-build-isolation -q -r requirements.txt && mpirun -n {ranks} python3 -B -u main.py {config_file}'
+            f'{setup_cmd}pip install -q pymetis && pip install --no-build-isolation -q -r requirements.txt && mpirun -n {ranks} python3 -B -u main.py {config_file}'
         ]
 
         try:
@@ -825,19 +833,24 @@ def get_interfaces():
 
     num_ranks = max(interfaces.keys()) + 1
 
-    # Load matrix-to-vertex mapping if available
-    # This maps matrix global DOF indices to mesh vertex indices
+    # Load matrix-to-vertex mapping from the most recent simulation
+    # The mapping depends on MPI rank count (rank-major DOF ordering), so it must
+    # come from the same simulation run that produced the IF_*.txt files.
+    # Use the most recently modified *_sim directory to match the current IF files.
     matrix_to_vertex = None
-    for sim_dir in PROJECT_ROOT.glob('*_sim'):
-        mapping_file = sim_dir / 'matrix_to_vertex.pickle'
-        if mapping_file.exists():
-            try:
-                with open(mapping_file, 'rb') as f:
-                    matrix_to_vertex = pickle.load(f)
-                print(f"Loaded matrix-to-vertex mapping from {mapping_file} ({len(matrix_to_vertex)} entries)")
-                break
-            except Exception as e:
-                print(f"Warning: Could not load {mapping_file}: {e}")
+    sim_dirs = sorted(
+        [d for d in PROJECT_ROOT.glob('*_sim') if (d / 'matrix_to_vertex.pickle').exists()],
+        key=lambda d: (d / 'matrix_to_vertex.pickle').stat().st_mtime,
+        reverse=True
+    )
+    if sim_dirs:
+        mapping_file = sim_dirs[0] / 'matrix_to_vertex.pickle'
+        try:
+            with open(mapping_file, 'rb') as f:
+                matrix_to_vertex = pickle.load(f)
+            print(f"Loaded matrix-to-vertex mapping from {mapping_file} ({len(matrix_to_vertex)} entries)")
+        except Exception as e:
+            print(f"Warning: Could not load {mapping_file}: {e}")
 
     # Convert interface DOF indices to mesh vertex indices
     interface_vertices = {}
@@ -864,18 +877,18 @@ def get_interfaces():
                         if interface_size == 1:
                             dofs_in_size1_interfaces.add(vertex)
 
-        # Classify each DOF
+        # Classify each DOF based on number of sharing partitions:
+        # - face: shared by exactly 2 partitions (regardless of interface size)
+        # - vertex: shared by 3+ partitions AND appears in a size-1 interface
+        # - edge: shared by 3+ partitions AND only in multi-DOF interfaces
         dof_types = {}  # vertex_index -> 'vertex' | 'edge' | 'face'
         for vertex, ranks in dof_to_ranks.items():
             num_ranks = len(ranks)
-            if vertex in dofs_in_size1_interfaces:
-                # Vertex: DOF in a single-DOF interface
-                dof_types[vertex] = 'vertex'
-            elif num_ranks == 2:
-                # Face: shared by exactly 2 partitions
+            if num_ranks == 2:
                 dof_types[vertex] = 'face'
+            elif vertex in dofs_in_size1_interfaces:
+                dof_types[vertex] = 'vertex'
             else:
-                # Edge: shared by 3+ partitions (and not a vertex)
                 dof_types[vertex] = 'edge'
 
         # Second pass: build interface_vertices structure

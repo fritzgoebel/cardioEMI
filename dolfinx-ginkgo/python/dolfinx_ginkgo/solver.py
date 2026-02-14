@@ -54,10 +54,11 @@ class GinkgoSolver:
         - local_max_iterations: int (default: 100)
         - local_tolerance: float (default: 1e-12)
         - local_amg: dict with local AMG config (max_levels, smoother, coarse_solver, etc.)
-        - coarse_solver: "cg" or "gmres" (default: "cg")
+        - coarse_solver: "cg", "gmres", or "bddc" (default: "cg")
         - coarse_max_iterations: int (default: 100)
         - coarse_tolerance: float (default: 1e-10)
-        - repartition_coarse: bool (default: False)
+        - coarse_bddc_local_solver: "direct", "ilu", "ic", or "amg" (default: "direct")
+        - repartition_coarse: bool (default: True)
         - constant_nullspace: bool (default: False)
     verbose : bool, optional
         Print convergence info. Default: False
@@ -457,11 +458,11 @@ class GinkgoSolver:
             bddc.local_tolerance = cfg["local_tolerance"]
 
         if "coarse_solver" in cfg:
-            coarse_map = {"cg": "CG", "gmres": "GMRES"}
+            coarse_map = {"cg": "CG", "gmres": "GMRES", "bddc": "BDDC"}
             coarse = cfg["coarse_solver"].lower()
             if coarse not in coarse_map:
                 raise ValueError(f"Unknown coarse solver: {cfg['coarse_solver']}. "
-                               f"Available: cg, gmres")
+                               f"Available: cg, gmres, bddc")
             bddc.coarse_solver = getattr(_cpp.BDDCConfig.CoarseSolver, coarse_map[coarse])
 
         if "coarse_max_iterations" in cfg:
@@ -469,6 +470,14 @@ class GinkgoSolver:
 
         if "coarse_tolerance" in cfg:
             bddc.coarse_tolerance = cfg["coarse_tolerance"]
+
+        if "coarse_bddc_local_solver" in cfg:
+            solver_map = {"direct": "DIRECT", "ilu": "ILU", "ic": "IC", "amg": "AMG"}
+            solver = cfg["coarse_bddc_local_solver"].lower()
+            if solver not in solver_map:
+                raise ValueError(f"Unknown coarse BDDC local solver: {cfg['coarse_bddc_local_solver']}. "
+                               f"Available: direct, ilu, ic, amg")
+            bddc.coarse_bddc_local_solver = getattr(_cpp.BDDCConfig.LocalSolver, solver_map[solver])
 
         if "repartition_coarse" in cfg:
             bddc.repartition_coarse = cfg["repartition_coarse"]

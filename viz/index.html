@@ -166,6 +166,14 @@
                         <input type="number" id="mpi-ranks" value="8" min="1" max="32" step="1">
                         <span class="unit" id="cpu-info"></span>
                     </div>
+
+                    <div class="param-row">
+                        <label>Partitioning:</label>
+                        <select id="partition-mode" class="mesh-dropdown">
+                            <option value="default">Default</option>
+                            <option value="component">Tag based</option>
+                        </select>
+                    </div>
                 </section>
 
                 <!-- Solver Configuration -->
@@ -281,6 +289,17 @@
                                     <option value="amg">AMG</option>
                                 </select>
                             </div>
+                            <!-- Local solver stopping criteria (shown for iterative solvers: ILU, IC, AMG) -->
+                            <div id="bddc-local-stopping-options" style="display: none;">
+                                <div class="param-row">
+                                    <label>Local Max Iter:</label>
+                                    <input type="number" id="bddc-local-max-iter" value="100" min="1" max="10000" step="10">
+                                </div>
+                                <div class="param-row">
+                                    <label>Local Tolerance:</label>
+                                    <input type="text" id="bddc-local-tolerance" value="1e-12" style="width: 80px;">
+                                </div>
+                            </div>
                             <!-- Local AMG Options (shown when AMG is selected as local solver) -->
                             <div id="bddc-local-amg-options" style="display: none; margin-left: 10px; border-left: 2px solid #444; padding-left: 10px;">
                                 <div class="param-row">
@@ -317,11 +336,22 @@
                                 <select id="bddc-coarse-solver" class="mesh-dropdown">
                                     <option value="cg">CG</option>
                                     <option value="gmres">GMRES</option>
+                                    <option value="bddc">BDDC (nested)</option>
                                 </select>
                             </div>
                             <div class="param-row">
                                 <label>Coarse Max Iter:</label>
                                 <input type="number" id="bddc-coarse-max-iter" value="100" min="10" max="1000" step="10">
+                            </div>
+                            <!-- Coarse BDDC Local Solver (shown when BDDC is selected as coarse solver) -->
+                            <div id="bddc-coarse-bddc-options" class="param-row" style="display: none;">
+                                <label>Coarse BDDC Local:</label>
+                                <select id="bddc-coarse-bddc-local-solver" class="mesh-dropdown">
+                                    <option value="direct">Direct</option>
+                                    <option value="ilu">ILU</option>
+                                    <option value="ic">IC</option>
+                                    <option value="amg">AMG</option>
+                                </select>
                             </div>
                             <div class="param-row">
                                 <label>
@@ -339,6 +369,12 @@
                                 <label>
                                     <input type="checkbox" id="bddc-faces" checked>
                                     Face constraints
+                                </label>
+                            </div>
+                            <div class="param-row">
+                                <label>
+                                    <input type="checkbox" id="bddc-repartition-coarse" checked>
+                                    Repartition coarse problem
                                 </label>
                             </div>
                         </div>
