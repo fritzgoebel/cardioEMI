@@ -18,25 +18,35 @@ from native_assembly   import assemble_block_to_coo
 # Optional Ginkgo solver backend
 try:
     import sys
+    import glob
+    import importlib.util
     sys.path.insert(0, 'dolfinx-ginkgo/python')
     sys.path.insert(0, 'dolfinx-ginkgo/build')
-    # Import _cpp directly from build directory
-    import importlib.util
-    import glob
-    _cpp_modules = glob.glob('dolfinx-ginkgo/build/_cpp*.so')
-    if _cpp_modules:
-        spec = importlib.util.spec_from_file_location("_cpp", _cpp_modules[0])
-        _cpp = importlib.util.module_from_spec(spec)
+    # Preload system-installed _cpp.so if available (e.g. Apptainer container
+    # where the .so is at /usr/local but Python wrappers are on the bind mount)
+    _sys_cpp = glob.glob('/usr/local/dolfinx_ginkgo/_cpp*.so')
+    if _sys_cpp:
+        _spec = importlib.util.spec_from_file_location("dolfinx_ginkgo._cpp", _sys_cpp[0])
+        _cpp = importlib.util.module_from_spec(_spec)
         sys.modules["dolfinx_ginkgo._cpp"] = _cpp
-        spec.loader.exec_module(_cpp)
-        import dolfinx_ginkgo
-        dolfinx_ginkgo._cpp = _cpp
-        from dolfinx_ginkgo import GinkgoSolver
-        GINKGO_AVAILABLE = True
-    else:
+        _spec.loader.exec_module(_cpp)
+    from dolfinx_ginkgo import GinkgoSolver
+    GINKGO_AVAILABLE = True
+except (ImportError, OSError):
+    # Fall back to loading _cpp from local build directory (Docker dev setup)
+    try:
+        _cpp_modules = glob.glob('dolfinx-ginkgo/build/_cpp*.so')
+        if _cpp_modules:
+            _spec = importlib.util.spec_from_file_location("_cpp", _cpp_modules[0])
+            _cpp = importlib.util.module_from_spec(_spec)
+            sys.modules["dolfinx_ginkgo._cpp"] = _cpp
+            _spec.loader.exec_module(_cpp)
+            from dolfinx_ginkgo import GinkgoSolver
+            GINKGO_AVAILABLE = True
+        else:
+            GINKGO_AVAILABLE = False
+    except (ImportError, OSError):
         GINKGO_AVAILABLE = False
-except ImportError:
-    GINKGO_AVAILABLE = False
 
 # Options for the fenicsx form compiler optimization
 cache_dir       = f"{str(Path.cwd())}/.cache"
@@ -272,8 +282,6 @@ if bc_type is None:
 
 Dirichletbc = (bc_type != 'none')
 bcs = []
-rank_has_dirichlet = False
-
 if Dirichletbc:
     # Apply zero Dirichlet condition
     zero = dfx.fem.Constant(mesh, 0.0)
@@ -344,11 +352,14 @@ if Dirichletbc:
     # Each rank finds its local DOFs in the chosen set
     mask = np.isin(local_global_bdofs, chosen_global)
     local_chosen = local_bdofs[mask].astype(np.int32)
+    rank_has_dirichlet = len(local_chosen) > 0
 
     # Apply Dirichlet BCs to all function spaces
     for i in TAGS:
         bc_i = dfx.fem.dirichletbc(zero, local_chosen, V_dict[i])
         bcs.append(bc_i)
+else:
+    rank_has_dirichlet = False
 
 ##############
 #------------------------------------#
@@ -504,8 +515,11 @@ if use_ginkgo:
     bddc_config = None
     if gko_precond == "bddc":
         bddc_cfg = ginkgo_cfg.get("bddc", {})
-        # constant_nullspace should be True only for pure Neumann (no Dirichlet BCs globally)
-        has_nullspace = not Dirichletbc
+        # Per-rank nullspace: true if this rank has no Dirichlet BCs
+        local_nullspace = not rank_has_dirichlet
+        # Coarse nullspace: true only if ALL ranks have no Dirichlet BCs
+        all_have_nullspace = comm.allreduce(int(local_nullspace), op=MPI.MIN)
+        coarse_nullspace = bool(all_have_nullspace)
         bddc_config = {
             "local_solver": bddc_cfg.get("local_solver", "direct"),
             "local_max_iterations": int(bddc_cfg.get("local_max_iterations", 100)),
@@ -517,10 +531,11 @@ if use_ginkgo:
             "edges": bddc_cfg.get("edges", True),
             "faces": bddc_cfg.get("faces", True),
             "repartition_coarse": bddc_cfg.get("repartition_coarse", False),
-            "constant_nullspace": has_nullspace,
+            "constant_nullspace": local_nullspace,
+            "coarse_constant_nullspace": coarse_nullspace,
         }
         if comm.rank == 0:
-            print(f"BDDC constant_nullspace: {has_nullspace} (Dirichlet BCs: {Dirichletbc})")
+            print(f"BDDC constant_nullspace: per-rank (coarse: {coarse_nullspace}, Dirichlet BCs: {Dirichletbc})")
         # Add local AMG config if local solver is AMG
         local_amg_cfg = bddc_cfg.get("local_amg", {})
         if local_amg_cfg:

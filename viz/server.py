@@ -255,6 +255,40 @@ def find_config_for_mesh(mesh_name):
 
     return None
 
+
+def create_config_for_mesh(mesh_name, base_config=None):
+    """Create a config file for a mesh by copying an existing one and updating mesh paths.
+
+    If base_config is None, uses the current config as template.
+    Returns the new config filename.
+    """
+    import yaml
+
+    new_config_name = f'input_{mesh_name}.yml'
+    new_config_path = PROJECT_ROOT / new_config_name
+
+    # Use base config or current config as template
+    if base_config:
+        template_path = PROJECT_ROOT / base_config
+    else:
+        template_path = PROJECT_ROOT / mesh_state.get('currentConfig', 'input_pepe36_colored.yml')
+
+    if not template_path.exists():
+        return None
+
+    with open(template_path, 'r') as f:
+        config = yaml.safe_load(f) or {}
+
+    # Update mesh-specific fields
+    config['mesh_file'] = f'data/{mesh_name}.xdmf'
+    config['tags_dictionary_file'] = f'data/{mesh_name}.pickle'
+    config['out_name'] = f'{mesh_name}_sim'
+
+    with open(new_config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    return new_config_name
+
 @app.route('/api/meshes')
 def list_meshes():
     """List available mesh files from data/ directory."""
@@ -360,13 +394,18 @@ def select_mesh():
 
     mesh_state['current'] = mesh_name
 
-    # Set config file - use provided one, or find matching one, or keep current
+    # Set config file - use provided one, find matching one, or auto-create
     if config_file:
         mesh_state['currentConfig'] = config_file
     else:
         found_config = find_config_for_mesh(mesh_name)
         if found_config:
             mesh_state['currentConfig'] = found_config
+        else:
+            # Auto-create config from current template
+            new_config = create_config_for_mesh(mesh_name)
+            if new_config:
+                mesh_state['currentConfig'] = new_config
 
     with open(metadata_path, 'r') as f:
         metadata = json.load(f)
@@ -1066,6 +1105,213 @@ def download_video(filename):
     """Download a generated video file."""
     videos_dir = Path(__file__).parent / 'videos'
     return send_from_directory(videos_dir, filename, as_attachment=True)
+
+# --------------------- Karolina API ---------------------
+
+try:
+    from karolina import (
+        karolina_state, mesh_convert_state,
+        check_ssh, check_containers, upload_config, submit_job,
+        check_job_status, cancel_job, tail_remote_log,
+        download_results_streaming, list_remote_simulations,
+        list_remote_meshes, convert_remote_mesh, finish_conversion,
+        download_mesh_data
+    )
+except ImportError:
+    from viz.karolina import (
+        karolina_state, mesh_convert_state,
+        check_ssh, check_containers, upload_config, submit_job,
+        check_job_status, cancel_job, tail_remote_log,
+        download_results_streaming, list_remote_simulations,
+        list_remote_meshes, convert_remote_mesh, finish_conversion,
+        download_mesh_data
+    )
+
+@app.route('/api/karolina/check')
+def karolina_check():
+    """Test SSH connectivity to Karolina and check container availability."""
+    available = check_ssh()
+    containers = check_containers() if available else {}
+    return jsonify({'available': available, 'containers': containers})
+
+@app.route('/api/karolina/submit', methods=['POST'])
+def karolina_submit():
+    """Upload config and submit SLURM job to Karolina."""
+    data = request.json
+    config_file = data.get('config', 'input_pepe36_colored.yml')
+    nodes = data.get('nodes', 1)
+    ntasks_per_node = data.get('ntasks_per_node', 128)
+    walltime = data.get('walltime', '01:00:00')
+    partition = data.get('partition', 'qcpu_exp')
+    account = data.get('account', 'eu-26-11')
+    solver_backend = data.get('solver_backend', 'petsc')
+
+    try:
+        # Upload config file
+        config_path = PROJECT_ROOT / config_file
+        if not config_path.exists():
+            return jsonify({'error': f'Config file not found: {config_file}'}), 404
+
+        upload_config(config_path)
+
+        # Submit SLURM job
+        job_id = submit_job(
+            config_file, nodes, ntasks_per_node,
+            walltime, partition, account,
+            solver_backend=solver_backend
+        )
+
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'message': f'Job {job_id} submitted to Karolina'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/karolina/status')
+def karolina_status():
+    """Poll SLURM job status and tail log output."""
+    job_id = karolina_state.get('job_id')
+    if not job_id:
+        return jsonify({
+            'status': None,
+            'job_id': None,
+            'log': '',
+            'message': 'No job submitted'
+        })
+
+    try:
+        status = check_job_status(job_id)
+        log = tail_remote_log(job_id)
+
+        return jsonify({
+            'job_id': job_id,
+            'status': status,
+            'out_name': karolina_state.get('out_name', ''),
+            'log': log
+        })
+    except Exception as e:
+        return jsonify({
+            'job_id': job_id,
+            'status': karolina_state.get('status', 'UNKNOWN'),
+            'log': '',
+            'error': str(e)
+        })
+
+@app.route('/api/karolina/cancel', methods=['POST'])
+def karolina_cancel():
+    """Cancel the running SLURM job."""
+    job_id = karolina_state.get('job_id')
+    if not job_id:
+        return jsonify({'error': 'No job to cancel'}), 400
+
+    try:
+        cancel_job(job_id)
+        return jsonify({'success': True, 'message': f'Job {job_id} cancelled'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/karolina/download', methods=['POST'])
+def karolina_download():
+    """Download simulation results from Karolina via SCP (SSE stream with byte progress)."""
+    data = request.json
+    remote_dir = data.get('remote_dir') or karolina_state.get('out_name')
+
+    if not remote_dir:
+        return jsonify({'error': 'No remote directory specified'}), 400
+
+    local_dest = PROJECT_ROOT / remote_dir
+
+    def generate():
+        for status in download_results_streaming(remote_dir, local_dest):
+            yield f"data: {json.dumps(status)}\n\n"
+
+    return Response(generate(), mimetype='text/event-stream')
+
+@app.route('/api/karolina/remote-simulations')
+def karolina_remote_simulations():
+    """List simulation output directories on Karolina."""
+    try:
+        dirs = list_remote_simulations()
+        return jsonify({'simulations': dirs})
+    except Exception as e:
+        return jsonify({'error': str(e), 'simulations': []}), 500
+
+@app.route('/api/karolina/meshes')
+def karolina_meshes():
+    """List mesh families available on Karolina."""
+    try:
+        families = list_remote_meshes()
+        return jsonify({'families': families})
+    except Exception as e:
+        return jsonify({'error': str(e), 'families': []}), 500
+
+@app.route('/api/karolina/meshes/convert', methods=['POST'])
+def karolina_convert_mesh():
+    """Convert a remote mesh on Karolina inside the DOLFINx container (SSE stream)."""
+    data = request.json
+    family = data.get('family')
+    pts_file = data.get('pts')
+    elem_file = data.get('elem')
+    output_prefix = data.get('output_prefix')
+    color = data.get('color', False)
+
+    if not all([family, pts_file, elem_file, output_prefix]):
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    def generate():
+        try:
+            yield f"data: {json.dumps({'type': 'output', 'text': f'Starting conversion of {output_prefix} on Karolina...\\n'})}\n\n"
+            if color:
+                yield f"data: {json.dumps({'type': 'output', 'text': 'Graph coloring enabled (--color-intracellular)\\n'})}\n\n"
+
+            process = convert_remote_mesh(family, pts_file, elem_file, output_prefix, color)
+
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    yield f"data: {json.dumps({'type': 'output', 'text': line})}\n\n"
+
+            process.wait()
+            finish_conversion()
+
+            if process.returncode == 0:
+                yield f"data: {json.dumps({'type': 'complete', 'success': True})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'error', 'message': f'Conversion failed with exit code {process.returncode}'})}\n\n"
+
+        except Exception as e:
+            finish_conversion()
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return Response(
+        generate(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no'
+        }
+    )
+
+@app.route('/api/karolina/meshes/download', methods=['POST'])
+def karolina_download_mesh():
+    """Download converted mesh data from Karolina to local data/ directory."""
+    data = request.json
+    mesh_name = data.get('mesh_name')
+
+    if not mesh_name:
+        return jsonify({'error': 'No mesh name specified'}), 400
+
+    try:
+        local_data_dir = PROJECT_ROOT / 'data'
+        download_mesh_data(mesh_name, local_data_dir)
+        return jsonify({
+            'success': True,
+            'message': f'Downloaded {mesh_name} mesh data to data/'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # --------------------- Main ---------------------
 

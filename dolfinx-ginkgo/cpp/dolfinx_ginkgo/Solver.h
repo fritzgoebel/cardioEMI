@@ -344,6 +344,14 @@ private:
                     .on(exec_);
                 break;
             }
+            case BDDCConfig::LocalSolver::DIRECT_LU: {
+                // Use LU factorization for general (non-SPD) local problems
+                local_solver_factory = gko::experimental::solver::Direct<ValueType, LocalIndexType>::build()
+                    .with_factorization(
+                        gko::experimental::factorization::Lu<ValueType, LocalIndexType>::build())
+                    .on(exec_);
+                break;
+            }
             case BDDCConfig::LocalSolver::ILU: {
                 // ILU-preconditioned GMRES
                 local_solver_factory = gko::solver::Gmres<ValueType>::build()
@@ -476,6 +484,13 @@ private:
                             .on(exec_);
                         break;
                     }
+                    case BDDCConfig::LocalSolver::DIRECT_LU: {
+                        nested_local_solver_factory = gko::experimental::solver::Direct<ValueType, LocalIndexType>::build()
+                            .with_factorization(
+                                gko::experimental::factorization::Lu<ValueType, LocalIndexType>::build())
+                            .on(exec_);
+                        break;
+                    }
                     case BDDCConfig::LocalSolver::ILU: {
                         nested_local_solver_factory = gko::solver::Gmres<ValueType>::build()
                             .with_criteria(
@@ -572,7 +587,7 @@ private:
                 }
 
                 // Nested BDDC as coarse solver with CG for its own coarse level
-                coarse_solver_factory = local_bddc_type::build()
+                auto nested_bddc_params = local_bddc_type::build()
                     .with_local_solver(nested_local_solver_factory)
                     .with_coarse_solver(
                         gko::solver::Cg<ValueType>::build()
@@ -584,8 +599,13 @@ private:
                     .with_vertices(bddc_cfg.vertices)
                     .with_edges(bddc_cfg.edges)
                     .with_faces(bddc_cfg.faces)
-                    .with_constant_nullspace(bddc_cfg.constant_nullspace)
-                    .on(exec_);
+                    .with_constant_nullspace(bddc_cfg.coarse_constant_nullspace);
+                if (bddc_cfg.coarse_bddc_local_solver == BDDCConfig::LocalSolver::DIRECT ||
+                    bddc_cfg.coarse_bddc_local_solver == BDDCConfig::LocalSolver::DIRECT_LU) {
+                    nested_bddc_params.with_reordering(
+                        gko::share(gko::experimental::reorder::Amd<LocalIndexType>::build().on(exec_)));
+                }
+                coarse_solver_factory = nested_bddc_params.on(exec_);
                 break;
             }
         }
@@ -602,7 +622,7 @@ private:
         }
 
         // Build BDDC factory
-        return bddc_type::build()
+        auto bddc_params = bddc_type::build()
             .with_local_solver(local_solver_factory)
             .with_coarse_solver(coarse_solver_factory)
             .with_vertices(bddc_cfg.vertices)
@@ -610,8 +630,13 @@ private:
             .with_faces(bddc_cfg.faces)
             .with_scaling(scaling)
             .with_repartition_coarse(bddc_cfg.repartition_coarse)
-            .with_constant_nullspace(bddc_cfg.constant_nullspace)
-            .on(exec_);
+            .with_constant_nullspace(bddc_cfg.constant_nullspace);
+        if (bddc_cfg.local_solver == BDDCConfig::LocalSolver::DIRECT ||
+            bddc_cfg.local_solver == BDDCConfig::LocalSolver::DIRECT_LU) {
+            bddc_params.with_reordering(
+                gko::share(gko::experimental::reorder::Amd<LocalIndexType>::build().on(exec_)));
+        }
+        return bddc_params.on(exec_);
     }
 
     /// Build the complete solver with preconditioner

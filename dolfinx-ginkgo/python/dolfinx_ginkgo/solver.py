@@ -50,14 +50,14 @@ class GinkgoSolver:
         - edges: bool, use edge constraints (default: True)
         - faces: bool, use face constraints (default: True)
         - scaling: "stiffness" or "deluxe" (default: "stiffness")
-        - local_solver: "direct", "ilu", "ic", or "amg" (default: "direct")
+        - local_solver: "direct", "direct_lu", "ilu", "ic", or "amg" (default: "direct")
         - local_max_iterations: int (default: 100)
         - local_tolerance: float (default: 1e-12)
         - local_amg: dict with local AMG config (max_levels, smoother, coarse_solver, etc.)
         - coarse_solver: "cg", "gmres", or "bddc" (default: "cg")
         - coarse_max_iterations: int (default: 100)
         - coarse_tolerance: float (default: 1e-10)
-        - coarse_bddc_local_solver: "direct", "ilu", "ic", or "amg" (default: "direct")
+        - coarse_bddc_local_solver: "direct", "direct_lu", "ilu", "ic", or "amg" (default: "direct")
         - repartition_coarse: bool (default: True)
         - constant_nullspace: bool (default: False)
     verbose : bool, optional
@@ -444,11 +444,11 @@ class GinkgoSolver:
             bddc.scaling = getattr(_cpp.BDDCConfig.Scaling, scaling_map[scaling])
 
         if "local_solver" in cfg:
-            solver_map = {"direct": "DIRECT", "ilu": "ILU", "ic": "IC", "amg": "AMG"}
+            solver_map = {"direct": "DIRECT", "direct_lu": "DIRECT_LU", "ilu": "ILU", "ic": "IC", "amg": "AMG"}
             local_solver = cfg["local_solver"].lower()
             if local_solver not in solver_map:
                 raise ValueError(f"Unknown local solver: {cfg['local_solver']}. "
-                               f"Available: direct, ilu, ic, amg")
+                               f"Available: direct, direct_lu, ilu, ic, amg")
             bddc.local_solver = getattr(_cpp.BDDCConfig.LocalSolver, solver_map[local_solver])
 
         if "local_max_iterations" in cfg:
@@ -472,11 +472,11 @@ class GinkgoSolver:
             bddc.coarse_tolerance = cfg["coarse_tolerance"]
 
         if "coarse_bddc_local_solver" in cfg:
-            solver_map = {"direct": "DIRECT", "ilu": "ILU", "ic": "IC", "amg": "AMG"}
+            solver_map = {"direct": "DIRECT", "direct_lu": "DIRECT_LU", "ilu": "ILU", "ic": "IC", "amg": "AMG"}
             solver = cfg["coarse_bddc_local_solver"].lower()
             if solver not in solver_map:
                 raise ValueError(f"Unknown coarse BDDC local solver: {cfg['coarse_bddc_local_solver']}. "
-                               f"Available: direct, ilu, ic, amg")
+                               f"Available: direct, direct_lu, ilu, ic, amg")
             bddc.coarse_bddc_local_solver = getattr(_cpp.BDDCConfig.LocalSolver, solver_map[solver])
 
         if "repartition_coarse" in cfg:
@@ -484,6 +484,9 @@ class GinkgoSolver:
 
         if "constant_nullspace" in cfg:
             bddc.constant_nullspace = cfg["constant_nullspace"]
+
+        if "coarse_constant_nullspace" in cfg:
+            bddc.coarse_constant_nullspace = cfg["coarse_constant_nullspace"]
 
         # Configure local AMG if specified
         if "local_amg" in cfg:

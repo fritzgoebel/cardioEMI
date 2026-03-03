@@ -33,6 +33,11 @@ class Viewer {
         this.ecsRanksData = null;
         this.cutRanksData = null;
 
+        // Vertex picking
+        this.onVertexPicked = null;  // Callback: (vertexIndex, worldPos) => void
+        this.pickMarker = null;
+        this._pickPointerMoved = false;
+
         // Current colormap
         this.colormap = 'coolwarm';
 
@@ -1235,6 +1240,62 @@ class Viewer {
             this.interfacePoints = new THREE.Points(geometry, material);
             this.scene.add(this.interfacePoints);
         }
+    }
+
+    // Vertex picking via raycasting
+    setupPickingHandler() {
+        const canvas = this.renderer.domElement;
+
+        // Track pointer movement to distinguish click from drag
+        canvas.addEventListener('pointerdown', () => { this._pickPointerMoved = false; });
+        canvas.addEventListener('pointermove', () => { this._pickPointerMoved = true; });
+
+        canvas.addEventListener('click', (event) => {
+            if (this._pickPointerMoved) return;  // was a drag, not a click
+            if (!this.meshObject || !this.onVertexPicked) return;
+
+            const rect = canvas.getBoundingClientRect();
+            this.mouse.x =  ((event.clientX - rect.left) / rect.width)  * 2 - 1;
+            this.mouse.y = -((event.clientY - rect.top)  / rect.height) * 2 + 1;
+
+            this.raycaster.setFromCamera(this.mouse, this.camera);
+            const intersects = this.raycaster.intersectObject(this.meshObject);
+            if (intersects.length === 0) return;
+
+            const hit = intersects[0];
+            const face = hit.face;
+            const pos = this.meshObject.geometry.attributes.position.array;
+
+            // Pick the face vertex closest to the actual intersection point
+            let closestIdx = face.a;
+            let minDist = Infinity;
+            for (const vi of [face.a, face.b, face.c]) {
+                const dx = pos[vi * 3]     - hit.point.x;
+                const dy = pos[vi * 3 + 1] - hit.point.y;
+                const dz = pos[vi * 3 + 2] - hit.point.z;
+                const d = dx*dx + dy*dy + dz*dz;
+                if (d < minDist) { minDist = d; closestIdx = vi; }
+            }
+
+            this.setPickMarker(hit.point);
+            this.onVertexPicked(closestIdx, hit.point);
+        });
+    }
+
+    setPickMarker(position) {
+        if (!this.pickMarker) {
+            const geo = new THREE.SphereGeometry(1.5, 10, 8);
+            const mat = new THREE.MeshBasicMaterial({ color: 0xffff00, depthTest: false });
+            this.pickMarker = new THREE.Mesh(geo, mat);
+            this.pickMarker.renderOrder = 999;
+            this.scene.add(this.pickMarker);
+        }
+        this.pickMarker.position.copy(position);
+        this.pickMarker.visible = true;
+    }
+
+    clearPickMarker() {
+        if (this.pickMarker) this.pickMarker.visible = false;
     }
 
     // Remove interface points overlay

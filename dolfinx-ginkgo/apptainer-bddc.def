@@ -1,0 +1,69 @@
+Bootstrap: localimage
+From: dolfinx-v0.9.0.sif
+
+%files
+    ginkgo /tmp/ginkgo
+    dolfinx-ginkgo /tmp/dolfinx-ginkgo
+    ParMETIS /tmp/ParMETIS
+
+%post
+    # Install Ginkgo build dependencies
+    apt-get update && apt-get install -y --no-install-recommends \
+        libopenblas-dev \
+        libomp-dev \
+        libmetis-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+    # Build ParMETIS from source against the container's MPI
+    # The apt libparmetis-dev links against system OpenMPI (libmpi.so.40)
+    # but DOLFINx/Ginkgo use the container's MPI (libmpi.so.12 in /usr/local/lib).
+    # This mismatch causes segfaults when Ginkgo BDDC calls ParMETIS_V3_PartMeshKway.
+    cd /tmp/ParMETIS && rm -rf build && \
+    make config cc=/usr/local/bin/mpicc prefix=/usr/local shared=1 && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    rm -rf /tmp/ParMETIS
+
+    # Build Ginkgo
+    cd /tmp/ginkgo && rm -rf build && mkdir build && cd build && \
+    cmake .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DGINKGO_BUILD_TESTS=OFF \
+        -DGINKGO_BUILD_EXAMPLES=OFF \
+        -DGINKGO_BUILD_BENCHMARKS=OFF \
+        -DGINKGO_BUILD_REFERENCE=ON \
+        -DGINKGO_BUILD_OMP=ON \
+        -DGINKGO_BUILD_MPI=ON \
+        -DGINKGO_BUILD_CUDA=OFF \
+        -DGINKGO_BUILD_HIP=OFF \
+        -DGINKGO_BUILD_SYCL=OFF \
+    && make -j$(nproc) \
+    && make install \
+    && rm -rf /tmp/ginkgo
+
+    # Update library cache
+    ldconfig
+
+    # Install nanobind for Python bindings
+    pip install --no-cache-dir nanobind
+
+    # Build dolfinx-ginkgo Python bindings
+    cd /tmp/dolfinx-ginkgo && rm -rf build && mkdir build && cd build && \
+    cmake .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DDOLFINX_GINKGO_BUILD_TESTS=OFF \
+        -DDOLFINX_GINKGO_BUILD_EXAMPLES=OFF \
+    && make -j$(nproc) \
+    && make install \
+    && rm -rf /tmp/dolfinx-ginkgo
+
+    ldconfig
+
+%environment
+    export LC_ALL=C
+
+%labels
+    Author CardioEMI Project
+    Description DOLFINx with Ginkgo BDDC preconditioner

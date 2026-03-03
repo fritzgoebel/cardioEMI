@@ -19,6 +19,14 @@
             <!-- 3D Viewer -->
             <div class="viewer-panel">
                 <div id="viewer-container">
+                    <!-- Voltage time-series plot panel (shown when a point is picked) -->
+                    <div id="voltage-plot-panel" style="display: none;">
+                        <div id="voltage-plot-header">
+                            <span id="voltage-plot-coords"></span>
+                            <button id="voltage-plot-close" title="Close">✕</button>
+                        </div>
+                        <canvas id="voltage-plot-canvas" width="280" height="150"></canvas>
+                    </div>
                     <!-- Colorbar overlay -->
                     <div id="colorbar">
                         <div class="colorbar-gradient"></div>
@@ -111,6 +119,23 @@
 
             <!-- Control Panel -->
             <div class="control-panel">
+                <!-- Run Target (first section) -->
+                <section class="section">
+                    <h2>Run Target</h2>
+                    <div class="param-row">
+                        <label>Target:</label>
+                        <select id="run-target" class="mesh-dropdown">
+                            <option value="local">Local (Docker)</option>
+                            <option value="karolina">Karolina</option>
+                        </select>
+                        <span id="karolina-status-dot" style="display:none; margin-left:6px; font-size:14px;" title="SSH connectivity"></span>
+                    </div>
+                    <div id="karolina-container-status-row" style="display:none" class="param-row">
+                        <label>Containers:</label>
+                        <span id="karolina-container-status" style="font-size: 0.85em; color: #888;">-</span>
+                    </div>
+                </section>
+
                 <!-- Mesh Selection -->
                 <section class="section">
                     <h2>Mesh Selection</h2>
@@ -119,6 +144,7 @@
                         <select id="mesh-selector" class="mesh-dropdown">
                             <option value="">Loading...</option>
                         </select>
+                        <button id="refresh-mesh-list" class="btn-small" style="display:none;" title="Refresh mesh list">↻</button>
                     </div>
                     <div id="mesh-status" class="mesh-status"></div>
                     <button id="convert-mesh" class="btn btn-secondary" style="display:none; width: 100%; margin-top: 8px;">
@@ -128,6 +154,10 @@
                         <div class="progress-fill"></div>
                         <span class="progress-text">0%</span>
                     </div>
+                    <!-- Remote mesh conversion controls (Karolina mode) -->
+                    <div id="remote-convert-area" style="display:none; margin-top: 8px;"></div>
+                    <div id="remote-mesh-convert-status" class="mesh-status" style="display:none; margin-top:8px;"></div>
+                    <pre id="remote-mesh-convert-output" class="output-console" style="display:none; max-height:150px; margin-top:8px;"></pre>
                 </section>
 
                 <!-- Simulation Parameters -->
@@ -173,6 +203,39 @@
                             <option value="default">Default</option>
                             <option value="component">Tag based</option>
                         </select>
+                    </div>
+
+                    <!-- Karolina Options (shown when Karolina target selected) -->
+                    <div id="karolina-options" style="display:none;">
+                        <div class="param-row">
+                            <label>Nodes:</label>
+                            <input type="number" id="karolina-nodes" value="1" min="1" max="64" step="1">
+                        </div>
+                        <div class="param-row">
+                            <label>Tasks/node:</label>
+                            <input type="number" id="karolina-ntasks" value="128" min="1" max="128" step="1">
+                        </div>
+                        <div class="param-row">
+                            <label>Total ranks:</label>
+                            <span id="karolina-total-ranks">128</span>
+                        </div>
+                        <div class="param-row">
+                            <label>Walltime:</label>
+                            <input type="text" id="karolina-walltime" value="01:00:00" style="width:80px;" placeholder="HH:MM:SS">
+                        </div>
+                        <div class="param-row">
+                            <label>Partition:</label>
+                            <select id="karolina-partition" class="mesh-dropdown">
+                                <option value="qcpu_exp">qcpu_exp (debug, 1h)</option>
+                                <option value="qcpu">qcpu (production)</option>
+                                <option value="qgpu_exp">qgpu_exp (GPU debug)</option>
+                                <option value="qgpu">qgpu (GPU prod)</option>
+                            </select>
+                        </div>
+                        <div class="param-row">
+                            <label>Account:</label>
+                            <input type="text" id="karolina-account" value="eu-26-11" style="width:80px;">
+                        </div>
                     </div>
                 </section>
 
@@ -284,6 +347,7 @@
                                 <label>Local Solver:</label>
                                 <select id="bddc-local-solver" class="mesh-dropdown">
                                     <option value="direct">Direct (Cholesky)</option>
+                                    <option value="direct_lu">Direct (LU)</option>
                                     <option value="ilu">ILU</option>
                                     <option value="ic">IC</option>
                                     <option value="amg">AMG</option>
@@ -347,7 +411,8 @@
                             <div id="bddc-coarse-bddc-options" class="param-row" style="display: none;">
                                 <label>Coarse BDDC Local:</label>
                                 <select id="bddc-coarse-bddc-local-solver" class="mesh-dropdown">
-                                    <option value="direct">Direct</option>
+                                    <option value="direct">Direct (Cholesky)</option>
+                                    <option value="direct_lu">Direct (LU)</option>
                                     <option value="ilu">ILU</option>
                                     <option value="ic">IC</option>
                                     <option value="amg">AMG</option>
@@ -471,6 +536,36 @@
                     <pre id="simulation-output" class="output-console"></pre>
                 </section>
 
+                <!-- Karolina Job Status (shown when Karolina target) -->
+                <section class="section" id="karolina-job-section" style="display:none;">
+                    <h2>Karolina Job</h2>
+                    <div class="param-row">
+                        <label>Job ID:</label>
+                        <span id="karolina-job-id">-</span>
+                    </div>
+                    <div class="param-row">
+                        <label>Status:</label>
+                        <span id="karolina-job-status">-</span>
+                    </div>
+                    <div style="margin-top: 8px;">
+                        <button id="karolina-cancel-btn" class="btn btn-danger" style="display:none;">
+                            Cancel Job
+                        </button>
+                        <button id="karolina-download-btn" class="btn btn-success" style="display:none;">
+                            Download Results
+                        </button>
+                    </div>
+                    <div id="karolina-download-progress" style="display:none; margin-top:8px;">
+                        <div style="background:#333; border-radius:4px; overflow:hidden; height:18px; position:relative;">
+                            <div id="karolina-download-bar" style="background:#4CAF50; height:100%; width:0%; transition:width 0.2s;"></div>
+                        </div>
+                        <div id="karolina-download-text" style="font-size:0.8em; color:#aaa; margin-top:3px;"></div>
+                    </div>
+                    <div id="karolina-download-status" class="mesh-status" style="display:none; margin-top:8px;"></div>
+                    <h3 style="margin-top: 12px; font-size: 0.85em; color: #888;">Job Log</h3>
+                    <pre id="karolina-log-output" class="output-console" style="max-height: 200px;"></pre>
+                </section>
+
                 <!-- Results Visualization -->
                 <section class="section" id="results-section">
                     <h2>Results Visualization</h2>
@@ -546,6 +641,7 @@
     <script src="js/viewer.js"></script>
     <script src="js/config-manager.js"></script>
     <script src="js/simulation-runner.js"></script>
+    <script src="js/karolina-runner.js"></script>
     <script src="js/app.js"></script>
 </body>
 </html>

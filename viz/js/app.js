@@ -6,6 +6,8 @@ class App {
         this.viewer = null;
         this.configManager = new ConfigManager();
         this.simulationRunner = new SimulationRunner();
+        this.karolinaRunner = new KarolinaRunner();
+        this.runTarget = sessionStorage.getItem('runTarget') || 'local'; // 'local' or 'karolina'
 
         // Bounding box state (in micrometers - raw mesh coordinates)
         this.boundingBox = {
@@ -43,6 +45,10 @@ class App {
         this.residualChart = null;
         this.residualAbsData = [];
         this.residualRelData = [];
+
+        // Voltage time-series plot
+        this.voltagePlotChart = null;
+        this.pickedVertexIndex = null;
 
         // MPI partition data
         this.ranksData = null;
@@ -91,6 +97,8 @@ class App {
             // Setup UI controls
             this.setupSliders();
             this.setupSimulationParams();
+            this.setupRunTarget();
+            this.setupKarolinaOptions();
             this.setupSolverSettings();
             this.setupMpiRanks();
             this.setupVoltageControls();
@@ -101,6 +109,15 @@ class App {
             this.setupVideoExport();
             this.setupIterationsChart();
             this.setupResidualChart();
+            this.setupVoltagePlot();
+
+            // Setup vertex picking
+            this.viewer.setupPickingHandler();
+            this.viewer.onVertexPicked = (vertexIdx, worldPos) => {
+                if (!this.resultsData) return;
+                this.pickedVertexIndex = vertexIdx;
+                this.showVoltagePlot(vertexIdx, worldPos);
+            };
 
             // Initial update
             this.updateVinitExpression();
@@ -117,47 +134,14 @@ class App {
 
     async setupMeshSelector() {
         const selector = document.getElementById('mesh-selector');
-        const statusEl = document.getElementById('mesh-status');
         const convertBtn = document.getElementById('convert-mesh');
-        const progressBar = document.getElementById('conversion-progress');
+        const refreshBtn = document.getElementById('refresh-mesh-list');
 
-        // Fetch available meshes
-        try {
-            const response = await fetch('/api/meshes');
-            const data = await response.json();
-
-            // Store mesh info for later lookup
-            this.meshesInfo = data.meshes;
-
-            // Populate dropdown
-            selector.innerHTML = '';
-            data.meshes.forEach(mesh => {
-                const option = document.createElement('option');
-                option.value = mesh.name;
-                option.textContent = mesh.name + (mesh.converted ? '' : ' (not converted)');
-                if (mesh.name === data.current) {
-                    option.selected = true;
-                }
-                selector.appendChild(option);
-            });
-
-            // Set current mesh in loader
-            this.meshLoader.setMesh(data.current);
-
-            // Set current config file
-            if (data.currentConfig) {
-                this.configManager.setConfigFile(data.currentConfig);
-                this.simulationRunner.setConfigFile(data.currentConfig);
-                console.log(`Using config: ${data.currentConfig}`);
-            }
-
-            // Update status
-            this.updateMeshStatus(data.current, data.meshes);
-
-        } catch (error) {
-            console.error('Failed to load mesh list:', error);
-            selector.innerHTML = '<option value="">Error loading meshes</option>';
-        }
+        // Initial mesh list load (always local to get current mesh for viewer)
+        const savedTarget = this.runTarget;
+        this.runTarget = 'local';
+        await this.refreshMeshList();
+        this.runTarget = savedTarget;
 
         // Handle mesh selection change
         selector.addEventListener('change', async () => {
@@ -165,31 +149,237 @@ class App {
             await this.onMeshSelected(meshName);
         });
 
-        // Handle convert button
+        // Handle convert button (for local viz conversion)
         convertBtn.addEventListener('click', async () => {
             const meshName = selector.value;
             await this.convertMesh(meshName);
         });
+
+        // Handle refresh button (visible in Karolina mode)
+        refreshBtn.addEventListener('click', () => {
+            this.refreshMeshList();
+        });
+    }
+
+    async refreshMeshList() {
+        const selector = document.getElementById('mesh-selector');
+        const remoteConvertArea = document.getElementById('remote-convert-area');
+
+        // Always fetch local meshes
+        let localMeshes = [];
+        let currentMesh = null;
+        let currentConfig = null;
+        try {
+            const response = await fetch('/api/meshes');
+            const data = await response.json();
+            localMeshes = data.meshes;
+            currentMesh = data.current;
+            currentConfig = data.currentConfig;
+            this.meshesInfo = data.meshes;
+        } catch (error) {
+            console.error('Failed to load local mesh list:', error);
+            selector.innerHTML = '<option value="">Error loading meshes</option>';
+            return;
+        }
+
+        if (this.runTarget === 'karolina') {
+            // Karolina mode: fetch remote meshes and populate dropdown
+            selector.innerHTML = '<option value="">Loading remote meshes...</option>';
+            remoteConvertArea.innerHTML = '';
+            remoteConvertArea.style.display = 'none';
+
+            try {
+                const families = await this.karolinaRunner.listRemoteMeshes();
+                const localNames = new Set(localMeshes.map(m => m.name));
+
+                selector.innerHTML = '';
+                let hasOptions = false;
+
+                // Build list of converted remote meshes for the dropdown
+                // and unconverted ones for convert buttons
+                const unconverted = [];
+
+                for (const family of families) {
+                    for (const mesh of family.meshes) {
+                        // Plain converted mesh
+                        if (mesh.converted) {
+                            const opt = document.createElement('option');
+                            opt.value = mesh.name;
+                            const isLocal = localNames.has(mesh.name);
+                            const localInfo = localMeshes.find(m => m.name === mesh.name);
+                            const vizReady = localInfo && localInfo.converted;
+                            let label = mesh.name;
+                            if (vizReady) label += ' (ready)';
+                            else if (isLocal) label += ' (local, needs viz convert)';
+                            else label += ' (remote)';
+                            opt.textContent = label;
+                            if (mesh.name === currentMesh) opt.selected = true;
+                            selector.appendChild(opt);
+                            hasOptions = true;
+                        } else {
+                            unconverted.push({ family: family.family, mesh, color: false });
+                        }
+
+                        // Colored variant
+                        if (mesh.converted_colored) {
+                            const colorName = mesh.name + '_colored';
+                            const opt = document.createElement('option');
+                            opt.value = colorName;
+                            const isLocal = localNames.has(colorName);
+                            const localInfo = localMeshes.find(m => m.name === colorName);
+                            const vizReady = localInfo && localInfo.converted;
+                            let label = colorName;
+                            if (vizReady) label += ' (ready)';
+                            else if (isLocal) label += ' (local, needs viz convert)';
+                            else label += ' (remote)';
+                            opt.textContent = label;
+                            if (colorName === currentMesh) opt.selected = true;
+                            selector.appendChild(opt);
+                            hasOptions = true;
+                        } else {
+                            unconverted.push({ family: family.family, mesh, color: true });
+                        }
+                    }
+                }
+
+                if (!hasOptions) {
+                    selector.innerHTML = '<option value="">No converted meshes on Karolina</option>';
+                }
+
+                // Show unconverted meshes with convert buttons
+                if (unconverted.length > 0) {
+                    remoteConvertArea.style.display = 'block';
+                    remoteConvertArea.innerHTML = '<div style="font-size:0.85em; color:#888; margin-bottom:4px;">Unconverted meshes:</div>';
+                    for (const item of unconverted) {
+                        const row = document.createElement('div');
+                        row.style.cssText = 'display:flex; align-items:center; gap:6px; margin-bottom:4px; font-size:0.85em;';
+                        const nameSpan = document.createElement('span');
+                        const displayName = item.color ? item.mesh.name + '_colored' : item.mesh.name;
+                        nameSpan.textContent = displayName;
+                        nameSpan.style.minWidth = '80px';
+                        row.appendChild(nameSpan);
+                        const btn = document.createElement('button');
+                        btn.textContent = 'Convert on Karolina';
+                        btn.className = 'btn-small';
+                        btn.addEventListener('click', () => this.convertRemoteMeshAndRefresh(item.family, item.mesh, item.color));
+                        row.appendChild(btn);
+                        remoteConvertArea.appendChild(row);
+                    }
+                }
+            } catch (e) {
+                selector.innerHTML = '<option value="">Failed to load remote meshes</option>';
+                console.error('Failed to load remote meshes:', e);
+            }
+        } else {
+            // Local mode: populate with local meshes
+            remoteConvertArea.style.display = 'none';
+            selector.innerHTML = '';
+            localMeshes.forEach(mesh => {
+                const option = document.createElement('option');
+                option.value = mesh.name;
+                option.textContent = mesh.name + (mesh.converted ? '' : ' (not converted)');
+                if (mesh.name === currentMesh) {
+                    option.selected = true;
+                }
+                selector.appendChild(option);
+            });
+        }
+
+        // Set current mesh in loader
+        if (currentMesh) {
+            this.meshLoader.setMesh(currentMesh);
+        }
+
+        // Set current config file
+        if (currentConfig) {
+            this.configManager.setConfigFile(currentConfig);
+            this.simulationRunner.setConfigFile(currentConfig);
+        }
+
+        // Update status for currently selected mesh
+        const selected = selector.value;
+        if (selected && this.runTarget === 'local') {
+            this.updateMeshStatus(selected, localMeshes);
+        }
     }
 
     async onMeshSelected(meshName) {
         const statusEl = document.getElementById('mesh-status');
+
+        if (this.runTarget === 'karolina') {
+            // Karolina mode: auto-download if needed, auto-convert, then select
+            await this.onKarolinaMeshSelected(meshName);
+        } else {
+            // Local mode: check if converted
+            const response = await fetch('/api/meshes');
+            const data = await response.json();
+            const meshInfo = data.meshes.find(m => m.name === meshName);
+
+            if (!meshInfo) return;
+
+            if (meshInfo.converted) {
+                await this.selectMesh(meshName);
+            } else {
+                this.updateMeshStatus(meshName, data.meshes);
+            }
+        }
+    }
+
+    async onKarolinaMeshSelected(meshName) {
+        const statusEl = document.getElementById('mesh-status');
         const convertBtn = document.getElementById('convert-mesh');
 
-        // Check if mesh is converted
-        const response = await fetch('/api/meshes');
-        const data = await response.json();
-        const meshInfo = data.meshes.find(m => m.name === meshName);
+        statusEl.style.display = 'block';
+        convertBtn.style.display = 'none';
 
-        if (!meshInfo) return;
+        // Step 1: Check if mesh data exists locally
+        let localInfo = this.meshesInfo?.find(m => m.name === meshName);
 
-        if (meshInfo.converted) {
-            // Select the mesh
-            await this.selectMesh(meshName);
-        } else {
-            // Show convert button
-            this.updateMeshStatus(meshName, data.meshes);
+        if (!localInfo) {
+            // Need to download from Karolina
+            statusEl.className = 'mesh-status pending';
+            statusEl.textContent = `Downloading ${meshName} from Karolina...`;
+
+            try {
+                await this.karolinaRunner.downloadMeshData(meshName);
+                statusEl.textContent = `Downloaded ${meshName}. Checking conversion...`;
+
+                // Refresh local mesh info
+                const resp = await fetch('/api/meshes');
+                const data = await resp.json();
+                this.meshesInfo = data.meshes;
+                localInfo = data.meshes.find(m => m.name === meshName);
+            } catch (e) {
+                statusEl.className = 'mesh-status error';
+                statusEl.textContent = `Download failed: ${e.message}`;
+                return;
+            }
         }
+
+        if (!localInfo) {
+            statusEl.className = 'mesh-status error';
+            statusEl.textContent = `Mesh ${meshName} not found locally after download`;
+            return;
+        }
+
+        // Step 2: Check if viz conversion exists
+        if (!localInfo.converted) {
+            statusEl.className = 'mesh-status pending';
+            statusEl.textContent = `Converting ${meshName} for visualization...`;
+
+            try {
+                await this.convertMesh(meshName);
+                // convertMesh handles auto-select on completion
+                return;
+            } catch (e) {
+                statusEl.className = 'mesh-status error';
+                statusEl.textContent = `Conversion failed: ${e.message}`;
+                return;
+            }
+        }
+
+        // Step 3: Already local and converted - just select it
+        await this.selectMesh(meshName);
     }
 
     updateMeshStatus(meshName, meshes) {
@@ -382,6 +572,174 @@ class App {
                 this.partitionMode = e.target.value;
             });
         }
+    }
+
+    setupRunTarget() {
+        const selector = document.getElementById('run-target');
+        const karolinaOptions = document.getElementById('karolina-options');
+        const containerStatusRow = document.getElementById('karolina-container-status-row');
+        const statusDot = document.getElementById('karolina-status-dot');
+        const refreshBtn = document.getElementById('refresh-mesh-list');
+        const mpiRanksRow = document.getElementById('mpi-ranks').closest('.param-row');
+
+        const applyTarget = async (target) => {
+            if (target === 'karolina') {
+                karolinaOptions.style.display = 'block';
+                containerStatusRow.style.display = 'flex';
+                statusDot.style.display = 'inline';
+                refreshBtn.style.display = 'inline-block';
+                mpiRanksRow.style.display = 'none';
+                // Check connectivity + containers
+                statusDot.textContent = '...';
+                statusDot.title = 'Checking SSH...';
+                try {
+                    const result = await this.karolinaRunner.checkConnectivity();
+                    const ok = result.available;
+                    statusDot.textContent = '\u25CF';
+                    statusDot.style.color = ok ? '#4ade80' : '#e94560';
+                    statusDot.title = ok ? 'SSH connected' : 'SSH unreachable';
+                    // Show container status
+                    if (ok && result.containers) {
+                        const c = result.containers;
+                        const parts = [];
+                        parts.push(`DOLFINx: ${c.dolfinx ? 'ready' : 'missing'}`);
+                        parts.push(`Ginkgo: ${c.ginkgo ? 'ready' : 'missing'}`);
+                        const containerEl = document.getElementById('karolina-container-status');
+                        containerEl.textContent = parts.join(' | ');
+                        containerEl.style.color = c.dolfinx ? '#4ade80' : '#e94560';
+                    }
+                    // Refresh mesh list with remote meshes
+                    if (ok) this.refreshMeshList();
+                } catch (e) {
+                    statusDot.textContent = '\u25CF';
+                    statusDot.style.color = '#e94560';
+                    statusDot.title = 'SSH check failed';
+                }
+            } else {
+                karolinaOptions.style.display = 'none';
+                containerStatusRow.style.display = 'none';
+                statusDot.style.display = 'none';
+                refreshBtn.style.display = 'none';
+                mpiRanksRow.style.display = 'flex';
+                // Refresh mesh list with local meshes
+                this.refreshMeshList();
+            }
+        };
+
+        selector.addEventListener('change', async () => {
+            this.runTarget = selector.value;
+            sessionStorage.setItem('runTarget', this.runTarget);
+            await applyTarget(this.runTarget);
+        });
+
+        // Restore persisted run target on page load
+        if (this.runTarget !== 'local') {
+            selector.value = this.runTarget;
+            applyTarget(this.runTarget);
+        }
+    }
+
+    async convertRemoteMeshAndRefresh(family, mesh, color) {
+        const statusEl = document.getElementById('remote-mesh-convert-status');
+        const outputEl = document.getElementById('remote-mesh-convert-output');
+        const outputPrefix = color ? mesh.name + '_colored' : mesh.name;
+
+        statusEl.className = 'mesh-status pending';
+        statusEl.textContent = `Converting ${outputPrefix} on Karolina...`;
+        statusEl.style.display = 'block';
+        outputEl.style.display = 'block';
+        outputEl.textContent = '';
+
+        try {
+            await this.karolinaRunner.convertRemoteMesh(
+                family, mesh.pts, mesh.elem, outputPrefix, color,
+                (text) => {
+                    outputEl.textContent += text;
+                    outputEl.scrollTop = outputEl.scrollHeight;
+                }
+            );
+
+            statusEl.className = 'mesh-status converted';
+            statusEl.textContent = `Conversion of ${outputPrefix} complete!`;
+
+            // Refresh mesh list to show the newly converted mesh in the dropdown
+            await this.refreshMeshList();
+        } catch (e) {
+            statusEl.className = 'mesh-status error';
+            statusEl.textContent = `Conversion failed: ${e.message}`;
+        }
+    }
+
+    setupKarolinaOptions() {
+        const nodesInput = document.getElementById('karolina-nodes');
+        const ntasksInput = document.getElementById('karolina-ntasks');
+        const totalRanksSpan = document.getElementById('karolina-total-ranks');
+
+        const updateTotal = () => {
+            const nodes = parseInt(nodesInput.value) || 1;
+            const ntasks = parseInt(ntasksInput.value) || 128;
+            totalRanksSpan.textContent = nodes * ntasks;
+        };
+
+        nodesInput.addEventListener('input', updateTotal);
+        ntasksInput.addEventListener('input', updateTotal);
+        updateTotal();
+
+        // Cancel button
+        document.getElementById('karolina-cancel-btn').addEventListener('click', async () => {
+            try {
+                await this.karolinaRunner.cancel();
+                this.karolinaRunner.stopPolling();
+                document.getElementById('karolina-job-status').textContent = 'CANCELLED';
+                document.getElementById('karolina-cancel-btn').style.display = 'none';
+            } catch (e) {
+                alert('Cancel failed: ' + e.message);
+            }
+        });
+
+        // Download button
+        document.getElementById('karolina-download-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('karolina-download-btn');
+            const statusEl = document.getElementById('karolina-download-status');
+            const progressEl = document.getElementById('karolina-download-progress');
+            const progressBar = document.getElementById('karolina-download-bar');
+            const progressText = document.getElementById('karolina-download-text');
+            btn.disabled = true;
+            btn.textContent = 'Downloading...';
+            statusEl.style.display = 'none';
+            progressEl.style.display = 'block';
+            progressBar.style.width = '0%';
+            progressText.textContent = 'Starting download...';
+
+            try {
+                const result = await this.karolinaRunner.downloadResults(undefined, (data) => {
+                    const pct = data.bytes_total > 0
+                        ? Math.round(100 * data.bytes_done / data.bytes_total)
+                        : 0;
+                    progressBar.style.width = pct + '%';
+                    const doneMB = (data.bytes_done / 1048576).toFixed(1);
+                    const totalMB = (data.bytes_total / 1048576).toFixed(1);
+                    progressText.textContent = data.file
+                        ? `${doneMB} / ${totalMB} MB — ${data.file}`
+                        : `${doneMB} / ${totalMB} MB`;
+                });
+                progressBar.style.width = '100%';
+                progressText.textContent = 'Done';
+                statusEl.className = 'mesh-status converted';
+                statusEl.textContent = result.message;
+                statusEl.style.display = 'block';
+                // Refresh simulation list
+                await this.loadSimulationList();
+            } catch (e) {
+                statusEl.className = 'mesh-status error';
+                statusEl.textContent = 'Download failed: ' + e.message;
+                statusEl.style.display = 'block';
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Download Results';
+                setTimeout(() => { progressEl.style.display = 'none'; }, 2000);
+            }
+        });
     }
 
     setupSolverSettings() {
@@ -1368,6 +1726,8 @@ class App {
             const voltages = this.resultsData[timeIndex];
             this.viewer.updateVoltageColors(voltages);
         }
+
+        this.updateVoltagePlotTimeMarker(timeIndex);
     }
 
     async runSimulation() {
@@ -1459,6 +1819,15 @@ class App {
             return;
         }
 
+        // Branch on run target
+        if (this.runTarget === 'karolina') {
+            await this.runSimulationKarolina(statusEl, outputEl, runBtn);
+        } else {
+            await this.runSimulationLocal(statusEl, outputEl, runBtn);
+        }
+    }
+
+    async runSimulationLocal(statusEl, outputEl, runBtn) {
         const cancelBtn = document.getElementById('cancel-simulation');
 
         try {
@@ -1535,6 +1904,76 @@ class App {
         } finally {
             runBtn.disabled = false;
             cancelBtn.style.display = 'none';
+        }
+    }
+
+    async runSimulationKarolina(statusEl, outputEl, runBtn) {
+        const jobSection = document.getElementById('karolina-job-section');
+        const jobIdEl = document.getElementById('karolina-job-id');
+        const jobStatusEl = document.getElementById('karolina-job-status');
+        const cancelBtn = document.getElementById('karolina-cancel-btn');
+        const downloadBtn = document.getElementById('karolina-download-btn');
+        const logOutput = document.getElementById('karolina-log-output');
+
+        try {
+            runBtn.disabled = true;
+            statusEl.className = 'status visible running';
+            statusEl.textContent = 'Submitting to Karolina...';
+
+            const configFile = this.configManager.configFile || 'input_pepe36_colored.yml';
+            const options = {
+                config: configFile,
+                nodes: parseInt(document.getElementById('karolina-nodes').value) || 1,
+                ntasks_per_node: parseInt(document.getElementById('karolina-ntasks').value) || 128,
+                walltime: document.getElementById('karolina-walltime').value || '01:00:00',
+                partition: document.getElementById('karolina-partition').value || 'qcpu_exp',
+                account: document.getElementById('karolina-account').value || 'eu-26-11',
+                solver_backend: document.getElementById('solver-backend').value || 'petsc',
+            };
+
+            const result = await this.karolinaRunner.submit(options);
+
+            // Show job section
+            jobSection.style.display = 'block';
+            jobIdEl.textContent = result.job_id;
+            jobStatusEl.textContent = 'PENDING';
+            cancelBtn.style.display = 'inline-block';
+            downloadBtn.style.display = 'none';
+            logOutput.textContent = '';
+
+            statusEl.className = 'status visible success';
+            statusEl.textContent = `Job ${result.job_id} submitted!`;
+
+            // Start polling
+            this.karolinaRunner.startPolling((data) => {
+                jobStatusEl.textContent = data.status || '-';
+                if (data.log) {
+                    logOutput.textContent = data.log;
+                    logOutput.scrollTop = logOutput.scrollHeight;
+                }
+
+                // Style status
+                const s = data.status;
+                if (s === 'RUNNING') {
+                    jobStatusEl.style.color = '#4ade80';
+                } else if (s === 'PENDING') {
+                    jobStatusEl.style.color = '#fbbf24';
+                } else if (s === 'COMPLETED') {
+                    jobStatusEl.style.color = '#4ade80';
+                    cancelBtn.style.display = 'none';
+                    downloadBtn.style.display = 'inline-block';
+                    runBtn.disabled = false;
+                } else if (s === 'FAILED' || s === 'CANCELLED' || s === 'TIMEOUT' || s === 'OUT_OF_MEMORY') {
+                    jobStatusEl.style.color = '#e94560';
+                    cancelBtn.style.display = 'none';
+                    runBtn.disabled = false;
+                }
+            });
+
+        } catch (error) {
+            statusEl.className = 'status visible error';
+            statusEl.textContent = 'Submission failed: ' + error.message;
+            runBtn.disabled = false;
         }
     }
 
@@ -1634,6 +2073,117 @@ class App {
                 }, 2000);
             }
         });
+    }
+
+    // ==================== Voltage Time-Series Plot ====================
+
+    setupVoltagePlot() {
+        const ctx = document.getElementById('voltage-plot-canvas').getContext('2d');
+        this.voltagePlotChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    {
+                        label: 'Vm',
+                        data: [],
+                        borderColor: '#e74c3c',
+                        backgroundColor: 'rgba(231,76,60,0.08)',
+                        borderWidth: 1.5,
+                        pointRadius: 0,
+                        fill: false,
+                        tension: 0.3,
+                    },
+                    {
+                        label: 'Now',
+                        data: [],
+                        borderColor: '#f1c40f',
+                        backgroundColor: '#f1c40f',
+                        borderWidth: 0,
+                        pointRadius: 5,
+                        pointHoverRadius: 5,
+                        showLine: false,
+                    }
+                ]
+            },
+            options: {
+                animation: false,
+                responsive: false,
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        mode: 'index',
+                        intersect: false,
+                        callbacks: {
+                            title: (items) => `${items[0].parsed.x.toFixed(3)} ms`,
+                            label: (item) => {
+                                if (item.datasetIndex === 0) return `Vm: ${item.parsed.y.toFixed(2)} mV`;
+                                return null;
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    x: {
+                        type: 'linear',
+                        title: { display: true, text: 'Time (ms)', color: '#aaa', font: { size: 10 } },
+                        ticks: { color: '#aaa', font: { size: 9 }, maxTicksLimit: 6 },
+                        grid: { color: '#2a2a3a' },
+                    },
+                    y: {
+                        title: { display: true, text: 'Vm (mV)', color: '#aaa', font: { size: 10 } },
+                        ticks: { color: '#aaa', font: { size: 9 }, maxTicksLimit: 5 },
+                        grid: { color: '#2a2a3a' },
+                    }
+                }
+            }
+        });
+
+        document.getElementById('voltage-plot-close').addEventListener('click', () => {
+            this.hideVoltagePlot();
+        });
+    }
+
+    showVoltagePlot(vertexIdx, worldPos) {
+        if (!this.resultsData || !this.voltagePlotChart) return;
+
+        const times = this.resultsTimeSteps;
+        const series = this.resultsData.map(ts => ts[vertexIdx]);
+
+        this.voltagePlotChart.data.labels = times;
+        this.voltagePlotChart.data.datasets[0].data = series;
+
+        const currentIdx = parseInt(document.getElementById('result-time').value);
+        const markerData = new Array(times.length).fill(null);
+        if (currentIdx >= 0 && currentIdx < times.length) {
+            markerData[currentIdx] = series[currentIdx];
+        }
+        this.voltagePlotChart.data.datasets[1].data = markerData;
+        this.voltagePlotChart.update('none');
+
+        const x = worldPos.x.toFixed(1), y = worldPos.y.toFixed(1), z = worldPos.z.toFixed(1);
+        document.getElementById('voltage-plot-coords').textContent = `(${x}, ${y}, ${z}) μm`;
+
+        document.getElementById('voltage-plot-panel').style.display = 'block';
+    }
+
+    updateVoltagePlotTimeMarker(timeIndex) {
+        if (!this.voltagePlotChart || this.pickedVertexIndex === null || !this.resultsData) return;
+
+        const times = this.resultsTimeSteps;
+        const series = this.resultsData.map(ts => ts[this.pickedVertexIndex]);
+        const markerData = new Array(times.length).fill(null);
+        if (timeIndex >= 0 && timeIndex < times.length) {
+            markerData[timeIndex] = series[timeIndex];
+        }
+        this.voltagePlotChart.data.datasets[1].data = markerData;
+        this.voltagePlotChart.update('none');
+    }
+
+    hideVoltagePlot() {
+        document.getElementById('voltage-plot-panel').style.display = 'none';
+        this.pickedVertexIndex = null;
+        if (this.viewer) this.viewer.clearPickMarker();
     }
 
     setupIterationsChart() {

@@ -292,6 +292,8 @@ build_matrix_data_from_coo(
         mat_data.nonzeros.emplace_back(row_indices[i], col_indices[i], values[i]);
     }
 
+    mat_data.remove_zeros();
+
     return mat_data;
 }
 

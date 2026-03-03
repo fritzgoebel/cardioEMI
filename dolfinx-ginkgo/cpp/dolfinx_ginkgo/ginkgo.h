@@ -251,7 +251,7 @@ struct BDDCConfig {
     Scaling scaling = Scaling::STIFFNESS;
 
     // Local solver configuration
-    enum class LocalSolver { DIRECT, ILU, IC, AMG };
+    enum class LocalSolver { DIRECT, DIRECT_LU, ILU, IC, AMG };
     LocalSolver local_solver = LocalSolver::DIRECT;
     int local_max_iterations = 100;       ///< Max iterations for iterative local solver
     double local_tolerance = 1e-12;       ///< Tolerance for iterative local solver
@@ -283,7 +283,8 @@ struct BDDCConfig {
 
     // Advanced options
     bool repartition_coarse = true;       ///< Repartition coarse problem for load balance
-    bool constant_nullspace = false;      ///< Handle constant nullspace (pure Neumann BC)
+    bool constant_nullspace = false;      ///< Handle constant nullspace (pure Neumann BC) - per rank
+    bool coarse_constant_nullspace = false; ///< Constant nullspace for coarse BDDC level
 };
 
 /// Complete solver configuration

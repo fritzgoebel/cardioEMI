@@ -179,6 +179,7 @@ NB_MODULE(_cpp, m) {
 
     nb::enum_<BDDCConfig::LocalSolver>(bddc_config, "LocalSolver", "Local subdomain solver")
         .value("DIRECT", BDDCConfig::LocalSolver::DIRECT)
+        .value("DIRECT_LU", BDDCConfig::LocalSolver::DIRECT_LU)
         .value("ILU", BDDCConfig::LocalSolver::ILU)
         .value("IC", BDDCConfig::LocalSolver::IC)
         .value("AMG", BDDCConfig::LocalSolver::AMG)
@@ -232,7 +233,8 @@ NB_MODULE(_cpp, m) {
         .def_rw("coarse_tolerance", &BDDCConfig::coarse_tolerance)
         .def_rw("coarse_bddc_local_solver", &BDDCConfig::coarse_bddc_local_solver)
         .def_rw("repartition_coarse", &BDDCConfig::repartition_coarse)
-        .def_rw("constant_nullspace", &BDDCConfig::constant_nullspace);
+        .def_rw("constant_nullspace", &BDDCConfig::constant_nullspace)
+        .def_rw("coarse_constant_nullspace", &BDDCConfig::coarse_constant_nullspace);
 
     // =========================================================================
     // Solver Configuration
