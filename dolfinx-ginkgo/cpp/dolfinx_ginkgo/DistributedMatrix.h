@@ -464,6 +464,30 @@ create_dd_matrix_from_local_coo(
     return dd_mat;
 }
 
+/// Set a constant nullspace on a DdMatrix (for pure Neumann problems)
+///
+/// Must be called after read_distributed. Creates a constant vector
+/// as the nullspace, which enables proper handling of singular systems.
+///
+/// @param dd_mat The DdMatrix to set the nullspace on
+/// @param row_ranges Partition ranges used to create the distributed vector
+template<typename ValueType = double,
+         typename LocalIndexType = std::int32_t,
+         typename GlobalIndexType = std::int64_t>
+void set_dd_matrix_constant_null_space(
+    std::shared_ptr<gko_dist::DdMatrix<ValueType, LocalIndexType, GlobalIndexType>> dd_mat,
+    const std::vector<GlobalIndexType>& row_ranges)
+{
+    auto exec = dd_mat->get_executor();
+    auto gko_comm = std::make_shared<gko::experimental::mpi::communicator>(
+        dd_mat->get_communicator());
+
+    auto partition = create_partition_from_ranges<LocalIndexType, GlobalIndexType>(
+        exec->get_master(), row_ranges);
+
+    dd_mat->set_constant_null_space(partition);
+}
+
 /// Update values of an existing Ginkgo DdMatrix from local COO data
 ///
 /// Similar to create_dd_matrix_from_local_coo but updates an existing

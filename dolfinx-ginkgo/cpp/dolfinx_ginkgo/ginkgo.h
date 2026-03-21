@@ -261,6 +261,15 @@ struct BDDCConfig {
         unsigned int max_levels = 10;
         unsigned int min_coarse_rows = 50;
 
+        // Cycle type
+        enum class Cycle { V, W, F };
+        Cycle cycle = Cycle::V;
+
+        // Coarsening type
+        enum class Coarsening { PGM, HMIS };
+        Coarsening coarsening = Coarsening::PGM;
+        double strength_threshold = 0.25;  ///< HMIS strength-of-connection threshold (theta)
+
         enum class Smoother { JACOBI, GAUSS_SEIDEL, ILU };
         Smoother smoother = Smoother::JACOBI;
         unsigned int smooth_steps = 1;
@@ -310,6 +319,9 @@ struct SolverConfig {
 
     // BDDC configuration
     BDDCConfig bddc;
+
+    // Nullspace handling
+    bool pure_neumann = false;            ///< Set constant nullspace on DdMatrix (pure Neumann BC)
 
     // Output
     bool verbose = false;                 ///< Print convergence info

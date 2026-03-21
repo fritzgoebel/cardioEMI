@@ -213,6 +213,9 @@ def update_ginkgo_config():
             local_amg_config = bddc_config.get('localAmg', {})
             if local_amg_config:
                 bddc_dict['local_amg'] = {
+                    'coarsening': local_amg_config.get('coarsening', 'pgm'),
+                    'strength_threshold': float(local_amg_config.get('strengthThreshold', 0.25)),
+                    'cycle': local_amg_config.get('cycle', 'v'),
                     'smoother': local_amg_config.get('smoother', 'jacobi'),
                     'smooth_steps': int(local_amg_config.get('smoothSteps', 1)),
                     'max_levels': int(local_amg_config.get('maxLevels', 10)),

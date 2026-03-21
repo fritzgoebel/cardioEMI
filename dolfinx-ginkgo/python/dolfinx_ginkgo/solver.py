@@ -144,6 +144,7 @@ class GinkgoSolver:
         jacobi_block_size: int = 32,
         amg_config: Optional[dict] = None,
         bddc_config: Optional[dict] = None,
+        pure_neumann: bool = False,
         verbose: bool = False,
     ):
         # Import C++ bindings
@@ -195,6 +196,7 @@ class GinkgoSolver:
         config.max_iterations = max_iter
         config.krylov_dim = krylov_dim
         config.jacobi_block_size = jacobi_block_size
+        config.pure_neumann = pure_neumann
         config.verbose = verbose
 
         # Configure AMG if selected
@@ -366,6 +368,10 @@ class GinkgoSolver:
         self._A_petsc = None
         self._is_dd_matrix = True
 
+        # Set constant nullspace for pure Neumann problems
+        if self._config.pure_neumann:
+            _cpp.set_dd_matrix_constant_null_space(self._A_gko, row_ranges)
+
         if self._solver is None:
             self._solver = _cpp.DistributedSolver(self._exec, self._gko_comm, self._config)
         self._solver.set_operator_dd(self._A_gko)
@@ -499,6 +505,25 @@ class GinkgoSolver:
 
         if "min_coarse_rows" in cfg:
             local_amg.min_coarse_rows = cfg["min_coarse_rows"]
+
+        if "cycle" in cfg:
+            cycle_map = {"v": "V", "w": "W", "f": "F"}
+            cycle = cfg["cycle"].lower()
+            if cycle not in cycle_map:
+                raise ValueError(f"Unknown cycle type: {cfg['cycle']}. "
+                               f"Available: v, w, f")
+            local_amg.cycle = getattr(_cpp.BDDCConfig.LocalAMGConfig.Cycle, cycle_map[cycle])
+
+        if "coarsening" in cfg:
+            coarsening_map = {"pgm": "PGM", "hmis": "HMIS"}
+            coarsening = cfg["coarsening"].lower()
+            if coarsening not in coarsening_map:
+                raise ValueError(f"Unknown coarsening type: {cfg['coarsening']}. "
+                               f"Available: pgm, hmis")
+            local_amg.coarsening = getattr(_cpp.BDDCConfig.LocalAMGConfig.Coarsening, coarsening_map[coarsening])
+
+        if "strength_threshold" in cfg:
+            local_amg.strength_threshold = cfg["strength_threshold"]
 
         if "smoother" in cfg:
             smoother_map = {"jacobi": "JACOBI", "gauss_seidel": "GAUSS_SEIDEL", "ilu": "ILU"}

@@ -367,6 +367,27 @@
                             <!-- Local AMG Options (shown when AMG is selected as local solver) -->
                             <div id="bddc-local-amg-options" style="display: none; margin-left: 10px; border-left: 2px solid #444; padding-left: 10px;">
                                 <div class="param-row">
+                                    <label>Coarsening:</label>
+                                    <select id="bddc-local-amg-coarsening" class="mesh-dropdown">
+                                        <option value="pgm">PGM</option>
+                                        <option value="hmis">HMIS</option>
+                                    </select>
+                                </div>
+                                <div id="bddc-local-amg-hmis-options" style="display: none;">
+                                    <div class="param-row">
+                                        <label>Strength threshold:</label>
+                                        <input type="number" id="bddc-local-amg-strength-threshold" value="0.25" min="0.0" max="1.0" step="0.05">
+                                    </div>
+                                </div>
+                                <div class="param-row">
+                                    <label>Cycle:</label>
+                                    <select id="bddc-local-amg-cycle" class="mesh-dropdown">
+                                        <option value="v">V-cycle</option>
+                                        <option value="w">W-cycle</option>
+                                        <option value="f">F-cycle</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
                                     <label>Smoother:</label>
                                     <select id="bddc-local-amg-smoother" class="mesh-dropdown">
                                         <option value="jacobi">Jacobi</option>

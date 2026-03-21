@@ -532,7 +532,7 @@ if use_ginkgo:
             "faces": bddc_cfg.get("faces", True),
             "repartition_coarse": bddc_cfg.get("repartition_coarse", False),
             "constant_nullspace": local_nullspace,
-            "coarse_constant_nullspace": coarse_nullspace,
+            "coarse_constant_nullspace": False,
         }
         if comm.rank == 0:
             print(f"BDDC constant_nullspace: per-rank (coarse: {coarse_nullspace}, Dirichlet BCs: {Dirichletbc})")
@@ -545,6 +545,9 @@ if use_ginkgo:
                 "max_levels": int(local_amg_cfg.get("max_levels", 10)),
                 "coarse_solver": local_amg_cfg.get("coarse_solver", "direct"),
                 "relaxation_factor": float(local_amg_cfg.get("relaxation_factor", 0.9)),
+                "cycle": local_amg_cfg.get("cycle", "v"),
+                "coarsening": local_amg_cfg.get("coarsening", "pgm"),
+                "strength_threshold": float(local_amg_cfg.get("strength_threshold", 0.25)),
             }
 
     # Create Ginkgo solver (without matrix - set operator separately)
@@ -558,6 +561,7 @@ if use_ginkgo:
         max_iter=gko_max_iter,
         amg_config=amg_config,
         bddc_config=bddc_config,
+        pure_neumann=not Dirichletbc,
         verbose=params.get("verbose", False)
     )
 

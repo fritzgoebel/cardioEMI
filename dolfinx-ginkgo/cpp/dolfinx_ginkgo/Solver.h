@@ -248,7 +248,8 @@ private:
             case AMGConfig::Smoother::GAUSS_SEIDEL: {
                 schwarz_smoother = gko::share(schwarz_type::build()
                     .with_local_solver(
-                        gko::solver::LowerTrs<ValueType, LocalIndexType>::build())
+                        gko::preconditioner::GaussSeidel<ValueType, LocalIndexType>::build()
+                            .with_symmetric(true))
                     .on(exec_));
                 break;
             }
@@ -393,7 +394,8 @@ private:
                         break;
                     case BDDCConfig::LocalAMGConfig::Smoother::GAUSS_SEIDEL:
                         smoother_factory = gko::share(
-                            gko::solver::LowerTrs<ValueType, LocalIndexType>::build()
+                            gko::preconditioner::GaussSeidel<ValueType, LocalIndexType>::build()
+                                .with_symmetric(true)
                                 .on(exec_));
                         break;
                     case BDDCConfig::LocalAMGConfig::Smoother::ILU:
@@ -433,12 +435,37 @@ private:
                         break;
                 }
 
+                // Determine local AMG cycle type
+                gko::solver::multigrid::cycle local_cycle_type;
+                switch (amg_cfg.cycle) {
+                    case BDDCConfig::LocalAMGConfig::Cycle::V:
+                        local_cycle_type = gko::solver::multigrid::cycle::v; break;
+                    case BDDCConfig::LocalAMGConfig::Cycle::W:
+                        local_cycle_type = gko::solver::multigrid::cycle::w; break;
+                    case BDDCConfig::LocalAMGConfig::Cycle::F:
+                        local_cycle_type = gko::solver::multigrid::cycle::f; break;
+                }
+
+                // Determine local AMG coarsening
+                std::shared_ptr<gko::LinOpFactory> local_mg_level;
+                switch (amg_cfg.coarsening) {
+                    case BDDCConfig::LocalAMGConfig::Coarsening::PGM:
+                        local_mg_level = gko::share(gko::multigrid::Pgm<ValueType, LocalIndexType>::build().on(exec_));
+                        break;
+                    case BDDCConfig::LocalAMGConfig::Coarsening::HMIS:
+                        local_mg_level = gko::share(gko::multigrid::Hmis<ValueType, LocalIndexType>::build()
+                            .with_strength_threshold(amg_cfg.strength_threshold)
+                            .on(exec_));
+                        break;
+                }
+
                 local_solver_factory = gko::solver::Multigrid::build()
-                    .with_mg_level(gko::multigrid::Pgm<ValueType, LocalIndexType>::build())
+                    .with_mg_level(local_mg_level)
                     .with_pre_smoother(mg_smoother)
                     .with_coarsest_solver(mg_coarse_factory)
                     .with_max_levels(static_cast<gko::size_type>(amg_cfg.max_levels))
                     .with_min_coarse_rows(static_cast<gko::size_type>(amg_cfg.min_coarse_rows))
+                    .with_cycle(local_cycle_type)
                     .with_criteria(
                         gko::stop::Iteration::build()
                             .with_max_iters(static_cast<gko::size_type>(bddc_cfg.local_max_iterations)),
@@ -570,12 +597,35 @@ private:
                                 break;
                         }
 
+                        // Determine local AMG cycle type
+                        gko::solver::multigrid::cycle nested_cycle_type;
+                        switch (amg_cfg.cycle) {
+                            case BDDCConfig::LocalAMGConfig::Cycle::V:
+                                nested_cycle_type = gko::solver::multigrid::cycle::v; break;
+                            case BDDCConfig::LocalAMGConfig::Cycle::W:
+                                nested_cycle_type = gko::solver::multigrid::cycle::w; break;
+                            case BDDCConfig::LocalAMGConfig::Cycle::F:
+                                nested_cycle_type = gko::solver::multigrid::cycle::f; break;
+                        }
+
+                        // Determine local AMG coarsening
+                        std::shared_ptr<gko::LinOpFactory> nested_mg_level;
+                        switch (amg_cfg.coarsening) {
+                            case BDDCConfig::LocalAMGConfig::Coarsening::PGM:
+                                nested_mg_level = gko::share(gko::multigrid::Pgm<ValueType, LocalIndexType>::build().on(exec_));
+                                break;
+                            case BDDCConfig::LocalAMGConfig::Coarsening::HMIS:
+                                nested_mg_level = gko::share(gko::multigrid::Hmis<ValueType, LocalIndexType>::build().on(exec_));
+                                break;
+                        }
+
                         nested_local_solver_factory = gko::solver::Multigrid::build()
-                            .with_mg_level(gko::multigrid::Pgm<ValueType, LocalIndexType>::build())
+                            .with_mg_level(nested_mg_level)
                             .with_pre_smoother(mg_smoother)
                             .with_coarsest_solver(mg_coarse_factory)
                             .with_max_levels(static_cast<gko::size_type>(amg_cfg.max_levels))
                             .with_min_coarse_rows(static_cast<gko::size_type>(amg_cfg.min_coarse_rows))
+                            .with_cycle(nested_cycle_type)
                             .with_criteria(
                                 gko::stop::Iteration::build()
                                     .with_max_iters(static_cast<gko::size_type>(bddc_cfg.local_max_iterations)),
@@ -599,7 +649,11 @@ private:
                     .with_vertices(bddc_cfg.vertices)
                     .with_edges(bddc_cfg.edges)
                     .with_faces(bddc_cfg.faces)
-                    .with_constant_nullspace(bddc_cfg.coarse_constant_nullspace);
+                    ;
+                if (bddc_cfg.coarse_bddc_local_solver != BDDCConfig::LocalSolver::DIRECT &&
+                    bddc_cfg.coarse_bddc_local_solver != BDDCConfig::LocalSolver::DIRECT_LU) {
+                    nested_bddc_params.with_constant_nullspace(bddc_cfg.coarse_constant_nullspace);
+                }
                 if (bddc_cfg.coarse_bddc_local_solver == BDDCConfig::LocalSolver::DIRECT ||
                     bddc_cfg.coarse_bddc_local_solver == BDDCConfig::LocalSolver::DIRECT_LU) {
                     nested_bddc_params.with_reordering(
@@ -630,7 +684,11 @@ private:
             .with_faces(bddc_cfg.faces)
             .with_scaling(scaling)
             .with_repartition_coarse(bddc_cfg.repartition_coarse)
-            .with_constant_nullspace(bddc_cfg.constant_nullspace);
+            ;
+        if (bddc_cfg.local_solver != BDDCConfig::LocalSolver::DIRECT &&
+            bddc_cfg.local_solver != BDDCConfig::LocalSolver::DIRECT_LU) {
+            bddc_params.with_constant_nullspace(bddc_cfg.constant_nullspace);
+        }
         if (bddc_cfg.local_solver == BDDCConfig::LocalSolver::DIRECT ||
             bddc_cfg.local_solver == BDDCConfig::LocalSolver::DIRECT_LU) {
             bddc_params.with_reordering(

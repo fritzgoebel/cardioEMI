@@ -776,6 +776,9 @@ class App {
                     faces: true,
                     repartitionCoarse: true,
                     localAmg: {
+                        coarsening: 'pgm',
+                        strengthThreshold: 0.25,
+                        cycle: 'v',
                         smoother: 'jacobi',
                         smoothSteps: 1,
                         maxLevels: 10,
@@ -939,6 +942,20 @@ class App {
         });
 
         // BDDC local AMG options
+        const bddcLocalAmgHmisOptions = document.getElementById('bddc-local-amg-hmis-options');
+        document.getElementById('bddc-local-amg-coarsening').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localAmg.coarsening = e.target.value;
+            bddcLocalAmgHmisOptions.style.display = e.target.value === 'hmis' ? 'block' : 'none';
+        });
+
+        document.getElementById('bddc-local-amg-strength-threshold').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localAmg.strengthThreshold = parseFloat(e.target.value);
+        });
+
+        document.getElementById('bddc-local-amg-cycle').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localAmg.cycle = e.target.value;
+        });
+
         document.getElementById('bddc-local-amg-smoother').addEventListener('change', (e) => {
             this.solverConfig.ginkgo.bddc.localAmg.smoother = e.target.value;
         });
@@ -1803,6 +1820,9 @@ class App {
                         faces: document.getElementById('bddc-faces').checked,
                         repartitionCoarse: document.getElementById('bddc-repartition-coarse').checked,
                         localAmg: {
+                            coarsening: document.getElementById('bddc-local-amg-coarsening').value,
+                            strengthThreshold: parseFloat(document.getElementById('bddc-local-amg-strength-threshold').value),
+                            cycle: document.getElementById('bddc-local-amg-cycle').value,
                             smoother: document.getElementById('bddc-local-amg-smoother').value,
                             smoothSteps: parseInt(document.getElementById('bddc-local-amg-smooth-steps').value),
                             maxLevels: parseInt(document.getElementById('bddc-local-amg-max-levels').value),

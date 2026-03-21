@@ -195,6 +195,17 @@ NB_MODULE(_cpp, m) {
     nb::class_<BDDCConfig::LocalAMGConfig> local_amg_config(bddc_config, "LocalAMGConfig",
         "AMG configuration for local subdomain solver");
 
+    nb::enum_<BDDCConfig::LocalAMGConfig::Cycle>(local_amg_config, "Cycle", "Multigrid cycle type")
+        .value("V", BDDCConfig::LocalAMGConfig::Cycle::V)
+        .value("W", BDDCConfig::LocalAMGConfig::Cycle::W)
+        .value("F", BDDCConfig::LocalAMGConfig::Cycle::F)
+        .export_values();
+
+    nb::enum_<BDDCConfig::LocalAMGConfig::Coarsening>(local_amg_config, "Coarsening", "Coarsening type")
+        .value("PGM", BDDCConfig::LocalAMGConfig::Coarsening::PGM)
+        .value("HMIS", BDDCConfig::LocalAMGConfig::Coarsening::HMIS)
+        .export_values();
+
     nb::enum_<BDDCConfig::LocalAMGConfig::Smoother>(local_amg_config, "Smoother", "Smoother type")
         .value("JACOBI", BDDCConfig::LocalAMGConfig::Smoother::JACOBI)
         .value("GAUSS_SEIDEL", BDDCConfig::LocalAMGConfig::Smoother::GAUSS_SEIDEL)
@@ -212,6 +223,9 @@ NB_MODULE(_cpp, m) {
         .def(nb::init<>())
         .def_rw("max_levels", &BDDCConfig::LocalAMGConfig::max_levels)
         .def_rw("min_coarse_rows", &BDDCConfig::LocalAMGConfig::min_coarse_rows)
+        .def_rw("cycle", &BDDCConfig::LocalAMGConfig::cycle)
+        .def_rw("coarsening", &BDDCConfig::LocalAMGConfig::coarsening)
+        .def_rw("strength_threshold", &BDDCConfig::LocalAMGConfig::strength_threshold)
         .def_rw("smoother", &BDDCConfig::LocalAMGConfig::smoother)
         .def_rw("smooth_steps", &BDDCConfig::LocalAMGConfig::smooth_steps)
         .def_rw("relaxation_factor", &BDDCConfig::LocalAMGConfig::relaxation_factor)
@@ -252,6 +266,7 @@ NB_MODULE(_cpp, m) {
         .def_rw("ilu_fill_level", &SolverConfig::ilu_fill_level)
         .def_rw("amg", &SolverConfig::amg)
         .def_rw("bddc", &SolverConfig::bddc)
+        .def_rw("pure_neumann", &SolverConfig::pure_neumann)
         .def_rw("verbose", &SolverConfig::verbose);
 
     // =========================================================================
@@ -423,6 +438,16 @@ NB_MODULE(_cpp, m) {
           nb::arg("row_indices"), nb::arg("col_indices"), nb::arg("values"),
           nb::arg("row_ranges"),
           "Update Ginkgo DdMatrix values from local COO data");
+
+    m.def("set_dd_matrix_constant_null_space",
+          [](std::shared_ptr<gko_dist::DdMatrix<double, std::int32_t, std::int64_t>> dd_mat,
+             nb::ndarray<std::int64_t, nb::ndim<1>, nb::c_contig> row_ranges) {
+              std::vector<std::int64_t> ranges(row_ranges.data(),
+                                                row_ranges.data() + row_ranges.size());
+              set_dd_matrix_constant_null_space(dd_mat, ranges);
+          },
+          nb::arg("dd_mat"), nb::arg("row_ranges"),
+          "Set constant nullspace on DdMatrix for pure Neumann problems");
 
     // =========================================================================
     // Apply (SpMV) Functions
