@@ -520,6 +520,89 @@ void test_amg_vs_jacobi_2d(MPI_Comm comm)
     }
 }
 
+/// Test MUMPS direct solver on a local SPD matrix
+void test_mumps_direct(MPI_Comm comm)
+{
+    int rank;
+    MPI_Comm_rank(comm, &rank);
+
+    if (rank == 0) {
+        std::cout << "\n--- Test: MUMPS Direct Solver ---" << std::endl;
+    }
+
+    auto exec = gko::ReferenceExecutor::create();
+
+    // Create a small local SPD matrix (1D Laplacian, 50 DOFs)
+    const int n = 50;
+    // Build tridiagonal: 2 on diagonal, -1 off-diagonal
+    std::vector<int> row_ptrs(n + 1);
+    std::vector<int> col_idxs;
+    std::vector<double> vals;
+
+    for (int i = 0; i < n; ++i) {
+        row_ptrs[i] = static_cast<int>(col_idxs.size());
+        if (i > 0) {
+            col_idxs.push_back(i - 1);
+            vals.push_back(-1.0);
+        }
+        col_idxs.push_back(i);
+        vals.push_back(2.0);
+        if (i < n - 1) {
+            col_idxs.push_back(i + 1);
+            vals.push_back(-1.0);
+        }
+    }
+    row_ptrs[n] = static_cast<int>(col_idxs.size());
+
+    // Create arrays that own their data
+    gko::array<double> val_arr(exec, vals.begin(), vals.end());
+    gko::array<int> col_arr(exec, col_idxs.begin(), col_idxs.end());
+    gko::array<int> row_arr(exec, row_ptrs.begin(), row_ptrs.end());
+    auto local_mtx = gko::matrix::Csr<double, int>::create(
+        exec, gko::dim<2>(n, n),
+        std::move(val_arr), std::move(col_arr), std::move(row_arr));
+
+    // Create RHS: b = A * [1, 1, ..., 1]
+    auto x_exact = gko::matrix::Dense<double>::create(exec, gko::dim<2>(n, 1));
+    for (int i = 0; i < n; ++i) {
+        x_exact->at(i, 0) = 1.0;
+    }
+    auto b_local = gko::matrix::Dense<double>::create(exec, gko::dim<2>(n, 1));
+    local_mtx->apply(x_exact, b_local);
+
+    // Create solution vector (zero initial guess)
+    auto x_sol = gko::matrix::Dense<double>::create(exec, gko::dim<2>(n, 1));
+    for (int i = 0; i < n; ++i) {
+        x_sol->at(i, 0) = 0.0;
+    }
+
+    // Solve with MUMPS (symmetric since matrix is SPD)
+    auto mumps_factory = gko::experimental::solver::Mumps<double, int>::build()
+        .with_symmetric(true)
+        .on(exec);
+    auto mumps_solver = mumps_factory->generate(gko::share(local_mtx->clone()));
+    mumps_solver->apply(b_local, x_sol);
+
+    // Compute error
+    double max_err = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double err = std::abs(x_sol->at(i, 0) - 1.0);
+        max_err = std::max(max_err, err);
+    }
+
+    // Print from all ranks to diagnose issues
+    std::cout << "  [Rank " << rank << "] Matrix size: " << n << "x" << n
+              << ", Solution error: " << max_err << std::endl;
+
+    MPI_Barrier(comm);
+
+    assert(max_err < 1e-8);
+
+    if (rank == 0) {
+        std::cout << "  [OK]" << std::endl;
+    }
+}
+
 /// Compare Ginkgo solver to PETSc KSP
 void test_vs_petsc(MPI_Comm comm, Mat A, Vec b, Vec x)
 {
@@ -624,6 +707,9 @@ int main(int argc, char* argv[])
     test_cg_jacobi(comm, A, b, x);
     test_cg_block_jacobi(comm, A, b, x);
     test_vs_petsc(comm, A, b, x);
+
+    // Run MUMPS direct solver test
+    test_mumps_direct(comm);
 
     // Run AMG tests on 1D Laplacian
     test_cg_amg_vcycle(comm, A, b, x);

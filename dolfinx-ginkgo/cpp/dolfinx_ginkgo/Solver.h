@@ -338,18 +338,14 @@ private:
         std::shared_ptr<gko::LinOpFactory> local_solver_factory;
         switch (bddc_cfg.local_solver) {
             case BDDCConfig::LocalSolver::DIRECT: {
-                // Use Cholesky factorization for SPD local problems
-                local_solver_factory = gko::experimental::solver::Direct<ValueType, LocalIndexType>::build()
-                    .with_factorization(
-                        gko::experimental::factorization::Cholesky<ValueType, LocalIndexType>::build())
+                // Use MUMPS direct solver for SPD local problems
+                local_solver_factory = gko::experimental::solver::Mumps<ValueType, LocalIndexType>::build()
                     .on(exec_);
                 break;
             }
             case BDDCConfig::LocalSolver::DIRECT_LU: {
-                // Use LU factorization for general (non-SPD) local problems
-                local_solver_factory = gko::experimental::solver::Direct<ValueType, LocalIndexType>::build()
-                    .with_factorization(
-                        gko::experimental::factorization::Lu<ValueType, LocalIndexType>::build())
+                // Use MUMPS direct solver for general (non-SPD) local problems
+                local_solver_factory = gko::experimental::solver::Mumps<ValueType, LocalIndexType>::build()
                     .on(exec_);
                 break;
             }
@@ -413,9 +409,7 @@ private:
                 std::shared_ptr<gko::LinOpFactory> mg_coarse_factory;
                 switch (amg_cfg.coarse_solver) {
                     case BDDCConfig::LocalAMGConfig::CoarseSolver::DIRECT:
-                        mg_coarse_factory = gko::experimental::solver::Direct<ValueType, LocalIndexType>::build()
-                            .with_factorization(
-                                gko::experimental::factorization::Cholesky<ValueType, LocalIndexType>::build())
+                        mg_coarse_factory = gko::experimental::solver::Mumps<ValueType, LocalIndexType>::build()
                             .on(exec_);
                         break;
                     case BDDCConfig::LocalAMGConfig::CoarseSolver::CG:
@@ -505,16 +499,12 @@ private:
                 std::shared_ptr<gko::LinOpFactory> nested_local_solver_factory;
                 switch (bddc_cfg.coarse_bddc_local_solver) {
                     case BDDCConfig::LocalSolver::DIRECT: {
-                        nested_local_solver_factory = gko::experimental::solver::Direct<ValueType, LocalIndexType>::build()
-                            .with_factorization(
-                                gko::experimental::factorization::Cholesky<ValueType, LocalIndexType>::build())
+                        nested_local_solver_factory = gko::experimental::solver::Mumps<ValueType, LocalIndexType>::build()
                             .on(exec_);
                         break;
                     }
                     case BDDCConfig::LocalSolver::DIRECT_LU: {
-                        nested_local_solver_factory = gko::experimental::solver::Direct<ValueType, LocalIndexType>::build()
-                            .with_factorization(
-                                gko::experimental::factorization::Lu<ValueType, LocalIndexType>::build())
+                        nested_local_solver_factory = gko::experimental::solver::Mumps<ValueType, LocalIndexType>::build()
                             .on(exec_);
                         break;
                     }
@@ -575,9 +565,7 @@ private:
                         std::shared_ptr<gko::LinOpFactory> mg_coarse_factory;
                         switch (amg_cfg.coarse_solver) {
                             case BDDCConfig::LocalAMGConfig::CoarseSolver::DIRECT:
-                                mg_coarse_factory = gko::experimental::solver::Direct<ValueType, LocalIndexType>::build()
-                                    .with_factorization(
-                                        gko::experimental::factorization::Cholesky<ValueType, LocalIndexType>::build())
+                                mg_coarse_factory = gko::experimental::solver::Mumps<ValueType, LocalIndexType>::build()
                                     .on(exec_);
                                 break;
                             case BDDCConfig::LocalAMGConfig::CoarseSolver::CG:
@@ -654,11 +642,6 @@ private:
                     bddc_cfg.coarse_bddc_local_solver != BDDCConfig::LocalSolver::DIRECT_LU) {
                     nested_bddc_params.with_constant_nullspace(bddc_cfg.coarse_constant_nullspace);
                 }
-                if (bddc_cfg.coarse_bddc_local_solver == BDDCConfig::LocalSolver::DIRECT ||
-                    bddc_cfg.coarse_bddc_local_solver == BDDCConfig::LocalSolver::DIRECT_LU) {
-                    nested_bddc_params.with_reordering(
-                        gko::share(gko::experimental::reorder::Amd<LocalIndexType>::build().on(exec_)));
-                }
                 coarse_solver_factory = nested_bddc_params.on(exec_);
                 break;
             }
@@ -688,11 +671,6 @@ private:
         if (bddc_cfg.local_solver != BDDCConfig::LocalSolver::DIRECT &&
             bddc_cfg.local_solver != BDDCConfig::LocalSolver::DIRECT_LU) {
             bddc_params.with_constant_nullspace(bddc_cfg.constant_nullspace);
-        }
-        if (bddc_cfg.local_solver == BDDCConfig::LocalSolver::DIRECT ||
-            bddc_cfg.local_solver == BDDCConfig::LocalSolver::DIRECT_LU) {
-            bddc_params.with_reordering(
-                gko::share(gko::experimental::reorder::Amd<LocalIndexType>::build().on(exec_)));
         }
         return bddc_params.on(exec_);
     }
