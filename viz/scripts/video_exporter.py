@@ -258,13 +258,13 @@ class VideoExporter:
         # Create offscreen plotter with proper configuration
         plotter = pv.Plotter(off_screen=True, window_size=resolution, lighting='three_lights')
 
-        # Configure camera if provided
+        # Determine camera position (saved and re-applied after each plotter.clear())
         if camera_config:
-            pos = camera_config.get('position', [200, 150, 200])
-            target = camera_config.get('target', [50, 30, 40])
-            up = camera_config.get('up', [0, 1, 0])
-
-            plotter.camera_position = [pos, target, up]
+            cam_position = [
+                camera_config.get('position', [200, 150, 200]),
+                camera_config.get('target', [50, 30, 40]),
+                camera_config.get('up', [0, 1, 0])
+            ]
         else:
             # Default camera based on mesh bounds
             bounds = self.metadata.get('bounds', {})
@@ -278,11 +278,13 @@ class VideoExporter:
                 bounds.get('y', [0, 100])[1] - bounds.get('y', [0, 100])[0],
                 bounds.get('z', [0, 100])[1] - bounds.get('z', [0, 100])[0],
             )
-            plotter.camera_position = [
+            cam_position = [
                 [center[0] + extent, center[1] + extent * 0.5, center[2] + extent],
                 center,
                 [0, 1, 0]
             ]
+
+        plotter.camera_position = cam_position
 
         # Prepare video writer
         timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -298,6 +300,9 @@ class VideoExporter:
                 # Render
                 plotter.clear()
                 plotter.add_mesh(mesh, scalars='colors', rgb=True, show_scalar_bar=False)
+
+                # Restore camera after clear() resets it
+                plotter.camera_position = cam_position
 
                 # Add time annotation
                 plotter.add_text(f"t = {time:.3f} ms", position='upper_left',

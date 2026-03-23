@@ -16,6 +16,11 @@ class App {
             zMin: -20, zMax: 118
         };
 
+        // Scar tissue state (in micrometers)
+        this.scarEnabled = false;
+        this.scarBox = { xMin: 0, xMax: 0, yMin: 0, yMax: 0, zMin: 0, zMax: 0 };
+        this.scarMargin = 10; // um
+
         // Simulation parameters
         this.dt = 0.001;
         this.timeSteps = 1000;
@@ -49,6 +54,7 @@ class App {
         // Voltage time-series plot
         this.voltagePlotChart = null;
         this.pickedVertexIndex = null;
+        this._pickedVertexSeries = null;
 
         // MPI partition data
         this.ranksData = null;
@@ -105,6 +111,7 @@ class App {
             this.setupButtons();
             this.setupCheckboxes();
             this.setupColormapSelector();
+            this.setupScarControls();
             this.setupResultsControls();
             this.setupVideoExport();
             this.setupIterationsChart();
@@ -114,10 +121,13 @@ class App {
             // Setup vertex picking
             this.viewer.setupPickingHandler();
             this.viewer.onVertexPicked = (vertexIdx, worldPos) => {
-                if (!this.resultsData) return;
+                if (!this.resultsVizDir) return;
                 this.pickedVertexIndex = vertexIdx;
                 this.showVoltagePlot(vertexIdx, worldPos);
             };
+
+            // Load config from YAML and populate form
+            await this.loadConfigFromYaml();
 
             // Initial update
             this.updateVinitExpression();
@@ -246,25 +256,37 @@ class App {
                     selector.innerHTML = '<option value="">No converted meshes on Karolina</option>';
                 }
 
-                // Show unconverted meshes with convert buttons
+                // Show unconverted meshes as dropdown with convert button
                 if (unconverted.length > 0) {
                     remoteConvertArea.style.display = 'block';
-                    remoteConvertArea.innerHTML = '<div style="font-size:0.85em; color:#888; margin-bottom:4px;">Unconverted meshes:</div>';
+                    remoteConvertArea.innerHTML = '';
+                    const row = document.createElement('div');
+                    row.style.cssText = 'display:flex; align-items:center; gap:6px; font-size:0.85em;';
+                    const label = document.createElement('label');
+                    label.textContent = 'Unconverted:';
+                    label.style.color = '#888';
+                    row.appendChild(label);
+                    const sel = document.createElement('select');
+                    sel.className = 'mesh-dropdown';
+                    sel.id = 'unconverted-mesh-selector';
+                    sel.style.flex = '1';
                     for (const item of unconverted) {
-                        const row = document.createElement('div');
-                        row.style.cssText = 'display:flex; align-items:center; gap:6px; margin-bottom:4px; font-size:0.85em;';
-                        const nameSpan = document.createElement('span');
+                        const opt = document.createElement('option');
                         const displayName = item.color ? item.mesh.name + '_colored' : item.mesh.name;
-                        nameSpan.textContent = displayName;
-                        nameSpan.style.minWidth = '80px';
-                        row.appendChild(nameSpan);
-                        const btn = document.createElement('button');
-                        btn.textContent = 'Convert on Karolina';
-                        btn.className = 'btn-small';
-                        btn.addEventListener('click', () => this.convertRemoteMeshAndRefresh(item.family, item.mesh, item.color));
-                        row.appendChild(btn);
-                        remoteConvertArea.appendChild(row);
+                        opt.value = JSON.stringify({ family: item.family, mesh: item.mesh, color: item.color });
+                        opt.textContent = displayName;
+                        sel.appendChild(opt);
                     }
+                    row.appendChild(sel);
+                    const btn = document.createElement('button');
+                    btn.textContent = 'Convert';
+                    btn.className = 'btn-small';
+                    btn.addEventListener('click', () => {
+                        const val = JSON.parse(sel.value);
+                        this.convertRemoteMeshAndRefresh(val.family, val.mesh, val.color);
+                    });
+                    row.appendChild(btn);
+                    remoteConvertArea.appendChild(row);
                 }
             } catch (e) {
                 selector.innerHTML = '<option value="">Failed to load remote meshes</option>';
@@ -541,6 +563,150 @@ class App {
         });
     }
 
+    setupScarControls() {
+        const enabledCb = document.getElementById('scar-enabled');
+        const controls = document.getElementById('scar-controls');
+        const showBoxCb = document.getElementById('show-scar-box');
+        const marginSlider = document.getElementById('scar-margin');
+        const marginVal = document.getElementById('scar-margin-val');
+
+        enabledCb.addEventListener('change', () => {
+            this.scarEnabled = enabledCb.checked;
+            controls.style.display = this.scarEnabled ? 'block' : 'none';
+            showBoxCb.checked = this.scarEnabled;
+            this.onScarChange();
+        });
+
+        showBoxCb.addEventListener('change', () => {
+            if (this.viewer) {
+                this.viewer.setScarBoxVisible(showBoxCb.checked);
+            }
+        });
+
+        marginSlider.addEventListener('input', () => {
+            this.scarMargin = parseFloat(marginSlider.value);
+            marginVal.textContent = this.scarMargin;
+            this.onScarChange();
+        });
+
+        // Scar bounding box sliders (same pattern as excitation box)
+        const axes = ['x', 'y', 'z'];
+        axes.forEach(axis => {
+            const minSlider = document.getElementById(`scar-${axis}-min`);
+            const maxSlider = document.getElementById(`scar-${axis}-max`);
+            const minValEl = document.getElementById(`scar-${axis}-min-val`);
+            const maxValEl = document.getElementById(`scar-${axis}-max-val`);
+
+            const bounds = this.meshBounds[axis];
+            const range = bounds[1] - bounds[0];
+            const center = (bounds[0] + bounds[1]) / 2;
+            const quarter = range / 4;
+
+            minSlider.min = bounds[0];
+            minSlider.max = bounds[1];
+            minSlider.step = range / 200;
+            // Default to center quarter of mesh
+            this.scarBox[`${axis}Min`] = center - quarter;
+            this.scarBox[`${axis}Max`] = center + quarter;
+            minSlider.value = this.scarBox[`${axis}Min`];
+
+            maxSlider.min = bounds[0];
+            maxSlider.max = bounds[1];
+            maxSlider.step = range / 200;
+            maxSlider.value = this.scarBox[`${axis}Max`];
+
+            minValEl.textContent = parseFloat(minSlider.value).toFixed(1);
+            maxValEl.textContent = parseFloat(maxSlider.value).toFixed(1);
+
+            minSlider.addEventListener('input', () => {
+                const val = parseFloat(minSlider.value);
+                this.scarBox[`${axis}Min`] = val;
+                minValEl.textContent = val.toFixed(1);
+                this.onScarChange();
+            });
+            maxSlider.addEventListener('input', () => {
+                const val = parseFloat(maxSlider.value);
+                this.scarBox[`${axis}Max`] = val;
+                maxValEl.textContent = val.toFixed(1);
+                this.onScarChange();
+            });
+        });
+
+        // Conductivity inputs trigger preview update
+        ['scar-si-dense', 'scar-se-dense', 'scar-si-border', 'scar-se-border'].forEach(id => {
+            document.getElementById(id).addEventListener('input', () => this.onScarChange());
+        });
+    }
+
+    onScarChange() {
+        if (this.viewer) {
+            this.viewer.updateScarBox(this.scarBox, this.scarMargin, this.scarEnabled);
+            // Update scar zone mask for desaturation
+            this.viewer.setScarZones(this.scarBox, this.scarMargin, this.scarEnabled);
+
+            // Re-render current results with desaturation, or preview on resting mesh
+            if (this.resultsVizDir) {
+                const idx = parseInt(document.getElementById('result-time').value);
+                this.showResultsAtTime(idx);
+            } else if (this.scarEnabled) {
+                this.viewer.highlightScarZones(this.scarBox, this.scarMargin);
+            }
+        }
+    }
+
+    _updateScarSlidersFromConfig(region) {
+        const box = region.box;
+        const margin = region.margin || 10;
+
+        // Update sliders and display values
+        ['x', 'y', 'z'].forEach(axis => {
+            const minSlider = document.getElementById(`scar-${axis}-min`);
+            const maxSlider = document.getElementById(`scar-${axis}-max`);
+            const minValEl = document.getElementById(`scar-${axis}-min-val`);
+            const maxValEl = document.getElementById(`scar-${axis}-max-val`);
+
+            minSlider.value = box[`${axis}Min`];
+            maxSlider.value = box[`${axis}Max`];
+            minValEl.textContent = box[`${axis}Min`].toFixed(1);
+            maxValEl.textContent = box[`${axis}Max`].toFixed(1);
+        });
+
+        document.getElementById('scar-margin').value = margin;
+        document.getElementById('scar-margin-val').textContent = margin;
+
+        // Update conductivity inputs if present
+        const dense = region.dense;
+        const border = region.border;
+        if (dense) {
+            document.getElementById('scar-si-dense').value = dense.sigma_i;
+            document.getElementById('scar-se-dense').value = dense.sigma_e;
+        }
+        if (border) {
+            document.getElementById('scar-si-border').value = border.sigma_i;
+            document.getElementById('scar-se-border').value = border.sigma_e;
+        }
+    }
+
+    getScarConfig() {
+        if (!this.scarEnabled) return null;
+        return {
+            regions: [{
+                box: { ...this.scarBox },
+                margin: this.scarMargin,
+                dense: {
+                    sigma_i: parseFloat(document.getElementById('scar-si-dense').value),
+                    sigma_e: parseFloat(document.getElementById('scar-se-dense').value),
+                },
+                border: {
+                    sigma_i: parseFloat(document.getElementById('scar-si-border').value),
+                    sigma_e: parseFloat(document.getElementById('scar-se-border').value),
+                },
+            }],
+            healthy: { sigma_i: 4.0, sigma_e: 20.0 },
+            conversionFactor: this.conversionFactor,
+        };
+    }
+
     setupSimulationParams() {
         const dtInput = document.getElementById('dt');
         const stepsInput = document.getElementById('time-steps');
@@ -615,12 +781,16 @@ class App {
                     statusDot.style.color = '#e94560';
                     statusDot.title = 'SSH check failed';
                 }
+                document.getElementById('download-karolina-results').style.display = 'block';
+                // Refresh sim list to include remote sims
+                this.loadSimulationList();
             } else {
                 karolinaOptions.style.display = 'none';
                 containerStatusRow.style.display = 'none';
                 statusDot.style.display = 'none';
                 refreshBtn.style.display = 'none';
                 mpiRanksRow.style.display = 'flex';
+                document.getElementById('download-karolina-results').style.display = 'none';
                 // Refresh mesh list with local meshes
                 this.refreshMeshList();
             }
@@ -740,6 +910,55 @@ class App {
                 setTimeout(() => { progressEl.style.display = 'none'; }, 2000);
             }
         });
+    }
+
+    async downloadKarolinaSimulation() {
+        const simName = document.getElementById('simulation-selector').value;
+        if (!simName) {
+            alert('Please select a simulation first');
+            return;
+        }
+
+        const btn = document.getElementById('download-karolina-results');
+        const statusEl = document.getElementById('results-status');
+        const progressEl = document.getElementById('results-download-progress');
+        const progressBar = document.getElementById('results-download-bar');
+        const progressText = document.getElementById('results-download-text');
+
+        btn.disabled = true;
+        btn.textContent = 'Downloading...';
+        statusEl.style.display = 'none';
+        progressEl.style.display = 'block';
+        progressBar.style.width = '0%';
+        progressText.textContent = 'Starting download...';
+
+        try {
+            const result = await this.karolinaRunner.downloadResults(simName, (data) => {
+                const pct = data.bytes_total > 0
+                    ? Math.round(100 * data.bytes_done / data.bytes_total)
+                    : 0;
+                progressBar.style.width = pct + '%';
+                const doneMB = (data.bytes_done / 1048576).toFixed(1);
+                const totalMB = (data.bytes_total / 1048576).toFixed(1);
+                progressText.textContent = data.file
+                    ? `${doneMB} / ${totalMB} MB — ${data.file}`
+                    : `${doneMB} / ${totalMB} MB`;
+            });
+            progressBar.style.width = '100%';
+            progressText.textContent = 'Done';
+            statusEl.className = 'mesh-status converted';
+            statusEl.textContent = result.message;
+            statusEl.style.display = 'block';
+            await this.loadSimulationList();
+        } catch (e) {
+            statusEl.className = 'mesh-status error';
+            statusEl.textContent = 'Download failed: ' + e.message;
+            statusEl.style.display = 'block';
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Download from Karolina';
+            setTimeout(() => { progressEl.style.display = 'none'; }, 2000);
+        }
     }
 
     setupSolverSettings() {
@@ -1113,8 +1332,12 @@ class App {
 
         loadBtn.addEventListener('click', () => this.loadResults());
 
+        // Karolina download button in results section
+        const dlBtn = document.getElementById('download-karolina-results');
+        dlBtn.addEventListener('click', () => this.downloadKarolinaSimulation());
+
         timeSlider.addEventListener('input', () => {
-            if (this.resultsData && this.resultsTimeSteps.length > 0) {
+            if (this.resultsVizDir && this.resultsTimeSteps && this.resultsTimeSteps.length > 0) {
                 const idx = parseInt(timeSlider.value);
                 const time = this.resultsTimeSteps[idx];
                 timeVal.textContent = time.toFixed(3);
@@ -1134,8 +1357,10 @@ class App {
         const simSelector = document.getElementById('simulation-selector');
 
         try {
+            // Fetch local simulations
             const response = await fetch('/api/simulations');
             const data = await response.json();
+            const localNames = new Set(data.simulations.map(s => s.name));
 
             simSelector.innerHTML = '<option value="">Select simulation...</option>';
 
@@ -1145,6 +1370,26 @@ class App {
                 option.textContent = sim.name + (sim.has_viz_data ? '' : ' (will generate viz data)');
                 simSelector.appendChild(option);
             });
+
+            // If in Karolina mode, also fetch remote simulations
+            if (this.runTarget === 'karolina') {
+                try {
+                    const remoteResp = await fetch('/api/karolina/remote-simulations');
+                    const remoteData = await remoteResp.json();
+                    if (remoteData.simulations) {
+                        for (const name of remoteData.simulations) {
+                            if (!localNames.has(name)) {
+                                const option = document.createElement('option');
+                                option.value = name;
+                                option.textContent = name + ' (remote)';
+                                simSelector.appendChild(option);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Failed to load remote simulations:', e);
+                }
+            }
 
             // Select first simulation by default if available
             if (data.simulations.length > 0) {
@@ -1551,8 +1796,7 @@ class App {
     }
 
     updateVinitExpression() {
-        const expr = this.generateVinitExpression();
-        document.getElementById('v-init-preview').textContent = expr;
+        // Expression is generated on demand when running simulation
     }
 
     generateVinitExpression() {
@@ -1600,6 +1844,57 @@ class App {
         }
     }
 
+    async _generateVizData(simName, statusEl) {
+        /**
+         * Run viz data generation via SSE endpoint, showing progress.
+         * Returns true on success, throws on error.
+         */
+        return new Promise((resolve, reject) => {
+            // EventSource doesn't support POST, so use fetch + ReadableStream
+            fetch('/api/generate-viz', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ dir: simName }),
+            }).then(response => {
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                const pump = () => {
+                    reader.read().then(({ done, value }) => {
+                        if (done) {
+                            reject(new Error('Stream ended without completion'));
+                            return;
+                        }
+                        buffer += decoder.decode(value, { stream: true });
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop(); // keep incomplete line
+
+                        for (const line of lines) {
+                            if (!line.startsWith('data: ')) continue;
+                            try {
+                                const event = JSON.parse(line.slice(6));
+                                if (event.type === 'progress') {
+                                    statusEl.className = 'mesh-status';
+                                    statusEl.textContent = `Generating viz data... ${event.percent}% - ${event.message}`;
+                                    statusEl.style.display = 'block';
+                                } else if (event.type === 'complete') {
+                                    resolve(true);
+                                    return;
+                                } else if (event.type === 'error') {
+                                    reject(new Error(event.message));
+                                    return;
+                                }
+                            } catch (e) { /* skip malformed */ }
+                        }
+                        pump();
+                    }).catch(reject);
+                };
+                pump();
+            }).catch(reject);
+        });
+    }
+
     async loadResults() {
         const loadBtn = document.getElementById('load-results');
         const statusEl = document.getElementById('results-status');
@@ -1620,32 +1915,60 @@ class App {
 
             // Check if regenerate checkbox is checked
             const regenerate = document.getElementById('regenerate-viz').checked;
+            const url = `/api/results?dir=${encodeURIComponent(simName)}`;
 
-            // Fetch results metadata and data from server
-            let url = `/api/results?dir=${encodeURIComponent(simName)}`;
+            // If regenerate requested, generate first
             if (regenerate) {
-                url += '&regenerate=true';
-                loadBtn.textContent = 'Regenerating viz data...';
+                loadBtn.textContent = 'Generating viz data...';
+                statusEl.className = 'mesh-status';
+                statusEl.textContent = 'Starting viz data generation...';
+                statusEl.style.display = 'block';
+                await this._generateVizData(simName, statusEl);
+                statusEl.textContent = 'Viz data generated, loading results...';
+                loadBtn.textContent = 'Loading results...';
             }
-            const response = await fetch(url);
+
+            // Load results
+            let response = await fetch(url);
+
+            // If viz data doesn't exist yet, generate it
             if (!response.ok) {
                 const errData = await response.json();
-                throw new Error(errData.error || 'Failed to load results');
+                if (errData.error && errData.error.includes('not found')) {
+                    loadBtn.textContent = 'Generating viz data...';
+                    statusEl.className = 'mesh-status';
+                    statusEl.textContent = 'Starting viz data generation...';
+                    statusEl.style.display = 'block';
+                    await this._generateVizData(simName, statusEl);
+                    statusEl.textContent = 'Viz data generated, loading results...';
+                    loadBtn.textContent = 'Loading results...';
+                    response = await fetch(url);
+                    if (!response.ok) {
+                        const err2 = await response.json();
+                        throw new Error(err2.error || 'Failed to load results after generation');
+                    }
+                } else {
+                    throw new Error(errData.error || 'Failed to load results');
+                }
             }
 
             const data = await response.json();
+            const vizDir = data.vizDataDir;
 
             // Reload mesh from simulation's viz data if different from current
-            if (data.vizDataDir && data.vizDataDir !== this.meshLoader.currentMesh) {
+            if (vizDir && vizDir !== this.meshLoader.currentMesh) {
                 loadBtn.textContent = 'Reloading mesh...';
-                this.meshLoader.setMesh(data.vizDataDir);
+                this.meshLoader.setMesh(vizDir);
                 const meshData = await this.meshLoader.load();
                 this.meshBounds = meshData.metadata.bounds;
                 this.conversionFactor = meshData.metadata.mesh_conversion_factor;
                 await this.viewer.reloadMesh(meshData);
             }
 
-            this.resultsData = data.voltages;
+            // Store viz dir for binary fetches; voltage data loaded on demand
+            this.resultsVizDir = vizDir;
+            this.resultsData = null; // voltages loaded per-timestep now
+            this._voltageCache = {};
             this.resultsTimeSteps = data.times;
 
             // Update UI
@@ -1664,11 +1987,27 @@ class App {
             document.getElementById('colorbar-min').textContent = `${Math.round(data.vMin)} mV`;
             document.getElementById('colorbar-mid').textContent = `${Math.round((data.vMax + data.vMin) / 2)} mV`;
 
+            // Apply scar config from the simulation's YAML if present
+            if (data.scarConfig && data.scarConfig.regions && data.scarConfig.regions.length > 0) {
+                const region = data.scarConfig.regions[0];
+                this.scarBox = { ...region.box };
+                this.scarMargin = region.margin || 10;
+                this.scarEnabled = true;
+                document.getElementById('scar-enabled').checked = true;
+                document.getElementById('scar-controls').style.display = 'block';
+                // Update scar sliders to match
+                this._updateScarSlidersFromConfig(region);
+                // Set scar zone mask for desaturation
+                this.viewer.setScarZones(this.scarBox, this.scarMargin, true);
+                this.viewer.updateScarBox(this.scarBox, this.scarMargin, true);
+            } else {
+                this.viewer.setScarZones(null, 0, false);
+            }
+
             // Load iterations data if available
             if (data.iterations && data.iterations.length > 0) {
                 this.setIterationsData(data.iterations);
                 this.showIterationsChart();
-                // Highlight initial step
                 this.highlightIterationStep(0, this.resultsTimeSteps.length);
             } else {
                 this.hideIterationsChart();
@@ -1682,30 +2021,42 @@ class App {
                 this.hideResidualChart();
             }
 
-            // Load MPI rank data if available
-            if (data.ranks && data.numRanks) {
-                this.ranksData = data.ranks;
+            // Load MPI rank data as binary if available
+            if (data.hasRankData && data.numRanks) {
+                loadBtn.textContent = 'Loading rank data...';
+                const binBase = `/api/results/binary/${encodeURIComponent(vizDir)}`;
+
+                // Fetch rank binary data in parallel
+                const [ranksResp, ecsRanksResp, cutRanksResp, dofResp, ecsDofResp] = await Promise.all([
+                    fetch(`${binBase}/dof_ranks.bin`),
+                    data.hasEcsRanks ? fetch(`${binBase}/ecs_ranks.bin`) : Promise.resolve(null),
+                    data.hasCutRanks ? fetch(`${binBase}/cut_ranks.bin`) : Promise.resolve(null),
+                    data.hasDofIndices ? fetch(`${binBase}/facet_orig_vertices.bin`) : Promise.resolve(null),
+                    data.hasEcsDofIndices ? fetch(`${binBase}/ecs_orig_vertices.bin`) : Promise.resolve(null),
+                ]);
+
+                this.ranksData = new Int32Array(await ranksResp.arrayBuffer());
                 this.numRanks = data.numRanks;
-                this.ecsRanksData = data.ecsRanks;
-                this.cutRanksData = data.cutRanks;
                 this.rankCentroids = data.rankCentroids;
                 this.globalCentroid = data.globalCentroid;
 
+                this.ecsRanksData = ecsRanksResp ? new Int32Array(await ecsRanksResp.arrayBuffer()) : null;
+                this.cutRanksData = cutRanksResp ? new Int32Array(await cutRanksResp.arrayBuffer()) : null;
+
                 this.viewer.setNumRanks(data.numRanks);
                 this.viewer.setExplosionData(
-                    data.ranks,
-                    data.ecsRanks,
-                    data.cutRanks,
+                    this.ranksData,
+                    this.ecsRanksData,
+                    this.cutRanksData,
                     data.rankCentroids,
                     data.globalCentroid
                 );
 
-                // Pass DOF indices for interface highlighting
-                if (data.dofIndices) {
-                    this.viewer.setDofIndices(data.dofIndices);
+                if (dofResp) {
+                    this.viewer.setDofIndices(new Uint32Array(await dofResp.arrayBuffer()));
                 }
-                if (data.ecsDofIndices) {
-                    this.viewer.setEcsDofIndices(data.ecsDofIndices);
+                if (ecsDofResp) {
+                    this.viewer.setEcsDofIndices(new Uint32Array(await ecsDofResp.arrayBuffer()));
                 }
 
                 this.showPartitionOption(data.numRanks);
@@ -1719,8 +2070,8 @@ class App {
                 this.hidePartitionOption();
             }
 
-            // Show first timestep
-            this.showResultsAtTime(0);
+            // Show first timestep (loads voltage binary on demand)
+            await this.showResultsAtTime(0);
 
             // Uncheck regenerate to prevent accidental re-regeneration
             document.getElementById('regenerate-viz').checked = false;
@@ -1734,14 +2085,24 @@ class App {
         }
     }
 
-    showResultsAtTime(timeIndex) {
-        if (!this.resultsData || !this.viewer) return;
+    async showResultsAtTime(timeIndex) {
+        if (!this.resultsVizDir || !this.viewer) return;
 
         // Only update voltage colors if not in partition mode
         const showPartition = document.getElementById('show-partition').checked;
         if (!showPartition) {
-            const voltages = this.resultsData[timeIndex];
-            this.viewer.updateVoltageColors(voltages);
+            // Fetch voltage binary on demand with caching
+            if (!this._voltageCache[timeIndex]) {
+                const url = `/api/results/binary/${encodeURIComponent(this.resultsVizDir)}/${timeIndex}.bin`;
+                const resp = await fetch(url);
+                if (resp.ok) {
+                    this._voltageCache[timeIndex] = new Float32Array(await resp.arrayBuffer());
+                }
+            }
+            const voltages = this._voltageCache[timeIndex];
+            if (voltages) {
+                this.viewer.updateVoltageColors(voltages);
+            }
         }
 
         this.updateVoltagePlotTimeMarker(timeIndex);
@@ -1790,6 +2151,17 @@ class App {
 
             // Update config via API
             await this.configManager.updateConfig(configUpdates);
+
+            // Update scar tissue config (writes sigma_i/sigma_e expressions)
+            const scarConfig = this.getScarConfig();
+            const scarPayload = scarConfig || { regions: [], healthy: { sigma_i: 4.0, sigma_e: 20.0 } };
+            scarPayload.conversionFactor = this.conversionFactor;
+            scarPayload.file = this.configManager.configFile;
+            await fetch('/api/config/scar', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(scarPayload),
+            });
 
             // If using Ginkgo, update ginkgo config via special endpoint
             if (solverBackend === 'ginkgo') {
@@ -1928,6 +2300,9 @@ class App {
     }
 
     async runSimulationKarolina(statusEl, outputEl, runBtn) {
+        // Hide the local simulation output console — Karolina has its own log
+        outputEl.style.display = 'none';
+
         const jobSection = document.getElementById('karolina-job-section');
         const jobIdEl = document.getElementById('karolina-job-id');
         const jobStatusEl = document.getElementById('karolina-job-status');
@@ -2006,92 +2381,165 @@ class App {
         const downloadLink = document.getElementById('video-download');
 
         exportBtn.addEventListener('click', async () => {
-            const resolutionSelect = document.getElementById('video-resolution');
-            const fpsInput = document.getElementById('video-fps');
+            const fps = parseInt(document.getElementById('video-fps').value);
 
-            const resolution = resolutionSelect.value.split('x');
-            const width = parseInt(resolution[0]);
-            const height = parseInt(resolution[1]);
-            const fps = parseInt(fpsInput.value);
-
-            // Get current camera state
-            const cameraState = this.viewer.getCameraState();
+            if (!this.resultsVizDir || !this.resultsTimeSteps || this.resultsTimeSteps.length === 0) {
+                statusEl.className = 'mesh-status error';
+                statusEl.textContent = 'Load results first before exporting video';
+                statusEl.style.display = 'block';
+                return;
+            }
 
             exportBtn.disabled = true;
             progressBar.style.display = 'block';
             progressFill.style.width = '0%';
-            progressText.textContent = 'Starting...';
+            progressText.textContent = 'Starting capture session...';
             statusEl.style.display = 'none';
             downloadLink.style.display = 'none';
 
             try {
-                const simName = this.selectedSimulation || document.getElementById('simulation-selector').value;
-                if (!simName) {
-                    throw new Error('Please select a simulation first');
-                }
-
-                const response = await fetch('/api/video/export', {
+                // 1. Start capture session on server
+                const startResp = await fetch('/api/video/start-capture', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        output_dir: simName,
-                        camera: cameraState,
-                        width: width,
-                        height: height,
-                        fps: fps
-                    })
+                    body: JSON.stringify({ fps })
                 });
+                const { session_id } = await startResp.json();
 
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
+                const numFrames = this.resultsTimeSteps.length;
 
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
+                // 2. Capture each frame from the viewer
+                for (let i = 0; i < numFrames; i++) {
+                    // Update voltage display (same as moving the time slider)
+                    await this.showResultsAtTime(i);
 
-                    const text = decoder.decode(value);
-                    const lines = text.split('\n');
+                    // Force render
+                    this.viewer.renderer.render(this.viewer.scene, this.viewer.camera);
 
-                    for (const line of lines) {
-                        if (line.startsWith('data: ')) {
-                            try {
-                                const data = JSON.parse(line.substring(6));
+                    // Composite frame with overlays
+                    const blob = await this._captureViewerFrame(i);
 
-                                if (data.type === 'progress') {
-                                    progressFill.style.width = `${data.percent}%`;
-                                    progressText.textContent = data.message || `${data.percent}%`;
-                                } else if (data.type === 'complete') {
-                                    progressFill.style.width = '100%';
-                                    progressText.textContent = 'Complete!';
+                    // Send frame to server
+                    await fetch(`/api/video/frame/${session_id}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'image/jpeg' },
+                        body: blob
+                    });
 
-                                    statusEl.className = 'mesh-status converted';
-                                    statusEl.textContent = 'Video exported successfully!';
-                                    statusEl.style.display = 'block';
-
-                                    downloadLink.href = `/api/video/download/${data.filename}`;
-                                    downloadLink.textContent = `Download ${data.filename}`;
-                                    downloadLink.style.display = 'block';
-                                } else if (data.type === 'error') {
-                                    throw new Error(data.message);
-                                }
-                            } catch (e) {
-                                if (e.message !== 'Unexpected end of JSON input') {
-                                    throw e;
-                                }
-                            }
-                        }
-                    }
+                    const pct = Math.round(((i + 1) / numFrames) * 80);
+                    progressFill.style.width = `${pct}%`;
+                    progressText.textContent = `Capturing frame ${i + 1}/${numFrames}`;
                 }
+
+                // 3. Finalize: tell server to encode video
+                progressText.textContent = 'Encoding video...';
+                progressFill.style.width = '85%';
+
+                const finishResp = await fetch(`/api/video/finish-capture/${session_id}`, {
+                    method: 'POST'
+                });
+                const result = await finishResp.json();
+
+                if (result.error) {
+                    throw new Error(result.error);
+                }
+
+                progressFill.style.width = '100%';
+                progressText.textContent = 'Complete!';
+
+                statusEl.className = 'mesh-status converted';
+                statusEl.textContent = 'Video exported successfully!';
+                statusEl.style.display = 'block';
+
+                downloadLink.href = `/api/video/download/${result.filename}`;
+                downloadLink.textContent = `Download ${result.filename}`;
+                downloadLink.style.display = 'block';
+
             } catch (error) {
                 statusEl.className = 'mesh-status error';
                 statusEl.textContent = `Export failed: ${error.message}`;
                 statusEl.style.display = 'block';
             } finally {
                 exportBtn.disabled = false;
-                setTimeout(() => {
-                    progressBar.style.display = 'none';
-                }, 2000);
+                setTimeout(() => { progressBar.style.display = 'none'; }, 2000);
             }
+        });
+    }
+
+    /**
+     * Capture the current viewer as a JPEG blob, compositing the 3D canvas
+     * with colorbar and voltage plot overlays.
+     */
+    _captureViewerFrame(timeIndex) {
+        return new Promise((resolve) => {
+            const glCanvas = this.viewer.renderer.domElement;
+            const w = glCanvas.width;
+            const h = glCanvas.height;
+
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+
+            // Draw 3D scene
+            ctx.drawImage(glCanvas, 0, 0, w, h);
+
+            // Draw time label (top-left)
+            const time = this.resultsTimeSteps[timeIndex];
+            ctx.font = 'bold 18px -apple-system, sans-serif';
+            ctx.fillStyle = 'rgba(0,0,0,0.6)';
+            ctx.fillRect(10, 10, ctx.measureText(`t = ${time.toFixed(3)} ms`).width + 16, 30);
+            ctx.fillStyle = '#fff';
+            ctx.fillText(`t = ${time.toFixed(3)} ms`, 18, 32);
+
+            // Draw colorbar (top-right)
+            const cbW = 30, cbH = 150, cbPad = 20;
+            const cbX = w - cbW - cbPad - 70, cbY = cbPad;
+
+            // Background
+            ctx.fillStyle = 'rgba(0,0,0,0.6)';
+            ctx.fillRect(cbX - 8, cbY - 8, cbW + 80, cbH + 16);
+
+            // Gradient
+            const cm = this.viewer.colormaps[this.viewer.colormap];
+            const grad = ctx.createLinearGradient(0, cbY, 0, cbY + cbH);
+            for (let i = 0; i < cm.colors.length; i++) {
+                const [r, g, b] = cm.colors[i];
+                const pos = 1 - cm.positions[i]; // Invert for top-to-bottom
+                grad.addColorStop(pos, `rgb(${Math.round(r*255)},${Math.round(g*255)},${Math.round(b*255)})`);
+            }
+            ctx.fillStyle = grad;
+            ctx.fillRect(cbX, cbY, cbW, cbH);
+
+            // Labels
+            ctx.font = '12px -apple-system, sans-serif';
+            ctx.fillStyle = '#fff';
+            ctx.textAlign = 'left';
+            ctx.fillText(`${Math.round(this.viewer.vMax)} mV`, cbX + cbW + 6, cbY + 10);
+            ctx.fillText(`${Math.round((this.viewer.vMax + this.viewer.vMin) / 2)} mV`, cbX + cbW + 6, cbY + cbH / 2 + 4);
+            ctx.fillText(`${Math.round(this.viewer.vMin)} mV`, cbX + cbW + 6, cbY + cbH);
+
+            // Draw voltage plot if a vertex is picked
+            const plotPanel = document.getElementById('voltage-plot-panel');
+            if (plotPanel && plotPanel.style.display !== 'none') {
+                const plotCanvas = document.getElementById('voltage-plot-canvas');
+                if (plotCanvas) {
+                    const plotW = plotCanvas.width;
+                    const plotH = plotCanvas.height;
+                    // Draw background
+                    ctx.fillStyle = 'rgba(10, 10, 26, 0.92)';
+                    ctx.fillRect(15, h - plotH - 50, plotW + 20, plotH + 40);
+                    // Draw coords text
+                    const coordsText = document.getElementById('voltage-plot-coords').textContent;
+                    ctx.font = '10px monospace';
+                    ctx.fillStyle = '#aaa';
+                    ctx.fillText(coordsText, 25, h - plotH - 18);
+                    // Draw chart canvas
+                    ctx.drawImage(plotCanvas, 25, h - plotH - 10, plotW, plotH);
+                }
+            }
+
+            canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.92);
         });
     }
 
@@ -2164,11 +2612,24 @@ class App {
         });
     }
 
-    showVoltagePlot(vertexIdx, worldPos) {
-        if (!this.resultsData || !this.voltagePlotChart) return;
+    async showVoltagePlot(vertexIdx, worldPos) {
+        if (!this.resultsVizDir || !this.voltagePlotChart) return;
 
         const times = this.resultsTimeSteps;
-        const series = this.resultsData.map(ts => ts[vertexIdx]);
+
+        // Load all timestep voltages for this vertex from binary cache
+        const series = [];
+        for (let i = 0; i < times.length; i++) {
+            if (!this._voltageCache[i]) {
+                const url = `/api/results/binary/${encodeURIComponent(this.resultsVizDir)}/${i}.bin`;
+                const resp = await fetch(url);
+                if (resp.ok) {
+                    this._voltageCache[i] = new Float32Array(await resp.arrayBuffer());
+                }
+            }
+            const voltages = this._voltageCache[i];
+            series.push(voltages ? voltages[vertexIdx] : null);
+        }
 
         this.voltagePlotChart.data.labels = times;
         this.voltagePlotChart.data.datasets[0].data = series;
@@ -2181,6 +2642,9 @@ class App {
         this.voltagePlotChart.data.datasets[1].data = markerData;
         this.voltagePlotChart.update('none');
 
+        // Store loaded series for time marker updates
+        this._pickedVertexSeries = series;
+
         const x = worldPos.x.toFixed(1), y = worldPos.y.toFixed(1), z = worldPos.z.toFixed(1);
         document.getElementById('voltage-plot-coords').textContent = `(${x}, ${y}, ${z}) μm`;
 
@@ -2188,10 +2652,10 @@ class App {
     }
 
     updateVoltagePlotTimeMarker(timeIndex) {
-        if (!this.voltagePlotChart || this.pickedVertexIndex === null || !this.resultsData) return;
+        if (!this.voltagePlotChart || this.pickedVertexIndex === null || !this._pickedVertexSeries) return;
 
         const times = this.resultsTimeSteps;
-        const series = this.resultsData.map(ts => ts[this.pickedVertexIndex]);
+        const series = this._pickedVertexSeries;
         const markerData = new Array(times.length).fill(null);
         if (timeIndex >= 0 && timeIndex < times.length) {
             markerData[timeIndex] = series[timeIndex];
@@ -2203,6 +2667,7 @@ class App {
     hideVoltagePlot() {
         document.getElementById('voltage-plot-panel').style.display = 'none';
         this.pickedVertexIndex = null;
+        this._pickedVertexSeries = null;
         if (this.viewer) this.viewer.clearPickMarker();
     }
 

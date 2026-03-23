@@ -11,6 +11,7 @@ import os
 import json
 import subprocess
 import re
+import threading
 import h5py
 import numpy as np
 from pathlib import Path
@@ -64,6 +65,17 @@ mesh_state = {
     'converting': False
 }
 
+# Viz generation state
+viz_gen_state = {
+    'generating': False,
+    'sim_name': None,
+    'progress': 0,
+    'message': '',
+    'done': False,
+    'error': None,
+    'lock': threading.Lock(),
+}
+
 # --------------------- Static Files ---------------------
 
 @app.route('/')
@@ -79,18 +91,13 @@ def static_files(path):
 @app.route('/api/config', methods=['GET'])
 def get_config():
     """Read YAML config file and return as JSON."""
+    import yaml
     config_file = request.args.get('file', 'input_pepe36_colored.yml')
     config_path = PROJECT_ROOT / config_file
 
     try:
-        # Simple YAML parsing (good enough for our config)
-        config = {}
         with open(config_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and ':' in line:
-                    key, value = line.split(':', 1)
-                    config[key.strip()] = value.strip()
+            config = yaml.safe_load(f) or {}
         return jsonify(config)
     except FileNotFoundError:
         return jsonify({'error': f'Config file not found: {config_file}'}), 404
@@ -154,6 +161,121 @@ def update_config():
         return jsonify({'success': True, 'message': 'Config updated'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/config/scar', methods=['POST'])
+def update_scar_config():
+    """Generate scar tissue conductivity expressions and write to YAML config."""
+    import yaml
+
+    data = request.json
+    config_file = data.get('file', 'input_pepe36_colored.yml')
+    regions = data.get('regions', [])  # [{box: {xMin,...}, margin, dense: {si,se}, border: {si,se}}]
+    healthy = data.get('healthy', {'sigma_i': 4.0, 'sigma_e': 20.0})
+    cf = data.get('conversionFactor', 0.0001)
+
+    config_path = PROJECT_ROOT / config_file
+
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f) or {}
+
+        if not regions:
+            config['sigma_i'] = healthy['sigma_i']
+            config['sigma_e'] = healthy['sigma_e']
+            config.pop('scar_config', None)
+        else:
+            sigma_i_expr, sigma_e_expr = _build_scar_expressions(regions, cf, healthy)
+            config['sigma_i'] = sigma_i_expr
+            config['sigma_e'] = sigma_e_expr
+            # Save scar geometry in micrometers for visualization playback
+            config['scar_config'] = {
+                'regions': regions,
+                'healthy': healthy,
+            }
+
+        with open(config_path, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+        return jsonify({
+            'success': True,
+            'sigma_i': str(config['sigma_i']),
+            'sigma_e': str(config['sigma_e']),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+def _build_scar_expressions(regions, cf, healthy):
+    """Build UFL expression strings for sigma_i and sigma_e with scar regions.
+
+    Uses ufl.conditional/ufl.ge/ufl.le/ufl.And instead of comparison operators
+    (* products of >= / <=), because sigma expressions are used in variational
+    forms compiled by ffcx, which cannot handle Python comparison products.
+
+    Each region defines:
+      - box (inner): dense scar zone
+      - box + margin (outer): border zone (the ring between inner and outer)
+      - outside outer: healthy tissue
+    """
+    def fmt(v):
+        return f'{v:.8g}'
+
+    def box_condition(prefix, box_coords):
+        """Build a ufl.And chain for a 3D box condition."""
+        xmin, xmax, ymin, ymax, zmin, zmax = box_coords
+        return (
+            f'ufl.And(ufl.ge({prefix}[0], {fmt(xmin)}), '
+            f'ufl.And(ufl.le({prefix}[0], {fmt(xmax)}), '
+            f'ufl.And(ufl.ge({prefix}[1], {fmt(ymin)}), '
+            f'ufl.And(ufl.le({prefix}[1], {fmt(ymax)}), '
+            f'ufl.And(ufl.ge({prefix}[2], {fmt(zmin)}), '
+            f'ufl.le({prefix}[2], {fmt(zmax)}))))))'
+        )
+
+    # Build nested conditionals: for each region, check inner first, then outer
+    # Result: conditional(inner, dense, conditional(outer, border, healthy))
+    si_healthy = fmt(healthy['sigma_i'])
+    se_healthy = fmt(healthy['sigma_e'])
+
+    # Start from the outermost fallback (healthy) and wrap inward
+    si_expr = si_healthy
+    se_expr = se_healthy
+
+    for region in regions:
+        box = region['box']
+        margin = region.get('margin', 10)
+        dense = region.get('dense', {'sigma_i': 0.2, 'sigma_e': 1.0})
+        border = region.get('border', {'sigma_i': 2.0, 'sigma_e': 10.0})
+
+        inner_coords = (
+            box['xMin'] * cf, box['xMax'] * cf,
+            box['yMin'] * cf, box['yMax'] * cf,
+            box['zMin'] * cf, box['zMax'] * cf,
+        )
+        outer_coords = (
+            (box['xMin'] - margin) * cf, (box['xMax'] + margin) * cf,
+            (box['yMin'] - margin) * cf, (box['yMax'] + margin) * cf,
+            (box['zMin'] - margin) * cf, (box['zMax'] + margin) * cf,
+        )
+
+        inner_cond = box_condition('x', inner_coords)
+        outer_cond = box_condition('x', outer_coords)
+
+        # Wrap: conditional(outer, conditional(inner, dense, border), previous)
+        si_expr = (
+            f'ufl.conditional({outer_cond}, '
+            f'ufl.conditional({inner_cond}, {fmt(dense["sigma_i"])}, {fmt(border["sigma_i"])}), '
+            f'{si_expr})'
+        )
+        se_expr = (
+            f'ufl.conditional({outer_cond}, '
+            f'ufl.conditional({inner_cond}, {fmt(dense["sigma_e"])}, {fmt(border["sigma_e"])}), '
+            f'{se_expr})'
+        )
+
+    return si_expr, se_expr
+
 
 @app.route('/api/config/ginkgo', methods=['POST'])
 def update_ginkgo_config():
@@ -608,11 +730,117 @@ def list_simulations():
         'simulations': sorted(simulations, key=lambda x: x['name'])
     })
 
+# --------------------- Viz Generation API ---------------------
+
+@app.route('/api/generate-viz', methods=['POST'])
+def generate_viz_endpoint():
+    """Generate visualization data from simulation output asynchronously with SSE progress."""
+    data = request.json
+    sim_name = data.get('dir')
+    if not sim_name:
+        return jsonify({'error': 'No simulation directory specified'}), 400
+
+    sim_output_dir = PROJECT_ROOT / sim_name
+    if not sim_output_dir.exists():
+        return jsonify({'error': f'Simulation output not found: {sim_name}'}), 404
+
+    mesh_data_dir = Path(__file__).parent / 'data' / Path(sim_name).name
+
+    def generate():
+        with viz_gen_state['lock']:
+            if viz_gen_state['generating']:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Viz generation already in progress'})}\n\n"
+                return
+            viz_gen_state['generating'] = True
+            viz_gen_state['sim_name'] = sim_name
+            viz_gen_state['progress'] = 0
+            viz_gen_state['message'] = 'Starting...'
+            viz_gen_state['done'] = False
+            viz_gen_state['error'] = None
+
+        try:
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent / 'scripts'))
+            from generate_viz_from_output import generate_viz_data
+
+            # Use a list to collect progress events from the worker thread
+            progress_queue = []
+            progress_event = threading.Event()
+
+            def progress_callback(percent, message):
+                viz_gen_state['progress'] = percent
+                viz_gen_state['message'] = message
+                progress_queue.append({'type': 'progress', 'percent': percent, 'message': message})
+                progress_event.set()
+
+            # Run generation in a background thread
+            result = {'error': None}
+            def worker():
+                try:
+                    generate_viz_data(sim_output_dir, mesh_data_dir, progress_callback=progress_callback)
+                except Exception as e:
+                    import traceback
+                    result['error'] = str(e)
+                    result['traceback'] = traceback.format_exc()
+                finally:
+                    progress_event.set()
+
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+
+            # Stream progress events to client
+            while thread.is_alive():
+                progress_event.wait(timeout=2)
+                progress_event.clear()
+                while progress_queue:
+                    event = progress_queue.pop(0)
+                    yield f"data: {json.dumps(event)}\n\n"
+
+            # Drain remaining events
+            while progress_queue:
+                event = progress_queue.pop(0)
+                yield f"data: {json.dumps(event)}\n\n"
+
+            if result['error']:
+                yield f"data: {json.dumps({'type': 'error', 'message': result['error'], 'traceback': result.get('traceback', '')})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'complete', 'success': True})}\n\n"
+
+        except Exception as e:
+            import traceback
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e), 'traceback': traceback.format_exc()})}\n\n"
+
+        finally:
+            with viz_gen_state['lock']:
+                viz_gen_state['generating'] = False
+                viz_gen_state['done'] = True
+
+    return Response(
+        generate(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no'
+        }
+    )
+
+@app.route('/api/generate-viz/status')
+def generate_viz_status():
+    """Check current viz generation status."""
+    return jsonify({
+        'generating': viz_gen_state['generating'],
+        'sim_name': viz_gen_state['sim_name'],
+        'progress': viz_gen_state['progress'],
+        'message': viz_gen_state['message'],
+    })
+
+# --------------------- Results API ---------------------
+
 @app.route('/api/results')
 def get_results():
     """Load simulation results from HDF5 file with per-facet voltage mapping."""
     output_dir = request.args.get('dir', 'pepe36_colored_sim')
-    regenerate = request.args.get('regenerate', 'false').lower() == 'true'
 
     sim_output_dir = PROJECT_ROOT / output_dir
     if not sim_output_dir.exists():
@@ -623,20 +851,6 @@ def get_results():
     mesh_data_dir = Path(__file__).parent / 'data' / sim_name
     viz_mesh_path = mesh_data_dir / 'mesh_vertices.bin'
     metadata_path = mesh_data_dir / 'mesh_metadata.json'
-
-    # Auto-generate viz data from simulation output if not present or if regenerate requested
-    if not viz_mesh_path.exists() or regenerate:
-        try:
-            import sys
-            sys.path.insert(0, str(Path(__file__).parent / 'scripts'))
-            from generate_viz_from_output import generate_viz_data
-            generate_viz_data(sim_output_dir, mesh_data_dir)
-        except Exception as e:
-            import traceback
-            return jsonify({
-                'error': f'Failed to generate visualization data: {str(e)}',
-                'traceback': traceback.format_exc()
-            }), 500
 
     if not viz_mesh_path.exists():
         return jsonify({'error': f'Visualization data not found for: {sim_name}'}), 404
@@ -655,7 +869,6 @@ def get_results():
             facet_pair_indices = np.fromfile(facet_pair_indices_path, dtype=np.int32)
             unique_pairs = [tuple(p) for p in metadata.get('unique_pairs', [])]
         else:
-            # Fallback: no per-facet mapping, use old method
             facet_orig_vertices = None
             facet_pair_indices = None
             unique_pairs = []
@@ -671,22 +884,22 @@ def get_results():
                 except ValueError:
                     pass
 
-        # Determine which voltage source to use
         use_per_facet = len(vij_files) > 0 and facet_orig_vertices is not None
 
         def parse_time(key):
             return float(key.replace('_', '.'))
 
+        # Build voltage data and save as binary files for efficient serving
+        voltages_dir = mesh_data_dir / 'voltages'
+        voltages_dir.mkdir(parents=True, exist_ok=True)
+
         if use_per_facet:
-            # Use per-membrane voltage files for correct visualization
-            # Pick the first vij file to get timesteps
             first_vij_path = list(vij_files.values())[0]
             with h5py.File(first_vij_path, 'r') as f:
                 func_name = list(f['Function'].keys())[0]
                 v_group = f['Function'][func_name]
                 timestep_keys = sorted(v_group.keys(), key=parse_time)
 
-            # Sample timesteps
             max_timesteps = 50
             if len(timestep_keys) > max_timesteps:
                 step = len(timestep_keys) // max_timesteps
@@ -702,22 +915,18 @@ def get_results():
                     for key in timestep_keys:
                         if key in v_group:
                             v_arr = v_group[key][:].flatten()
-                            # Replace NaN/Inf with 0 for valid JSON
                             vij_data[pair][key] = np.nan_to_num(v_arr, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # Build per-vertex voltages for expanded mesh
             num_facets = len(facet_orig_vertices)
-            voltages = []
             times = []
+            v_min = float('inf')
+            v_max = float('-inf')
 
-            for key in timestep_keys:
-                # For each facet, get voltage from the correct vij
+            for ti, key in enumerate(timestep_keys):
                 expanded_voltages = np.zeros(num_facets * 3, dtype=np.float32)
-
                 for facet_idx in range(num_facets):
                     pair_idx = facet_pair_indices[facet_idx]
                     orig_verts = facet_orig_vertices[facet_idx]
-
                     if pair_idx < len(unique_pairs):
                         pair = unique_pairs[pair_idx]
                         if pair in vij_data and key in vij_data[pair]:
@@ -726,11 +935,12 @@ def get_results():
                                 if orig_v < len(v_data):
                                     expanded_voltages[facet_idx * 3 + local_v] = v_data[orig_v]
 
-                voltages.append(expanded_voltages.tolist())
+                expanded_voltages.tofile(voltages_dir / f'{ti}.bin')
+                v_min = min(v_min, float(np.min(expanded_voltages)))
+                v_max = max(v_max, float(np.max(expanded_voltages)))
                 times.append(parse_time(key))
 
         else:
-            # Fallback: use summed v.h5 (old method)
             h5_path = sim_output_dir / 'v.h5'
             if not h5_path.exists():
                 return jsonify({'error': f'v.h5 not found in {output_dir}'}), 404
@@ -744,19 +954,20 @@ def get_results():
                     step = len(timestep_keys) // max_timesteps
                     timestep_keys = timestep_keys[::step]
 
-                voltages = []
                 times = []
-                for key in timestep_keys:
+                v_min = float('inf')
+                v_max = float('-inf')
+                for ti, key in enumerate(timestep_keys):
                     v_data = v_group[key][:].flatten()
-                    # Replace NaN/Inf with 0 for valid JSON
-                    v_data = np.nan_to_num(v_data, nan=0.0, posinf=0.0, neginf=0.0)
-                    voltages.append(v_data.tolist())
+                    v_data = np.nan_to_num(v_data, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+                    v_data.tofile(voltages_dir / f'{ti}.bin')
+                    v_min = min(v_min, float(np.min(v_data)))
+                    v_max = max(v_max, float(np.max(v_data)))
                     times.append(parse_time(key))
 
-        # Compute voltage range (using nan-safe functions)
-        all_v = np.concatenate([np.array(v) for v in voltages])
-        v_min = float(np.nanmin(all_v)) if not np.all(np.isnan(all_v)) else 0.0
-        v_max = float(np.nanmax(all_v)) if not np.all(np.isnan(all_v)) else 0.0
+        if v_min == float('inf'):
+            v_min = 0.0
+            v_max = 0.0
 
         # Load iterations if available
         iterations_path = sim_output_dir / 'iterations.pickle'
@@ -774,51 +985,34 @@ def get_results():
             with open(residuals_path, 'rb') as f:
                 residuals = pickle.load(f)
 
-        # Load DOF rank data if available
-        dof_ranks_path = mesh_data_dir / 'dof_ranks.bin'
+        # Load rank metadata (small JSON only - binary data served separately)
         rank_metadata_path = mesh_data_dir / 'rank_metadata.json'
-        ranks_data = None
         num_ranks = None
         rank_centroids = None
         global_centroid = None
+        has_rank_data = (mesh_data_dir / 'dof_ranks.bin').exists()
 
-        if dof_ranks_path.exists():
-            ranks_data = np.fromfile(dof_ranks_path, dtype=np.int32).tolist()
-            if rank_metadata_path.exists():
-                with open(rank_metadata_path, 'r') as f:
-                    rank_meta = json.load(f)
-                    num_ranks = rank_meta.get('num_ranks')
-                    rank_centroids = rank_meta.get('rank_centroids')
-                    global_centroid = rank_meta.get('global_centroid')
+        if has_rank_data and rank_metadata_path.exists():
+            with open(rank_metadata_path, 'r') as f:
+                rank_meta = json.load(f)
+                num_ranks = rank_meta.get('num_ranks')
+                rank_centroids = rank_meta.get('rank_centroids')
+                global_centroid = rank_meta.get('global_centroid')
 
-        # Load ECS rank data if available
-        ecs_ranks_data = None
-        ecs_ranks_path = mesh_data_dir / 'ecs_ranks.bin'
-        if ecs_ranks_path.exists():
-            ecs_ranks_data = np.fromfile(ecs_ranks_path, dtype=np.int32).tolist()
-
-        # Load partition cut rank data if available
-        cut_ranks_data = None
-        cut_ranks_path = mesh_data_dir / 'cut_ranks.bin'
-        if cut_ranks_path.exists():
-            cut_ranks_data = np.fromfile(cut_ranks_path, dtype=np.int32).tolist()
-
-        # Load DOF indices for interface highlighting
-        # The facet_orig_vertices gives the original vertex (DOF) index for each viz vertex
-        dof_indices = None
-        if facet_orig_vertices is not None:
-            # Flatten the facet vertex indices to get per-viz-vertex DOF indices
-            dof_indices = facet_orig_vertices.flatten().tolist()
-
-        # Load ECS DOF indices for interface highlighting on ECS mesh
-        ecs_dof_indices = None
-        ecs_orig_vertices_path = mesh_data_dir / 'ecs_orig_vertices.bin'
-        if ecs_orig_vertices_path.exists():
-            ecs_orig_vertices = np.fromfile(ecs_orig_vertices_path, dtype=np.uint32).reshape(-1, 3)
-            ecs_dof_indices = ecs_orig_vertices.flatten().tolist()
+        # Find scar config from the YAML config that produced this simulation
+        scar_config = None
+        import yaml as _yaml
+        for yml_path in PROJECT_ROOT.glob('input_*.yml'):
+            try:
+                with open(yml_path, 'r') as f:
+                    cfg = _yaml.safe_load(f) or {}
+                if cfg.get('out_name') == sim_name and 'scar_config' in cfg:
+                    scar_config = cfg['scar_config']
+                    break
+            except Exception:
+                pass
 
         return jsonify({
-            'voltages': voltages,
             'times': times,
             'vMin': v_min,
             'vMax': v_max,
@@ -827,19 +1021,45 @@ def get_results():
             'perFacet': use_per_facet,
             'iterations': iterations,
             'residuals': residuals,
-            'ranks': ranks_data,
+            'hasRankData': has_rank_data,
             'numRanks': num_ranks,
             'rankCentroids': rank_centroids,
             'globalCentroid': global_centroid,
-            'ecsRanks': ecs_ranks_data,
-            'cutRanks': cut_ranks_data,
-            'dofIndices': dof_indices,
-            'ecsDofIndices': ecs_dof_indices
+            'hasEcsRanks': (mesh_data_dir / 'ecs_ranks.bin').exists(),
+            'hasCutRanks': (mesh_data_dir / 'cut_ranks.bin').exists(),
+            'hasDofIndices': facet_orig_vertices is not None,
+            'hasEcsDofIndices': (mesh_data_dir / 'ecs_orig_vertices.bin').exists(),
+            'scarConfig': scar_config,
         })
 
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+@app.route('/api/results/binary/<sim_name>/<filename>')
+def get_results_binary(sim_name, filename):
+    """Serve binary data files (voltages, ranks, dof indices) for a simulation."""
+    # Validate filename to prevent path traversal
+    allowed_files = {
+        'dof_ranks.bin', 'ecs_ranks.bin', 'cut_ranks.bin',
+        'facet_orig_vertices.bin', 'ecs_orig_vertices.bin',
+    }
+    # Also allow voltage timestep files: 0.bin, 1.bin, ...
+    is_voltage = filename.endswith('.bin') and filename[:-4].isdigit()
+
+    if filename not in allowed_files and not is_voltage:
+        return jsonify({'error': 'Invalid file'}), 400
+
+    if is_voltage:
+        file_path = Path(__file__).parent / 'data' / sim_name / 'voltages' / filename
+    else:
+        file_path = Path(__file__).parent / 'data' / sim_name / filename
+
+    if not file_path.exists():
+        return jsonify({'error': 'File not found'}), 404
+
+    return send_from_directory(str(file_path.parent), file_path.name,
+                               mimetype='application/octet-stream')
 
 # --------------------- Interface Data API ---------------------
 
@@ -1093,6 +1313,82 @@ def export_video():
             'X-Accel-Buffering': 'no'
         }
     )
+
+# ----- Client-side frame capture video export -----
+
+import uuid
+import shutil
+import tempfile
+
+_capture_sessions = {}
+
+@app.route('/api/video/start-capture', methods=['POST'])
+def start_capture():
+    """Start a new frame capture session. Returns a session_id."""
+    data = request.json or {}
+    session_id = uuid.uuid4().hex[:12]
+    frames_dir = Path(tempfile.mkdtemp(prefix=f'video_{session_id}_'))
+    _capture_sessions[session_id] = {
+        'frames_dir': frames_dir,
+        'fps': data.get('fps', 30),
+        'frame_count': 0
+    }
+    return jsonify({'session_id': session_id})
+
+
+@app.route('/api/video/frame/<session_id>', methods=['POST'])
+def receive_frame(session_id):
+    """Receive a single JPEG frame for a capture session."""
+    session = _capture_sessions.get(session_id)
+    if not session:
+        return jsonify({'error': 'Invalid session'}), 404
+
+    frame_num = session['frame_count']
+    frame_path = session['frames_dir'] / f'frame_{frame_num:06d}.jpg'
+    frame_path.write_bytes(request.data)
+    session['frame_count'] = frame_num + 1
+    return jsonify({'ok': True, 'frame': frame_num})
+
+
+@app.route('/api/video/finish-capture/<session_id>', methods=['POST'])
+def finish_capture(session_id):
+    """Encode captured frames into MP4 using ffmpeg."""
+    session = _capture_sessions.pop(session_id, None)
+    if not session:
+        return jsonify({'error': 'Invalid session'}), 404
+
+    frames_dir = session['frames_dir']
+    fps = session['fps']
+
+    try:
+        videos_dir = Path(__file__).parent / 'videos'
+        videos_dir.mkdir(parents=True, exist_ok=True)
+
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        filename = f'simulation_{timestamp}.mp4'
+        video_path = videos_dir / filename
+
+        # Use ffmpeg to encode frames
+        cmd = [
+            'ffmpeg', '-y',
+            '-framerate', str(fps),
+            '-i', str(frames_dir / 'frame_%06d.jpg'),
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-crf', '18',
+            '-preset', 'medium',
+            str(video_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+        if result.returncode != 0:
+            return jsonify({'error': f'ffmpeg failed: {result.stderr[-500:]}'}), 500
+
+        return jsonify({'filename': filename})
+    finally:
+        shutil.rmtree(frames_dir, ignore_errors=True)
+
 
 @app.route('/api/video/status')
 def video_status():

@@ -11,8 +11,11 @@ class Viewer {
         this.ecsMeshObject = null;  // ECS (exterior) mesh
         this.cutMeshObject = null;  // Partition cut mesh (internal facets at partition boundaries)
         this.boundingBoxHelper = null;
+        this.scarBoxHelper = null;
+        this.scarBorderBoxHelper = null;
         this.meshData = null;
         this.showExcitedHighlight = true;
+        this.scarZoneMask = null;  // Uint8Array: 0=healthy, 1=border, 2=dense
 
         // Voltage range for colormap
         this.vMin = -80;
@@ -265,7 +268,7 @@ class Viewer {
         this.camera = new THREE.PerspectiveCamera(60, width / height, 0.1, 10000);
 
         // Renderer
-        this.renderer = new THREE.WebGLRenderer({ antialias: true });
+        this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
         this.renderer.setSize(width, height);
         this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
         container.appendChild(this.renderer.domElement);
@@ -559,10 +562,9 @@ class Viewer {
         this.globalCentroid = globalCentroid;
 
         // Initialize visible ranks to all
-        if (ranksData) {
-            const maxRank = Math.max(...ranksData);
+        if (ranksData && this.numRanks) {
             this.visibleRanks = new Set();
-            for (let i = 0; i <= maxRank; i++) {
+            for (let i = 0; i < this.numRanks; i++) {
                 this.visibleRanks.add(i);
             }
         }
@@ -749,6 +751,136 @@ class Viewer {
         geometry.attributes.color.needsUpdate = true;
     }
 
+    updateScarBox(box, margin, enabled) {
+        // Remove existing scar box helpers
+        if (this.scarBoxHelper) {
+            this.scene.remove(this.scarBoxHelper);
+            this.scarBoxHelper = null;
+        }
+        if (this.scarBorderBoxHelper) {
+            this.scene.remove(this.scarBorderBoxHelper);
+            this.scarBorderBoxHelper = null;
+        }
+
+        if (!enabled) return;
+
+        const createBox = (b, color) => {
+            const w = b.xMax - b.xMin;
+            const h = b.yMax - b.yMin;
+            const d = b.zMax - b.zMin;
+            if (w <= 0 || h <= 0 || d <= 0) return null;
+            const geom = new THREE.BoxGeometry(w, h, d);
+            const edges = new THREE.EdgesGeometry(geom);
+            const mat = new THREE.LineBasicMaterial({ color, linewidth: 2 });
+            const helper = new THREE.LineSegments(edges, mat);
+            helper.position.set(
+                (b.xMin + b.xMax) / 2,
+                (b.yMin + b.yMax) / 2,
+                (b.zMin + b.zMax) / 2
+            );
+            return helper;
+        };
+
+        // Inner box (dense scar) - red
+        this.scarBoxHelper = createBox(box, 0xff0000);
+        if (this.scarBoxHelper) this.scene.add(this.scarBoxHelper);
+
+        // Outer box (border zone) - orange
+        const outerBox = {
+            xMin: box.xMin - margin, xMax: box.xMax + margin,
+            yMin: box.yMin - margin, yMax: box.yMax + margin,
+            zMin: box.zMin - margin, zMax: box.zMax + margin,
+        };
+        this.scarBorderBoxHelper = createBox(outerBox, 0xff8800);
+        if (this.scarBorderBoxHelper) this.scene.add(this.scarBorderBoxHelper);
+    }
+
+    setScarBoxVisible(visible) {
+        if (this.scarBoxHelper) this.scarBoxHelper.visible = visible;
+        if (this.scarBorderBoxHelper) this.scarBorderBoxHelper.visible = visible;
+    }
+
+    /**
+     * Precompute per-vertex scar zone mask.
+     * 0 = healthy, 1 = border zone, 2 = dense scar.
+     * Called when scar config changes; used by updateVoltageColors for desaturation.
+     */
+    setScarZones(box, margin, enabled) {
+        if (!enabled || !this.meshData) {
+            this.scarZoneMask = null;
+            return;
+        }
+
+        const vertices = this.meshData.vertices;
+        const numVertices = vertices.length / 3;
+        this.scarZoneMask = new Uint8Array(numVertices);
+
+        const outerBox = {
+            xMin: box.xMin - margin, xMax: box.xMax + margin,
+            yMin: box.yMin - margin, yMax: box.yMax + margin,
+            zMin: box.zMin - margin, zMax: box.zMax + margin,
+        };
+
+        for (let i = 0; i < numVertices; i++) {
+            const vx = vertices[i * 3], vy = vertices[i * 3 + 1], vz = vertices[i * 3 + 2];
+
+            const inInner = vx >= box.xMin && vx <= box.xMax &&
+                            vy >= box.yMin && vy <= box.yMax &&
+                            vz >= box.zMin && vz <= box.zMax;
+
+            if (inInner) {
+                this.scarZoneMask[i] = 2;
+            } else {
+                const inOuter = vx >= outerBox.xMin && vx <= outerBox.xMax &&
+                                vy >= outerBox.yMin && vy <= outerBox.yMax &&
+                                vz >= outerBox.zMin && vz <= outerBox.zMax;
+                if (inOuter) {
+                    this.scarZoneMask[i] = 1;
+                }
+            }
+        }
+    }
+
+    highlightScarZones(box, margin) {
+        // Legacy: update scar mask and refresh display
+        this.setScarZones(box, margin, true);
+        if (this.meshObject) {
+            const geometry = this.meshObject.geometry;
+            const colors = geometry.attributes.color.array;
+            const numVertices = colors.length / 3;
+            for (let i = 0; i < numVertices; i++) {
+                const color = this.voltageToColor(this.vMin);
+                colors[i * 3] = color.r;
+                colors[i * 3 + 1] = color.g;
+                colors[i * 3 + 2] = color.b;
+            }
+            this._applyScarDesaturation(colors, numVertices);
+            geometry.attributes.color.needsUpdate = true;
+        }
+    }
+
+    /**
+     * Apply desaturation to scar zone vertices in-place.
+     * Dense scar: 50% desaturation. Border zone: 30% desaturation.
+     */
+    _applyScarDesaturation(colors, numVertices) {
+        if (!this.scarZoneMask) return;
+
+        for (let i = 0; i < numVertices; i++) {
+            const zone = this.scarZoneMask[i];
+            if (zone === 0) continue;
+
+            const r = colors[i * 3], g = colors[i * 3 + 1], b = colors[i * 3 + 2];
+            // Luminance
+            const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+            // Desaturation factor: 0 = full grayscale, 1 = original
+            const factor = zone === 2 ? 0.5 : 0.7;
+            colors[i * 3]     = r * factor + lum * (1 - factor);
+            colors[i * 3 + 1] = g * factor + lum * (1 - factor);
+            colors[i * 3 + 2] = b * factor + lum * (1 - factor);
+        }
+    }
+
     setVoltageRange(vMin, vMax) {
         this.vMin = vMin;
         this.vMax = vMax;
@@ -767,6 +899,9 @@ class Viewer {
             colors[i * 3 + 1] = color.g;
             colors[i * 3 + 2] = color.b;
         }
+
+        // Desaturate scar zones
+        this._applyScarDesaturation(colors, voltages.length);
 
         geometry.attributes.color.needsUpdate = true;
         this.colorMode = 'voltage';

@@ -682,6 +682,23 @@ header p {
     to { transform: rotate(360deg); }
 }
 
+/* Collapsible sections */
+h2.collapsible {
+    cursor: pointer;
+    user-select: none;
+}
+
+h2.collapsible .collapse-indicator {
+    font-size: 0.7em;
+    display: inline-block;
+    transition: transform 0.2s;
+    margin-left: 6px;
+}
+
+h2.collapsible:not(.collapsed) .collapse-indicator {
+    transform: rotate(90deg);
+}
+
 /* Responsive */
 @media (max-width: 1200px) {
     .main-content {

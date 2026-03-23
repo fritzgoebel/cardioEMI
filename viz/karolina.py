@@ -146,6 +146,9 @@ def list_remote_meshes():
                 family_name = p.parent.name
                 family_map.setdefault(family_name, []).append(p)
 
+        # Track mesh names that come from .pts files
+        pts_mesh_names = set()
+
         families = []
         for family_name in sorted(family_map):
             meshes = []
@@ -153,6 +156,7 @@ def list_remote_meshes():
                 pts_name = pts_path.name
                 mesh_name = pts_name.split('-')[0]
                 elem_name = pts_name.replace('.pts', '.elem')
+                pts_mesh_names.add(mesh_name)
 
                 meshes.append({
                     'name': mesh_name,
@@ -167,6 +171,49 @@ def list_remote_meshes():
                     'family': family_name,
                     'meshes': meshes,
                 })
+
+        # Discover h5-only meshes (no .pts source files)
+        h5_only = {}  # base_name -> {'converted': bool, 'converted_colored': bool}
+        for name in converted_names:
+            base = name.removesuffix('_colored')
+            if base in pts_mesh_names:
+                continue
+            h5_only.setdefault(base, {'converted': False, 'converted_colored': False})
+            if name.endswith('_colored'):
+                h5_only[base]['converted_colored'] = True
+            else:
+                h5_only[base]['converted'] = True
+
+        if h5_only:
+            # Group h5-only meshes by family prefix (letters before first digit)
+            h5_family_map = {}
+            for base_name, flags in sorted(h5_only.items()):
+                # Derive family from name: strip trailing digits/hyphens
+                family = re.match(r'^([a-zA-Z]+)', base_name)
+                family_name = family.group(1) if family else base_name
+                h5_family_map.setdefault(family_name, []).append({
+                    'name': base_name,
+                    'pts': None,
+                    'elem': None,
+                    'converted': flags['converted'],
+                    'converted_colored': flags['converted_colored'],
+                })
+
+            for family_name in sorted(h5_family_map):
+                # Merge into existing family if present
+                existing = next((f for f in families if f['family'] == family_name), None)
+                if existing:
+                    existing_names = {m['name'] for m in existing['meshes']}
+                    for mesh in h5_family_map[family_name]:
+                        if mesh['name'] not in existing_names:
+                            existing['meshes'].append(mesh)
+                else:
+                    families.append({
+                        'family': family_name,
+                        'meshes': h5_family_map[family_name],
+                    })
+
+            families.sort(key=lambda f: f['family'])
 
         return families
 
@@ -441,7 +488,10 @@ def tail_remote_log(job_id, num_lines=50):
 # --------------------- Results Download ---------------------
 
 def download_results_streaming(remote_out_name, local_dest):
-    """Download simulation results with byte-level progress, yielding status dicts.
+    """Download simulation results as a single tar.gz archive with progress.
+
+    Creates a tar.gz on the remote side, streams it via SSH, and extracts locally.
+    Much faster than per-file SCP due to fewer SSH handshakes and compression.
 
     Yields dicts: {'type': 'progress', 'bytes_done': int, 'bytes_total': int, 'file': str}
                   {'type': 'complete', 'message': str}
@@ -450,75 +500,89 @@ def download_results_streaming(remote_out_name, local_dest):
     local_dest = Path(local_dest)
     local_dest.mkdir(parents=True, exist_ok=True)
 
-    # List files with sizes in the remote results directory
-    stdout, stderr, rc = _run_ssh(
-        f'find {REMOTE_PATH}/{remote_out_name} -type f -exec stat --format="%s %n" {{}} +',
-        timeout=30
-    )
-    if rc != 0:
-        yield {'type': 'error', 'message': f'Failed to list remote files: {stderr}'}
-        return
+    # Build list of paths to include in the archive
+    remote_dir = f'{REMOTE_PATH}/{remote_out_name}'
+    tar_paths = [remote_out_name]
 
-    # Parse file list: [(size, remote_path), ...]
-    files = []
-    for line in stdout.strip().split('\n'):
-        line = line.strip()
-        if not line:
-            continue
-        size_str, fpath = line.split(' ', 1)
-        files.append((int(size_str), fpath))
-
-    # Also collect IF_*.txt files with sizes
+    # Also include IF_*.txt files if available
     num_ranks = karolina_state.get('num_ranks')
+    if_pattern = ''
     if num_ranks:
-        candidates = [f'{REMOTE_PATH}/IF_{i}.txt' for i in range(num_ranks)]
-        file_list = ' '.join(candidates)
-        stdout, _, rc = _run_ssh(
-            f'stat --format="%s %n" {file_list} 2>/dev/null', timeout=10
-        )
-        if rc == 0 and stdout.strip():
-            for line in stdout.strip().split('\n'):
-                line = line.strip()
-                if not line:
-                    continue
-                size_str, fpath = line.split(' ', 1)
-                files.append((int(size_str), fpath))
+        if_pattern = ' '.join(f'IF_{i}.txt' for i in range(num_ranks))
 
-    if not files:
-        yield {'type': 'error', 'message': 'No files found to download'}
+    # Get total uncompressed size for progress estimation
+    size_cmd = f'du -sb {remote_dir} 2>/dev/null | cut -f1'
+    stdout, stderr, rc = _run_ssh(size_cmd, timeout=30)
+    if rc != 0 or not stdout.strip():
+        yield {'type': 'error', 'message': f'Failed to get remote directory size: {stderr}'}
         return
 
-    bytes_total = sum(size for size, _ in files)
-    bytes_done = 0
-    base_remote = f'{REMOTE_PATH}/{remote_out_name}'
+    bytes_total_uncompressed = int(stdout.strip())
+    # Estimate compressed size (HDF5 files compress ~40-60%)
+    bytes_total_estimate = int(bytes_total_uncompressed * 0.5)
 
-    yield {'type': 'progress', 'bytes_done': 0, 'bytes_total': bytes_total, 'file': ''}
+    yield {'type': 'progress', 'bytes_done': 0, 'bytes_total': bytes_total_estimate,
+           'file': 'Creating archive...'}
 
-    for size, remote_file in files:
-        # Compute local path preserving directory structure
-        if remote_file.startswith(base_remote):
-            rel = remote_file[len(base_remote):].lstrip('/')
-            local_file = local_dest / rel
-        else:
-            # IF files go to parent dir
-            local_file = local_dest.parent / Path(remote_file).name
+    # Build remote tar command: tar the sim directory + IF files, gzip, stream to stdout
+    tar_cmd = f'cd {REMOTE_PATH} && tar czf - {remote_out_name}'
+    if if_pattern:
+        # Add IF files if they exist (ignore missing ones)
+        tar_cmd += f' {if_pattern} 2>/dev/null'
 
-        local_file.parent.mkdir(parents=True, exist_ok=True)
-        fname = Path(remote_file).name
+    # Stream tar.gz via SSH and extract locally
+    archive_path = local_dest.parent / f'.{remote_out_name}.tar.gz'
 
-        yield {'type': 'progress', 'bytes_done': bytes_done, 'bytes_total': bytes_total, 'file': fname}
-
-        result = subprocess.run(
-            ['scp', f'{REMOTE_HOST}:{remote_file}', str(local_file)],
-            capture_output=True, text=True, timeout=120
+    try:
+        # Download archive with progress tracking
+        process = subprocess.Popen(
+            ['ssh', REMOTE_HOST, tar_cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-        if result.returncode != 0:
-            yield {'type': 'error', 'message': f'Failed to download {fname}: {result.stderr}'}
+
+        bytes_done = 0
+        chunk_size = 256 * 1024  # 256KB chunks
+        with open(archive_path, 'wb') as f:
+            while True:
+                chunk = process.stdout.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                bytes_done += len(chunk)
+                # Yield progress every chunk
+                yield {'type': 'progress', 'bytes_done': bytes_done,
+                       'bytes_total': bytes_total_estimate,
+                       'file': f'Downloading archive ({bytes_done // (1024*1024)} MB)...'}
+
+        process.wait()
+        if process.returncode != 0:
+            stderr_out = process.stderr.read().decode()
+            yield {'type': 'error', 'message': f'SSH tar failed: {stderr_out}'}
             return
 
-        bytes_done += size
+        compressed_size = bytes_done
+        yield {'type': 'progress', 'bytes_done': compressed_size,
+               'bytes_total': compressed_size, 'file': 'Extracting archive...'}
 
-    yield {'type': 'complete', 'message': f'Downloaded {len(files)} files ({bytes_total} bytes)'}
+        # Extract to local destination's parent (archive contains remote_out_name/ dir)
+        result = subprocess.run(
+            ['tar', 'xzf', str(archive_path), '-C', str(local_dest.parent)],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode != 0:
+            yield {'type': 'error', 'message': f'Extraction failed: {result.stderr}'}
+            return
+
+        ratio = (1 - compressed_size / bytes_total_uncompressed) * 100 if bytes_total_uncompressed > 0 else 0
+        yield {'type': 'complete',
+               'message': f'Downloaded {compressed_size // (1024*1024)} MB '
+                          f'(compressed {ratio:.0f}% from {bytes_total_uncompressed // (1024*1024)} MB)'}
+
+    finally:
+        # Clean up temporary archive
+        if archive_path.exists():
+            archive_path.unlink()
 
 
 def list_remote_simulations():
