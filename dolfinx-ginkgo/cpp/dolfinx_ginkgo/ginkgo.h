@@ -251,10 +251,22 @@ struct BDDCConfig {
     Scaling scaling = Scaling::STIFFNESS;
 
     // Local solver configuration
-    enum class LocalSolver { DIRECT, DIRECT_LU, ILU, IC, AMG };
+    enum class LocalSolver { DIRECT, DIRECT_LU, ILU, IC, AMG, HYPRE };
     LocalSolver local_solver = LocalSolver::DIRECT;
     int local_max_iterations = 100;       ///< Max iterations for iterative local solver
     double local_tolerance = 1e-12;       ///< Tolerance for iterative local solver
+
+    // Local Hypre BoomerAMG configuration (used when local_solver = HYPRE)
+    struct LocalHypreConfig {
+        int cycle_type = 1;               ///< 1 = V-cycle, 2 = W-cycle
+        int coarsening_type = 10;         ///< 0=CLJP, 3=Ruge-Stueben, 6=Falgout, 8=PMIS, 10=HMIS, 21=CGC
+        double strength_threshold = 0.25; ///< Strength-of-connection threshold (theta)
+        int smoother_type = 6;            ///< 0=Jacobi, 3/4/6/8/13/14=GS variants, 16=Chebyshev, 18=l1-Jacobi
+        int num_sweeps = 1;               ///< Number of smoother sweeps per level
+        int interpolation_type = 0;       ///< 0=classical, 3=direct, 4=multipass, 6=ext+i, 13=FF1, 14=ext
+        int max_levels = 25;              ///< Maximum number of AMG levels
+    };
+    LocalHypreConfig local_hypre;
 
     // Local AMG configuration (used when local_solver = AMG)
     struct LocalAMGConfig {

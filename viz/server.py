@@ -277,6 +277,29 @@ def _build_scar_expressions(regions, cf, healthy):
     return si_expr, se_expr
 
 
+@app.route('/api/config/conditions', methods=['POST'])
+def save_conditions():
+    """Save conditions.json to a simulation output directory."""
+    import hashlib as _hashlib
+    data = request.json
+    out_name = data.get('out_name')
+    conditions = data.get('conditions')
+
+    if not out_name or not conditions:
+        return jsonify({'error': 'out_name and conditions required'}), 400
+
+    conditions_hash = _hashlib.sha256(
+        json.dumps(conditions, sort_keys=True).encode()
+    ).hexdigest()[:12]
+    conditions['_hash'] = conditions_hash
+
+    out_dir = PROJECT_ROOT / out_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / 'conditions.json', 'w') as f:
+        json.dump(conditions, f, indent=2)
+
+    return jsonify({'success': True, 'hash': conditions_hash})
+
 @app.route('/api/config/ginkgo', methods=['POST'])
 def update_ginkgo_config():
     """Update the nested ginkgo configuration in YAML config file."""
@@ -345,6 +368,19 @@ def update_ginkgo_config():
                     'relaxation_factor': float(local_amg_config.get('relaxationFactor', 0.9))
                 }
 
+            # Add local Hypre BoomerAMG config if present
+            local_hypre_config = bddc_config.get('localHypre', {})
+            if local_hypre_config:
+                bddc_dict['local_hypre'] = {
+                    'cycle_type': int(local_hypre_config.get('cycleType', 1)),
+                    'coarsening_type': int(local_hypre_config.get('coarseningType', 10)),
+                    'strength_threshold': float(local_hypre_config.get('strengthThreshold', 0.25)),
+                    'smoother_type': int(local_hypre_config.get('smootherType', 6)),
+                    'num_sweeps': int(local_hypre_config.get('numSweeps', 1)),
+                    'interpolation_type': int(local_hypre_config.get('interpolationType', 0)),
+                    'max_levels': int(local_hypre_config.get('maxLevels', 25))
+                }
+
             ginkgo_dict['bddc'] = bddc_dict
 
         config['ginkgo'] = ginkgo_dict
@@ -356,6 +392,44 @@ def update_ginkgo_config():
         return jsonify({'success': True, 'message': 'Ginkgo config updated'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/config/petsc_bddc', methods=['POST'])
+def update_petsc_bddc_config():
+    """Update the nested petsc_bddc configuration in YAML config file."""
+    import yaml
+
+    data = request.json
+    config_file = data.get('file', 'input_pepe36_colored.yml')
+    bddc_config = data.get('petsc_bddc', {})
+
+    config_path = PROJECT_ROOT / config_file
+
+    try:
+        # Read the full YAML file
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f) or {}
+
+        # Build the petsc_bddc config dictionary
+        petsc_bddc_dict = {
+            'scaling': bddc_config.get('scaling', 'stiffness'),
+            'local_solver': bddc_config.get('localSolver', 'mumps'),
+            'coarse_solver': bddc_config.get('coarseSolver', 'mumps'),
+            'coarse_pc_type': bddc_config.get('coarsePcType', 'lu'),
+            'use_vertices': bddc_config.get('useVertices', True),
+            'use_edges': bddc_config.get('useEdges', True),
+            'use_faces': bddc_config.get('useFaces', False)
+        }
+
+        config['petsc_bddc'] = petsc_bddc_dict
+
+        # Write back with YAML formatting
+        with open(config_path, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+        return jsonify({'success': True, 'message': 'PETSc BDDC config updated'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 # --------------------- Mesh API ---------------------
 
@@ -710,9 +784,9 @@ def list_simulations():
     """List available simulation output directories."""
     simulations = []
 
-    # Look for directories ending in _sim that contain v.h5
+    # Look for directories containing _sim that have v.h5
     for item in PROJECT_ROOT.iterdir():
-        if item.is_dir() and item.name.endswith('_sim'):
+        if item.is_dir() and '_sim' in item.name:
             v_h5 = item / 'v.h5'
             if v_h5.exists():
                 # Check if viz data exists
@@ -726,6 +800,39 @@ def list_simulations():
                     'size': sum(f.stat().st_size for f in item.glob('*.h5'))
                 })
 
+    return jsonify({
+        'simulations': sorted(simulations, key=lambda x: x['name'])
+    })
+
+@app.route('/api/simulations/with-iterations')
+def list_simulations_with_iterations():
+    """List simulation directories that have iterations.pickle (for comparison)."""
+    simulations = []
+    for item in PROJECT_ROOT.iterdir():
+        if item.is_dir() and '_sim' in item.name:
+            iters_file = item / 'iterations.pickle'
+            if iters_file.exists():
+                cond_file = item / 'conditions.json'
+                conditions_hash = None
+                solver_info = {}
+                if cond_file.exists():
+                    try:
+                        with open(cond_file, 'r') as f:
+                            cond = json.load(f)
+                        conditions_hash = cond.get('_hash')
+                        solver_info = {
+                            'solver': cond.get('solver'),
+                            'preconditioner': cond.get('preconditioner'),
+                            'localSolver': cond.get('localSolver'),
+                            'nRanks': cond.get('nRanks'),
+                        }
+                    except Exception:
+                        pass
+                simulations.append({
+                    'name': item.name,
+                    'conditions_hash': conditions_hash,
+                    **solver_info,
+                })
     return jsonify({
         'simulations': sorted(simulations, key=lambda x: x['name'])
     })
@@ -1035,6 +1142,33 @@ def get_results():
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+@app.route('/api/results/iterations/<sim_name>')
+def get_iterations_data(sim_name):
+    """Fetch iterations and conditions data for a simulation (for comparison plots)."""
+    import pickle
+    sim_dir = PROJECT_ROOT / sim_name
+    if not sim_dir.is_dir():
+        return jsonify({'error': f'Simulation not found: {sim_name}'}), 404
+
+    result = {'sim_name': sim_name}
+
+    iterations_path = sim_dir / 'iterations.pickle'
+    if iterations_path.exists():
+        with open(iterations_path, 'rb') as f:
+            result['iterations'] = pickle.load(f)
+
+    residuals_path = sim_dir / 'residuals.pickle'
+    if residuals_path.exists():
+        with open(residuals_path, 'rb') as f:
+            result['residuals'] = pickle.load(f)
+
+    conditions_path = sim_dir / 'conditions.json'
+    if conditions_path.exists():
+        with open(conditions_path, 'r') as f:
+            result['conditions'] = json.load(f)
+
+    return jsonify(result)
 
 @app.route('/api/results/binary/<sim_name>/<filename>')
 def get_results_binary(sim_name, filename):
@@ -1409,19 +1543,21 @@ def download_video(filename):
 
 try:
     from karolina import (
-        karolina_state, mesh_convert_state,
+        karolina_state, karolina_jobs, mesh_convert_state,
         check_ssh, check_containers, upload_config, submit_job,
         check_job_status, cancel_job, tail_remote_log,
-        download_results_streaming, list_remote_simulations,
+        download_results_streaming, download_iterations,
+        list_remote_simulations,
         list_remote_meshes, convert_remote_mesh, finish_conversion,
         download_mesh_data
     )
 except ImportError:
     from viz.karolina import (
-        karolina_state, mesh_convert_state,
+        karolina_state, karolina_jobs, mesh_convert_state,
         check_ssh, check_containers, upload_config, submit_job,
         check_job_status, cancel_job, tail_remote_log,
-        download_results_streaming, list_remote_simulations,
+        download_results_streaming, download_iterations,
+        list_remote_simulations,
         list_remote_meshes, convert_remote_mesh, finish_conversion,
         download_mesh_data
     )
@@ -1444,34 +1580,43 @@ def karolina_submit():
     partition = data.get('partition', 'qcpu_exp')
     account = data.get('account', 'eu-26-11')
     solver_backend = data.get('solver_backend', 'petsc')
+    label = data.get('label')
+    conditions = data.get('conditions')
 
     try:
-        # Upload config file
         config_path = PROJECT_ROOT / config_file
         if not config_path.exists():
             return jsonify({'error': f'Config file not found: {config_file}'}), 404
 
-        upload_config(config_path)
-
-        # Submit SLURM job
-        job_id = submit_job(
+        # Submit SLURM job (updates config out_name, uploads config + script, submits)
+        job_info = submit_job(
             config_file, nodes, ntasks_per_node,
             walltime, partition, account,
-            solver_backend=solver_backend
+            solver_backend=solver_backend,
+            label=label,
+            conditions=conditions,
+            local_config_path=str(config_path)
         )
 
         return jsonify({
             'success': True,
-            'job_id': job_id,
-            'message': f'Job {job_id} submitted to Karolina'
+            **job_info,
+            'message': f'Job {job_info["job_id"]} submitted to Karolina'
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/karolina/jobs')
+def karolina_list_jobs():
+    """List all tracked Karolina jobs."""
+    return jsonify({'jobs': list(karolina_jobs.values())})
+
 @app.route('/api/karolina/status')
-def karolina_status():
+@app.route('/api/karolina/status/<job_id>')
+def karolina_status(job_id=None):
     """Poll SLURM job status and tail log output."""
-    job_id = karolina_state.get('job_id')
+    if job_id is None:
+        job_id = request.args.get('job_id') or karolina_state.get('job_id')
     if not job_id:
         return jsonify({
             'status': None,
@@ -1480,6 +1625,8 @@ def karolina_status():
             'message': 'No job submitted'
         })
 
+    job = karolina_jobs.get(job_id, {})
+
     try:
         status = check_job_status(job_id)
         log = tail_remote_log(job_id)
@@ -1487,27 +1634,45 @@ def karolina_status():
         return jsonify({
             'job_id': job_id,
             'status': status,
-            'out_name': karolina_state.get('out_name', ''),
+            'out_name': job.get('out_name', karolina_state.get('out_name', '')),
+            'label': job.get('label', ''),
+            'conditions_hash': job.get('conditions_hash'),
             'log': log
         })
     except Exception as e:
         return jsonify({
             'job_id': job_id,
-            'status': karolina_state.get('status', 'UNKNOWN'),
+            'status': job.get('status', karolina_state.get('status', 'UNKNOWN')),
             'log': '',
             'error': str(e)
         })
 
 @app.route('/api/karolina/cancel', methods=['POST'])
 def karolina_cancel():
-    """Cancel the running SLURM job."""
-    job_id = karolina_state.get('job_id')
+    """Cancel a SLURM job."""
+    data = request.json or {}
+    job_id = data.get('job_id') or karolina_state.get('job_id')
     if not job_id:
         return jsonify({'error': 'No job to cancel'}), 400
 
     try:
         cancel_job(job_id)
         return jsonify({'success': True, 'message': f'Job {job_id} cancelled'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/karolina/download-iterations', methods=['POST'])
+def karolina_download_iterations():
+    """Download just iterations.pickle + conditions.json from a remote simulation."""
+    data = request.json
+    remote_dir = data.get('remote_dir')
+    if not remote_dir:
+        return jsonify({'error': 'No remote directory specified'}), 400
+
+    local_dest = PROJECT_ROOT / remote_dir
+    try:
+        download_iterations(remote_dir, local_dest)
+        return jsonify({'success': True, 'out_name': remote_dir})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

@@ -450,11 +450,11 @@ class GinkgoSolver:
             bddc.scaling = getattr(_cpp.BDDCConfig.Scaling, scaling_map[scaling])
 
         if "local_solver" in cfg:
-            solver_map = {"direct": "DIRECT", "direct_lu": "DIRECT_LU", "ilu": "ILU", "ic": "IC", "amg": "AMG"}
+            solver_map = {"direct": "DIRECT", "direct_lu": "DIRECT_LU", "ilu": "ILU", "ic": "IC", "amg": "AMG", "hypre": "HYPRE"}
             local_solver = cfg["local_solver"].lower()
             if local_solver not in solver_map:
                 raise ValueError(f"Unknown local solver: {cfg['local_solver']}. "
-                               f"Available: direct, direct_lu, ilu, ic, amg")
+                               f"Available: direct, direct_lu, ilu, ic, amg, hypre")
             bddc.local_solver = getattr(_cpp.BDDCConfig.LocalSolver, solver_map[local_solver])
 
         if "local_max_iterations" in cfg:
@@ -478,11 +478,11 @@ class GinkgoSolver:
             bddc.coarse_tolerance = cfg["coarse_tolerance"]
 
         if "coarse_bddc_local_solver" in cfg:
-            solver_map = {"direct": "DIRECT", "direct_lu": "DIRECT_LU", "ilu": "ILU", "ic": "IC", "amg": "AMG"}
+            solver_map = {"direct": "DIRECT", "direct_lu": "DIRECT_LU", "ilu": "ILU", "ic": "IC", "amg": "AMG", "hypre": "HYPRE"}
             solver = cfg["coarse_bddc_local_solver"].lower()
             if solver not in solver_map:
                 raise ValueError(f"Unknown coarse BDDC local solver: {cfg['coarse_bddc_local_solver']}. "
-                               f"Available: direct, direct_lu, ilu, ic, amg")
+                               f"Available: direct, direct_lu, ilu, ic, amg, hypre")
             bddc.coarse_bddc_local_solver = getattr(_cpp.BDDCConfig.LocalSolver, solver_map[solver])
 
         if "repartition_coarse" in cfg:
@@ -497,6 +497,10 @@ class GinkgoSolver:
         # Configure local AMG if specified
         if "local_amg" in cfg:
             self._configure_local_amg(bddc.local_amg, cfg["local_amg"], _cpp)
+
+        # Configure local Hypre BoomerAMG if specified
+        if "local_hypre" in cfg:
+            self._configure_local_hypre(bddc.local_hypre, cfg["local_hypre"])
 
     def _configure_local_amg(self, local_amg, cfg: dict, _cpp) -> None:
         """Apply local AMG configuration for BDDC."""
@@ -549,6 +553,23 @@ class GinkgoSolver:
 
         if "coarse_max_iterations" in cfg:
             local_amg.coarse_max_iterations = cfg["coarse_max_iterations"]
+
+    def _configure_local_hypre(self, local_hypre, cfg: dict) -> None:
+        """Apply local Hypre BoomerAMG configuration for BDDC."""
+        if "cycle_type" in cfg:
+            local_hypre.cycle_type = int(cfg["cycle_type"])
+        if "coarsening_type" in cfg:
+            local_hypre.coarsening_type = int(cfg["coarsening_type"])
+        if "strength_threshold" in cfg:
+            local_hypre.strength_threshold = float(cfg["strength_threshold"])
+        if "smoother_type" in cfg:
+            local_hypre.smoother_type = int(cfg["smoother_type"])
+        if "num_sweeps" in cfg:
+            local_hypre.num_sweeps = int(cfg["num_sweeps"])
+        if "interpolation_type" in cfg:
+            local_hypre.interpolation_type = int(cfg["interpolation_type"])
+        if "max_levels" in cfg:
+            local_hypre.max_levels = int(cfg["max_levels"])
 
     def solve(self, b: Any, x: Any) -> int:
         """

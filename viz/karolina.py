@@ -9,6 +9,9 @@ import subprocess
 import re
 import json
 import os
+import hashlib
+import yaml
+from datetime import datetime
 from pathlib import Path
 
 REMOTE_HOST = 'karolina'
@@ -21,10 +24,13 @@ DATA_PATH = f'{REMOTE_PATH}/data'
 DOLFINX_SIF = f'{CONTAINERS_PATH}/dolfinx-v0.9.0.sif'
 GINKGO_SIF = f'{CONTAINERS_PATH}/dolfinx-ginkgo-bddc.sif'
 
-# Karolina job state (mirrors simulation_state pattern)
+# Multi-job state: keyed by job_id
+karolina_jobs = {}
+
+# Legacy single-job alias (for backward compat in status/download)
 karolina_state = {
     'job_id': None,
-    'status': None,       # PENDING, RUNNING, COMPLETED, FAILED, CANCELLED, TIMEOUT
+    'status': None,
     'config_file': None,
     'out_name': None,
     'num_ranks': None,
@@ -315,9 +321,12 @@ def upload_config(local_path):
 
 def generate_slurm_script(config_file, nodes=1, ntasks_per_node=128,
                           walltime='01:00:00', partition='qcpu_exp',
-                          account='eu-26-11', solver_backend='petsc'):
+                          account='eu-26-11', solver_backend='petsc',
+                          label=None):
     """Generate a SLURM batch script string for cardioEMI."""
-    out_name = Path(config_file).stem.replace('input_', '') + '_sim'
+    base = Path(config_file).stem.replace('input_', '') + '_sim'
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    out_name = f'{base}_{timestamp}' if label is None else f'{base}_{label}_{timestamp}'
 
     # Select container image
     if solver_backend == 'ginkgo':
@@ -359,62 +368,97 @@ srun -n {total_ranks} --cpu-bind=cores --cpus-per-task={cpus_per_task} apptainer
 
 def submit_job(config_file, nodes=1, ntasks_per_node=128,
                walltime='01:00:00', partition='qcpu_exp',
-               account='eu-26-11', solver_backend='petsc'):
-    """Upload config and SLURM script, then submit via sbatch. Returns job ID."""
-    if karolina_state['submitting']:
-        raise RuntimeError('A submission is already in progress')
+               account='eu-26-11', solver_backend='petsc',
+               label=None, conditions=None, local_config_path=None):
+    """Upload config and SLURM script, then submit via sbatch. Returns job info dict."""
+    # Generate SLURM script with timestamped out_name
+    script_content, out_name = generate_slurm_script(
+        config_file, nodes, ntasks_per_node, walltime, partition, account,
+        solver_backend, label
+    )
 
-    karolina_state['submitting'] = True
-    try:
-        # Generate SLURM script
-        script_content, out_name = generate_slurm_script(
-            config_file, nodes, ntasks_per_node, walltime, partition, account,
-            solver_backend
-        )
+    # Update the config YAML's out_name to the timestamped version
+    if local_config_path and Path(local_config_path).exists():
+        with open(local_config_path, 'r') as f:
+            config = yaml.safe_load(f) or {}
+        config['out_name'] = out_name
+        with open(local_config_path, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
-        # Write script to temp file and upload
-        script_name = 'run_cardioemi.sh'
-        local_script = Path('/tmp') / script_name
-        local_script.write_text(script_content)
+    # Upload config file
+    if local_config_path:
+        upload_config(local_config_path)
 
-        remote_dest = f'{REMOTE_HOST}:{REMOTE_PATH}/{script_name}'
-        result = subprocess.run(
-            ['scp', str(local_script), remote_dest],
+    # Write script to temp file and upload
+    script_name = 'run_cardioemi.sh'
+    local_script = Path('/tmp') / script_name
+    local_script.write_text(script_content)
+
+    remote_dest = f'{REMOTE_HOST}:{REMOTE_PATH}/{script_name}'
+    result = subprocess.run(
+        ['scp', str(local_script), remote_dest],
+        capture_output=True, text=True, timeout=30
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f'Failed to upload SLURM script: {result.stderr}')
+
+    # Upload conditions.json to the remote output directory
+    if conditions:
+        conditions_hash = hashlib.sha256(
+            json.dumps(conditions, sort_keys=True).encode()
+        ).hexdigest()[:12]
+        conditions['_hash'] = conditions_hash
+
+        _run_ssh(f'mkdir -p {REMOTE_PATH}/{out_name}', timeout=10)
+        local_cond = Path('/tmp') / 'conditions.json'
+        local_cond.write_text(json.dumps(conditions, indent=2))
+        subprocess.run(
+            ['scp', str(local_cond), f'{REMOTE_HOST}:{REMOTE_PATH}/{out_name}/conditions.json'],
             capture_output=True, text=True, timeout=30
         )
-        if result.returncode != 0:
-            raise RuntimeError(f'Failed to upload SLURM script: {result.stderr}')
 
-        # Submit job
-        stdout, stderr, rc = _run_ssh(
-            f'cd {REMOTE_PATH} && sbatch {script_name}',
-            timeout=30
-        )
-        if rc != 0:
-            raise RuntimeError(f'sbatch failed: {stderr}')
+    # Submit job
+    stdout, stderr, rc = _run_ssh(
+        f'cd {REMOTE_PATH} && sbatch {script_name}',
+        timeout=30
+    )
+    if rc != 0:
+        raise RuntimeError(f'sbatch failed: {stderr}')
 
-        # Parse job ID from "Submitted batch job 12345"
-        match = re.search(r'Submitted batch job (\d+)', stdout)
-        if not match:
-            raise RuntimeError(f'Could not parse job ID from: {stdout}')
+    # Parse job ID from "Submitted batch job 12345"
+    match = re.search(r'Submitted batch job (\d+)', stdout)
+    if not match:
+        raise RuntimeError(f'Could not parse job ID from: {stdout}')
 
-        job_id = match.group(1)
+    job_id = match.group(1)
+    num_ranks = nodes * ntasks_per_node
 
-        # Update state
-        karolina_state['job_id'] = job_id
-        karolina_state['status'] = 'PENDING'
-        karolina_state['config_file'] = config_file
-        karolina_state['out_name'] = out_name
-        karolina_state['num_ranks'] = nodes * ntasks_per_node
+    # Store in multi-job dict
+    job_info = {
+        'job_id': job_id,
+        'status': 'PENDING',
+        'config_file': config_file,
+        'out_name': out_name,
+        'num_ranks': num_ranks,
+        'label': label or out_name,
+        'conditions_hash': conditions.get('_hash') if conditions else None,
+    }
+    karolina_jobs[job_id] = job_info
 
-        return job_id
+    # Update legacy single-job state
+    karolina_state['job_id'] = job_id
+    karolina_state['status'] = 'PENDING'
+    karolina_state['config_file'] = config_file
+    karolina_state['out_name'] = out_name
+    karolina_state['num_ranks'] = num_ranks
 
-    finally:
-        karolina_state['submitting'] = False
+    return job_info
 
 
 def check_job_status(job_id):
     """Check SLURM job status via squeue/sacct. Returns status string."""
+    job = karolina_jobs.get(job_id, {})
+
     # First try squeue (for queued/running jobs)
     try:
         stdout, stderr, rc = _run_ssh(
@@ -424,6 +468,8 @@ def check_job_status(job_id):
         if rc == 0 and stdout:
             status = stdout.strip().split('\n')[0].strip()
             if status:
+                if job:
+                    job['status'] = status
                 karolina_state['status'] = status
                 return status
     except subprocess.TimeoutExpired:
@@ -436,15 +482,16 @@ def check_job_status(job_id):
             timeout=15
         )
         if rc == 0 and stdout:
-            # sacct may return multiple lines (job + job steps); take the first
             status = stdout.strip().split('\n')[0].strip()
             if status:
+                if job:
+                    job['status'] = status
                 karolina_state['status'] = status
                 return status
     except subprocess.TimeoutExpired:
         pass
 
-    return karolina_state.get('status', 'UNKNOWN')
+    return job.get('status', karolina_state.get('status', 'UNKNOWN'))
 
 
 def cancel_job(job_id):
@@ -452,6 +499,8 @@ def cancel_job(job_id):
     stdout, stderr, rc = _run_ssh(f'scancel {job_id}', timeout=15)
     if rc != 0:
         raise RuntimeError(f'scancel failed: {stderr}')
+    if job_id in karolina_jobs:
+        karolina_jobs[job_id]['status'] = 'CANCELLED'
     karolina_state['status'] = 'CANCELLED'
     return True
 
@@ -470,7 +519,8 @@ def tail_remote_log(job_id, num_lines=50):
         pass
 
     # Also try the tee'd log file
-    out_name = karolina_state.get('out_name', '')
+    job = karolina_jobs.get(job_id, {})
+    out_name = job.get('out_name', karolina_state.get('out_name', ''))
     if out_name:
         try:
             stdout, stderr, rc = _run_ssh(
@@ -585,11 +635,32 @@ def download_results_streaming(remote_out_name, local_dest):
             archive_path.unlink()
 
 
+def download_iterations(remote_out_name, local_dest):
+    """Download just iterations.pickle and conditions.json from a remote simulation."""
+    local_dest = Path(local_dest)
+    local_dest.mkdir(parents=True, exist_ok=True)
+
+    remote_dir = f'{REMOTE_PATH}/{remote_out_name}'
+    files = ['iterations.pickle', 'residuals.pickle', 'conditions.json']
+
+    for fname in files:
+        remote_file = f'{REMOTE_HOST}:{remote_dir}/{fname}'
+        result = subprocess.run(
+            ['scp', remote_file, str(local_dest / fname)],
+            capture_output=True, text=True, timeout=30
+        )
+        # Don't fail if a file doesn't exist — it's optional
+        if result.returncode != 0:
+            continue
+
+    return True
+
+
 def list_remote_simulations():
     """List simulation output directories on the remote machine."""
     try:
         stdout, stderr, rc = _run_ssh(
-            f'ls -d {REMOTE_PATH}/*_sim 2>/dev/null || true',
+            f'ls -d {REMOTE_PATH}/*_sim* 2>/dev/null || true',
             timeout=15
         )
         if rc == 0 and stdout:

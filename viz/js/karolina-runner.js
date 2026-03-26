@@ -3,7 +3,7 @@
 class KarolinaRunner {
     constructor(apiBase = '/api/karolina') {
         this.apiBase = apiBase;
-        this.pollInterval = null;
+        this.pollIntervals = {};  // jobId -> intervalId
         this.pollIntervalMs = 5000;
     }
 
@@ -26,39 +26,53 @@ class KarolinaRunner {
         return data;
     }
 
-    startPolling(onStatusUpdate) {
-        this.stopPolling();
-        // Immediate first poll
-        this._poll(onStatusUpdate);
-        this.pollInterval = setInterval(() => this._poll(onStatusUpdate), this.pollIntervalMs);
+    async listJobs() {
+        const response = await fetch(`${this.apiBase}/jobs`);
+        const data = await response.json();
+        return data.jobs || [];
     }
 
-    async _poll(onStatusUpdate) {
+    startPolling(jobId, onStatusUpdate) {
+        this.stopPolling(jobId);
+        const poll = () => this._poll(jobId, onStatusUpdate);
+        poll();
+        this.pollIntervals[jobId] = setInterval(poll, this.pollIntervalMs);
+    }
+
+    async _poll(jobId, onStatusUpdate) {
         try {
-            const response = await fetch(`${this.apiBase}/status`);
+            const response = await fetch(`${this.apiBase}/status/${jobId}`);
             const data = await response.json();
             onStatusUpdate(data);
 
-            // Stop polling if job is in a terminal state
             const terminal = ['COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY'];
             if (data.status && terminal.includes(data.status)) {
-                this.stopPolling();
+                this.stopPolling(jobId);
             }
         } catch (error) {
-            console.error('Karolina status poll failed:', error);
+            console.error(`Karolina status poll failed for job ${jobId}:`, error);
         }
     }
 
-    stopPolling() {
-        if (this.pollInterval) {
-            clearInterval(this.pollInterval);
-            this.pollInterval = null;
+    stopPolling(jobId) {
+        if (jobId && this.pollIntervals[jobId]) {
+            clearInterval(this.pollIntervals[jobId]);
+            delete this.pollIntervals[jobId];
         }
     }
 
-    async cancel() {
+    stopAllPolling() {
+        for (const jobId of Object.keys(this.pollIntervals)) {
+            clearInterval(this.pollIntervals[jobId]);
+        }
+        this.pollIntervals = {};
+    }
+
+    async cancel(jobId) {
         const response = await fetch(`${this.apiBase}/cancel`, {
-            method: 'POST'
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ job_id: jobId })
         });
         const data = await response.json();
         if (!response.ok) {
@@ -100,6 +114,28 @@ class KarolinaRunner {
             }
         }
         return result || { message: 'Download complete' };
+    }
+
+    async downloadIterations(remoteDir) {
+        const response = await fetch(`${this.apiBase}/download-iterations`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ remote_dir: remoteDir })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || 'Failed to download iterations');
+        }
+        return data;
+    }
+
+    async fetchIterations(simName) {
+        const response = await fetch(`/api/results/iterations/${simName}`);
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || 'Failed to fetch iterations');
+        }
+        return data;
     }
 
     async listRemoteSimulations() {

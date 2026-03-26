@@ -14,6 +14,7 @@ from petsc4py import PETSc
 from utils             import *
 from ionic_model       import *
 from native_assembly   import assemble_block_to_coo
+from matis_assembly    import assemble_block_to_matis
 
 # Optional Ginkgo solver backend
 try:
@@ -429,6 +430,9 @@ use_native_assembly = use_ginkgo and ginkgo_cfg.get("native_assembly", False)
 
 use_dd_matrix = use_ginkgo and ginkgo_cfg.get("dd_matrix", False)
 
+# Check if using PETSc BDDC (requires MATIS format)
+use_petsc_bddc = not use_ginkgo and params.get("pc_type", "hypre") == "bddc"
+
 # Matrix-to-vertex mapping (only populated for native assembly)
 matrix_to_vertex_local = None
 
@@ -447,6 +451,17 @@ if use_native_assembly:
         print(f"  Global size: {coo_global_size}, Local nnz: {len(coo_values)}")
 
     A = None  # No PETSc matrix
+elif use_petsc_bddc:
+    # MATIS assembly path for PETSc PCBDDC
+    if comm.rank == 0:
+        print(f"Assembling MATIS matrix for PCBDDC")
+
+    A = assemble_block_to_matis(a, restriction, bcs, comm)
+    assemble_time += time.perf_counter() - t1
+    contributed_vertices_local = None
+
+    if comm.rank == 0:
+        print(f"Assembling matrix A:    {time.perf_counter() - t1:.2f} seconds")
 else:
     # PETSc assembly path (original)
     A = multiphenicsx.fem.petsc.assemble_matrix_block(a, bcs=bcs, restriction=(restriction, restriction))
@@ -473,12 +488,13 @@ if not Dirichletbc:
     # Create the PETSc nullspace vector and check that it is a valid nullspace of A
     nullspace = PETSc.NullSpace().create(constant=True,comm=comm)
     if A is not None:
-        assert nullspace.test(A)
-        # For convenience, we explicitly inform PETSc that A is symmetric, so that it automatically
-        # sets the nullspace of A^T too (see the documentation of MatSetNullSpace).
-        # Symmetry checked also by direct inspection through the plot_sparsity_pattern() function
-        A.setOption(PETSc.Mat.Option.SYMMETRIC, True)
-        A.setOption(PETSc.Mat.Option.SYMMETRY_ETERNAL, True)
+        if not use_petsc_bddc:
+            assert nullspace.test(A)
+            # For convenience, we explicitly inform PETSc that A is symmetric, so that it automatically
+            # sets the nullspace of A^T too (see the documentation of MatSetNullSpace).
+            # Symmetry checked also by direct inspection through the plot_sparsity_pattern() function
+            A.setOption(PETSc.Mat.Option.SYMMETRIC, True)
+            A.setOption(PETSc.Mat.Option.SYMMETRY_ETERNAL, True)
         # Set the nullspace
         A.setNullSpace(nullspace)
         if params["ksp_type"] == "cg":
@@ -549,6 +565,18 @@ if use_ginkgo:
                 "coarsening": local_amg_cfg.get("coarsening", "pgm"),
                 "strength_threshold": float(local_amg_cfg.get("strength_threshold", 0.25)),
             }
+        # Add local Hypre BoomerAMG config if local solver is hypre
+        local_hypre_cfg = bddc_cfg.get("local_hypre", {})
+        if local_hypre_cfg:
+            bddc_config["local_hypre"] = {
+                "cycle_type": int(local_hypre_cfg.get("cycle_type", 1)),
+                "coarsening_type": int(local_hypre_cfg.get("coarsening_type", 10)),
+                "strength_threshold": float(local_hypre_cfg.get("strength_threshold", 0.25)),
+                "smoother_type": int(local_hypre_cfg.get("smoother_type", 6)),
+                "num_sweeps": int(local_hypre_cfg.get("num_sweeps", 1)),
+                "interpolation_type": int(local_hypre_cfg.get("interpolation_type", 0)),
+                "max_levels": int(local_hypre_cfg.get("max_levels", 25)),
+            }
 
     # Create Ginkgo solver (without matrix - set operator separately)
     ginkgo_solver = GinkgoSolver(
@@ -604,11 +632,43 @@ else:
     if params['pc_type'] != "lu" and params['ksp_type'] != "preonly":
         opts.setValue('ksp_rtol', params.get("ksp_rtol", 1e-8))
         opts.setValue('ksp_atol', params.get("ksp_atol", 1e-12))
-        # Note: ksp_converged_reason removed to avoid interfering with progress bar
-        # Iteration counts are now tracked separately via ITERATIONS output
+        opts.setValue('ksp_norm_type', 'unpreconditioned')
 
     if params['pc_type'] == "hypre" and mesh.geometry.dim == 3:
         opts.setValue('pc_hypre_boomeramg_strong_threshold', 0.7)
+
+    # PCBDDC-specific options
+    if params['pc_type'] == "bddc":
+        bddc_cfg = params.get("petsc_bddc", {})
+
+        # Primal constraint selection
+        if "use_vertices" in bddc_cfg:
+            opts.setValue('pc_bddc_use_vertices', bddc_cfg["use_vertices"])
+        if "use_edges" in bddc_cfg:
+            opts.setValue('pc_bddc_use_edges', bddc_cfg["use_edges"])
+        if "use_faces" in bddc_cfg:
+            opts.setValue('pc_bddc_use_faces', bddc_cfg["use_faces"])
+
+        # Scaling type: multiplicity, stiffness, or deluxe
+        scaling = bddc_cfg.get("scaling", "stiffness")
+        opts.setValue('pc_bddc_scaling_kind', scaling)
+
+        # Local subdomain solver
+        local_solver = bddc_cfg.get("local_solver", "mumps")
+        opts.setValue('pc_bddc_dirichlet_pc_type', 'lu')
+        opts.setValue('pc_bddc_dirichlet_pc_factor_solver_type', local_solver)
+        opts.setValue('pc_bddc_neumann_pc_type', 'lu')
+        opts.setValue('pc_bddc_neumann_pc_factor_solver_type', local_solver)
+
+        # Coarse solver
+        coarse_solver = bddc_cfg.get("coarse_solver", "mumps")
+        coarse_pc = bddc_cfg.get("coarse_pc_type", "lu")
+        opts.setValue('pc_bddc_coarse_redundant_pc_type', coarse_pc)
+        opts.setValue('pc_bddc_coarse_redundant_pc_factor_solver_type', coarse_solver)
+
+        if comm.rank == 0:
+            print(f"  PCBDDC: scaling={scaling}, local_solver={local_solver}, "
+                  f"coarse_solver={coarse_solver}")
 
     ksp.setFromOptions()
     ginkgo_solver = None  # Not using Ginkgo
@@ -1049,6 +1109,12 @@ if comm.rank == 0:
     print(f"Ionic model time: {max_local_ODE_time:.3f} seconds")
     print(f"Total time:       {total_time:.3f} seconds")    
     
+
+# Explicitly clean up solver objects before PETSc/MPI finalization
+# (HYPRE objects need MPI to be alive during destruction)
+if ksp is not None:
+    ksp.destroy()
+    ksp = None
 
 if params["save_output"]:
 

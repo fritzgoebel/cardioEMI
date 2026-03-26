@@ -371,12 +371,11 @@ header p {
     padding: 15px;
     background: #0a0a1a;
     border-top: 1px solid #0f3460;
-    height: 300px;
 }
 
 #iterations-chart-container canvas {
     width: 100% !important;
-    height: 100% !important;
+    height: 250px !important;
 }
 
 /* Residual Chart */

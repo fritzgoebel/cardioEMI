@@ -468,6 +468,26 @@ private:
                     .on(exec_);
                 break;
             }
+            case BDDCConfig::LocalSolver::HYPRE: {
+#if GKO_HAVE_HYPRE
+                const auto& hypre_cfg = bddc_cfg.local_hypre;
+                local_solver_factory =
+                    gko::experimental::solver::HypreBoomerAmg<ValueType>::build()
+                        .with_cycle_type(hypre_cfg.cycle_type)
+                        .with_coarsening_type(hypre_cfg.coarsening_type)
+                        .with_strength_threshold(hypre_cfg.strength_threshold)
+                        .with_smoother_type(hypre_cfg.smoother_type)
+                        .with_num_sweeps(hypre_cfg.num_sweeps)
+                        .with_interpolation_type(hypre_cfg.interpolation_type)
+                        .with_max_levels(hypre_cfg.max_levels)
+                        .on(exec_);
+#else
+                throw std::runtime_error(
+                    "Hypre BoomerAMG local solver requested but Ginkgo was "
+                    "built without Hypre support (GKO_HAVE_HYPRE=0).");
+#endif
+                break;
+            }
         }
 
         // Build coarse solver factory
@@ -620,6 +640,26 @@ private:
                                 gko::stop::ResidualNorm<ValueType>::build()
                                     .with_reduction_factor(bddc_cfg.local_tolerance))
                             .on(exec_);
+                        break;
+                    }
+                    case BDDCConfig::LocalSolver::HYPRE: {
+#if GKO_HAVE_HYPRE
+                        const auto& hypre_cfg = bddc_cfg.local_hypre;
+                        nested_local_solver_factory =
+                            gko::experimental::solver::HypreBoomerAmg<ValueType>::build()
+                                .with_cycle_type(hypre_cfg.cycle_type)
+                                .with_coarsening_type(hypre_cfg.coarsening_type)
+                                .with_strength_threshold(hypre_cfg.strength_threshold)
+                                .with_smoother_type(hypre_cfg.smoother_type)
+                                .with_num_sweeps(hypre_cfg.num_sweeps)
+                                .with_interpolation_type(hypre_cfg.interpolation_type)
+                                .with_max_levels(hypre_cfg.max_levels)
+                                .on(exec_);
+#else
+                        throw std::runtime_error(
+                            "Hypre BoomerAMG local solver requested but Ginkgo was "
+                            "built without Hypre support (GKO_HAVE_HYPRE=0).");
+#endif
                         break;
                     }
                 }

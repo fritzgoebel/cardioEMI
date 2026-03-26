@@ -40,6 +40,27 @@ class ConfigManager {
         return await response.json();
     }
 
+    async updatePetscBddcConfig(bddcConfig) {
+        // Update the nested petsc_bddc configuration in the YAML file
+        const response = await fetch(`${this.apiBase}/config/petsc_bddc`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                file: this.configFile,
+                petsc_bddc: bddcConfig
+            })
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to update PETSc BDDC config');
+        }
+
+        return await response.json();
+    }
+
     async updateGinkgoConfig(ginkgoConfig) {
         // Update the nested ginkgo configuration in the YAML file
         const response = await fetch(`${this.apiBase}/config/ginkgo`, {

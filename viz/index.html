@@ -113,6 +113,13 @@
                 </div>
                 <!-- Iterations Chart -->
                 <div id="iterations-chart-container" style="display: none;">
+                    <div id="compare-bar" style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+                        <details id="compare-details" style="flex:1;">
+                            <summary style="cursor:pointer; font-size:0.8em; color:#aaa; user-select:none;">Compare runs</summary>
+                            <div id="compare-sim-selector" style="margin-top:4px; max-height:150px; overflow-y:auto;"></div>
+                        </details>
+                        <div id="compare-conditions-warning" class="mesh-status error" style="display:none; font-size:0.75em; margin:0;"></div>
+                    </div>
                     <canvas id="iterations-chart"></canvas>
                 </div>
                 <!-- Residual Chart -->
@@ -385,10 +392,55 @@
                             <select id="petsc-pc-type" class="mesh-dropdown">
                                 <option value="lu">LU (MUMPS)</option>
                                 <option value="hypre">Hypre AMG</option>
+                                <option value="bddc">BDDC</option>
                                 <option value="jacobi">Jacobi</option>
                                 <option value="sor">SOR</option>
                                 <option value="none">None</option>
                             </select>
+                        </div>
+
+                        <!-- PETSc BDDC Options -->
+                        <div id="petsc-bddc-options" style="display: none;">
+                            <div class="param-row">
+                                <label>Scaling:</label>
+                                <select id="petsc-bddc-scaling" class="mesh-dropdown">
+                                    <option value="stiffness">Stiffness</option>
+                                    <option value="multiplicity">Multiplicity</option>
+                                    <option value="deluxe">Deluxe</option>
+                                </select>
+                            </div>
+                            <div class="param-row">
+                                <label>Local Solver:</label>
+                                <select id="petsc-bddc-local-solver" class="mesh-dropdown">
+                                    <option value="mumps">MUMPS</option>
+                                    <option value="superlu_dist">SuperLU</option>
+                                    <option value="petsc">PETSc</option>
+                                </select>
+                            </div>
+                            <div class="param-row">
+                                <label>Coarse Solver:</label>
+                                <select id="petsc-bddc-coarse-solver" class="mesh-dropdown">
+                                    <option value="mumps">MUMPS</option>
+                                    <option value="superlu_dist">SuperLU</option>
+                                    <option value="petsc">PETSc</option>
+                                </select>
+                            </div>
+                            <div class="param-row">
+                                <label>Coarse PC:</label>
+                                <select id="petsc-bddc-coarse-pc" class="mesh-dropdown">
+                                    <option value="lu">LU</option>
+                                    <option value="cholesky">Cholesky</option>
+                                    <option value="hypre">Hypre AMG</option>
+                                </select>
+                            </div>
+                            <div class="param-row">
+                                <label>Constraints:</label>
+                                <div style="display: flex; gap: 12px; align-items: center;">
+                                    <label style="font-weight: normal; min-width: auto;"><input type="checkbox" id="petsc-bddc-vertices" checked> Vertices</label>
+                                    <label style="font-weight: normal; min-width: auto;"><input type="checkbox" id="petsc-bddc-edges" checked> Edges</label>
+                                    <label style="font-weight: normal; min-width: auto;"><input type="checkbox" id="petsc-bddc-faces"> Faces</label>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
@@ -469,6 +521,7 @@
                                     <option value="ilu">ILU</option>
                                     <option value="ic">IC</option>
                                     <option value="amg">AMG</option>
+                                    <option value="hypre">Hypre BoomerAMG</option>
                                 </select>
                             </div>
                             <!-- Local solver stopping criteria (shown for iterative solvers: ILU, IC, AMG) -->
@@ -534,6 +587,64 @@
                                     <input type="number" id="bddc-local-amg-relaxation" value="0.9" min="0.1" max="1.0" step="0.05">
                                 </div>
                             </div>
+                            <!-- Local Hypre BoomerAMG Options (shown when hypre is selected as local solver) -->
+                            <div id="bddc-local-hypre-options" style="display: none; margin-left: 10px; border-left: 2px solid #444; padding-left: 10px;">
+                                <div class="param-row">
+                                    <label>Cycle:</label>
+                                    <select id="bddc-local-hypre-cycle" class="mesh-dropdown">
+                                        <option value="1">V-cycle</option>
+                                        <option value="2">W-cycle</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Coarsening:</label>
+                                    <select id="bddc-local-hypre-coarsening" class="mesh-dropdown">
+                                        <option value="0">CLJP</option>
+                                        <option value="3">Ruge-Stueben</option>
+                                        <option value="6">Falgout</option>
+                                        <option value="8">PMIS</option>
+                                        <option value="10" selected>HMIS</option>
+                                        <option value="21">CGC</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Strength threshold:</label>
+                                    <input type="number" id="bddc-local-hypre-strength" value="0.25" min="0.0" max="1.0" step="0.05">
+                                </div>
+                                <div class="param-row">
+                                    <label>Smoother:</label>
+                                    <select id="bddc-local-hypre-smoother" class="mesh-dropdown">
+                                        <option value="0">Jacobi</option>
+                                        <option value="3">Hybrid forward GS</option>
+                                        <option value="4">Hybrid backward GS</option>
+                                        <option value="6" selected>Hybrid symmetric GS</option>
+                                        <option value="8">Hybrid symmetric l1-GS</option>
+                                        <option value="13">Forward l1-GS</option>
+                                        <option value="14">Backward l1-GS</option>
+                                        <option value="16">Chebyshev</option>
+                                        <option value="18">l1-Jacobi</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Num sweeps:</label>
+                                    <input type="number" id="bddc-local-hypre-sweeps" value="1" min="1" max="10" step="1">
+                                </div>
+                                <div class="param-row">
+                                    <label>Interpolation:</label>
+                                    <select id="bddc-local-hypre-interpolation" class="mesh-dropdown">
+                                        <option value="0" selected>Classical modified</option>
+                                        <option value="3">Direct</option>
+                                        <option value="4">Multipass</option>
+                                        <option value="6">Extended+i</option>
+                                        <option value="13">FF1</option>
+                                        <option value="14">Extended</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Max levels:</label>
+                                    <input type="number" id="bddc-local-hypre-max-levels" value="25" min="2" max="50" step="1">
+                                </div>
+                            </div>
                             <div class="param-row">
                                 <label>Coarse Solver:</label>
                                 <select id="bddc-coarse-solver" class="mesh-dropdown">
@@ -555,6 +666,7 @@
                                     <option value="ilu">ILU</option>
                                     <option value="ic">IC</option>
                                     <option value="amg">AMG</option>
+                                    <option value="hypre">Hypre BoomerAMG</option>
                                 </select>
                             </div>
                             <div class="param-row">
@@ -616,35 +728,18 @@
                     <pre id="simulation-output" class="output-console"></pre>
                 </section>
 
-                <!-- Karolina Job Status (shown when Karolina target) -->
+                <!-- Karolina Jobs (shown when Karolina target) -->
                 <section class="section" id="karolina-job-section" style="display:none;">
-                    <h2>Karolina Job</h2>
-                    <div class="param-row">
-                        <label>Job ID:</label>
-                        <span id="karolina-job-id">-</span>
+                    <h2>Karolina Jobs</h2>
+                    <div class="param-row" style="margin-bottom: 8px;">
+                        <label>Job Label:</label>
+                        <input type="text" id="karolina-job-label" placeholder="optional label" style="width:140px; background:#2a2a2a; color:#eee; border:1px solid #555; border-radius:4px; padding:2px 6px;">
                     </div>
-                    <div class="param-row">
-                        <label>Status:</label>
-                        <span id="karolina-job-status">-</span>
+                    <div id="karolina-jobs-list">
+                        <!-- Dynamic job entries rendered here -->
                     </div>
-                    <div style="margin-top: 8px;">
-                        <button id="karolina-cancel-btn" class="btn btn-danger" style="display:none;">
-                            Cancel Job
-                        </button>
-                        <button id="karolina-download-btn" class="btn btn-success" style="display:none;">
-                            Download Results
-                        </button>
-                    </div>
-                    <div id="karolina-download-progress" style="display:none; margin-top:8px;">
-                        <div style="background:#333; border-radius:4px; overflow:hidden; height:18px; position:relative;">
-                            <div id="karolina-download-bar" style="background:#4CAF50; height:100%; width:0%; transition:width 0.2s;"></div>
-                        </div>
-                        <div id="karolina-download-text" style="font-size:0.8em; color:#aaa; margin-top:3px;"></div>
-                    </div>
-                    <div id="karolina-download-status" class="mesh-status" style="display:none; margin-top:8px;"></div>
-                    <h3 style="margin-top: 12px; font-size: 0.85em; color: #888;">Job Log</h3>
-                    <pre id="karolina-log-output" class="output-console" style="max-height: 200px;"></pre>
                 </section>
+
 
                 <!-- Results Visualization -->
                 <section class="section" id="results-section">

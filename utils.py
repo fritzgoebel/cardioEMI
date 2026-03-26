@@ -254,6 +254,12 @@ def read_input_file(input_yml_file):
         else:
             input_parameters['ginkgo'] = {}
 
+        # PETSc BDDC configuration (optional)
+        if 'petsc_bddc' in config:
+            input_parameters['petsc_bddc'] = config['petsc_bddc']
+        else:
+            input_parameters['petsc_bddc'] = {}
+
         ######### Partitioning #########
         # partition_mode: "default" or "component" (tag-based METIS partitioning)
         if 'partition_mode' in config:

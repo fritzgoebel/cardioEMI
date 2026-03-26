@@ -129,10 +129,16 @@ class App {
             // Load config from YAML and populate form
             await this.loadConfigFromYaml();
 
+            // Restore per-mesh IC/scar config from localStorage
+            this.loadMeshConfig();
+
             // Initial update
             this.updateVinitExpression();
             this.updateBoundingBoxVisualization();
             this.updateColorbar();
+
+            // Check for existing iteration data to show compare selector
+            this.updateCompareSelector();
 
             console.log('Application ready');
         } catch (error) {
@@ -639,6 +645,7 @@ class App {
     }
 
     onScarChange() {
+        this.saveMeshConfig();
         if (this.viewer) {
             this.viewer.updateScarBox(this.scarBox, this.scarMargin, this.scarEnabled);
             // Update scar zone mask for desaturation
@@ -684,6 +691,88 @@ class App {
         if (border) {
             document.getElementById('scar-si-border').value = border.sigma_i;
             document.getElementById('scar-se-border').value = border.sigma_e;
+        }
+    }
+
+    saveMeshConfig() {
+        const meshName = this.meshLoader.currentMesh;
+        if (!meshName) return;
+        const config = {
+            boundingBox: { ...this.boundingBox },
+            vExcited: this.vExcited,
+            vResting: this.vResting,
+            scarEnabled: this.scarEnabled,
+            scarBox: { ...this.scarBox },
+            scarMargin: this.scarMargin,
+            scarConductivities: {
+                dense: {
+                    sigma_i: parseFloat(document.getElementById('scar-si-dense').value),
+                    sigma_e: parseFloat(document.getElementById('scar-se-dense').value),
+                },
+                border: {
+                    sigma_i: parseFloat(document.getElementById('scar-si-border').value),
+                    sigma_e: parseFloat(document.getElementById('scar-se-border').value),
+                },
+            },
+        };
+        localStorage.setItem(`meshConfig_${meshName}`, JSON.stringify(config));
+    }
+
+    loadMeshConfig() {
+        const meshName = this.meshLoader.currentMesh;
+        if (!meshName) return;
+        const raw = localStorage.getItem(`meshConfig_${meshName}`);
+        if (!raw) return;
+
+        let config;
+        try { config = JSON.parse(raw); } catch { return; }
+
+        // Restore bounding box
+        if (config.boundingBox) {
+            Object.assign(this.boundingBox, config.boundingBox);
+            ['x', 'y', 'z'].forEach(axis => {
+                const minSlider = document.getElementById(`${axis}-min`);
+                const maxSlider = document.getElementById(`${axis}-max`);
+                minSlider.value = this.boundingBox[`${axis}Min`];
+                maxSlider.value = this.boundingBox[`${axis}Max`];
+                document.getElementById(`${axis}-min-val`).textContent = parseFloat(minSlider.value).toFixed(1);
+                document.getElementById(`${axis}-max-val`).textContent = parseFloat(maxSlider.value).toFixed(1);
+            });
+        }
+
+        // Restore voltage controls
+        if (config.vExcited !== undefined) {
+            this.vExcited = config.vExcited;
+            const el = document.getElementById('v-excited');
+            el.value = this.vExcited;
+            document.getElementById('v-excited-val').textContent = this.vExcited;
+        }
+        if (config.vResting !== undefined) {
+            this.vResting = config.vResting;
+            const el = document.getElementById('v-resting');
+            el.value = this.vResting;
+            document.getElementById('v-resting-val').textContent = this.vResting;
+        }
+
+        // Restore scar config
+        if (config.scarEnabled !== undefined) {
+            this.scarEnabled = config.scarEnabled;
+            document.getElementById('scar-enabled').checked = this.scarEnabled;
+            document.getElementById('scar-controls').style.display = this.scarEnabled ? 'block' : 'none';
+        }
+        if (config.scarBox) {
+            Object.assign(this.scarBox, config.scarBox);
+        }
+        if (config.scarMargin !== undefined) {
+            this.scarMargin = config.scarMargin;
+        }
+        if (config.scarBox || config.scarMargin !== undefined) {
+            this._updateScarSlidersFromConfig({
+                box: this.scarBox,
+                margin: this.scarMargin,
+                dense: config.scarConductivities?.dense,
+                border: config.scarConductivities?.border,
+            });
         }
     }
 
@@ -855,61 +944,123 @@ class App {
         ntasksInput.addEventListener('input', updateTotal);
         updateTotal();
 
+        // Track active jobs
+        this.karolinaJobs = {};
+        this.compareDatasets = [];  // extra datasets from comparison runs
+    }
+
+    renderJobEntry(jobInfo) {
+        const container = document.getElementById('karolina-jobs-list');
+        const jobId = jobInfo.job_id;
+        const entryId = `karolina-job-${jobId}`;
+
+        // Don't duplicate
+        if (document.getElementById(entryId)) return;
+
+        const entry = document.createElement('div');
+        entry.id = entryId;
+        entry.style.cssText = 'border:1px solid #444; border-radius:6px; padding:8px; margin-bottom:8px; background:#1a1a1a;';
+        entry.innerHTML = `
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-weight:bold; color:#ccc;">${jobInfo.label || jobId}</span>
+                <span style="font-size:0.8em; color:#888;">ID: ${jobId}</span>
+            </div>
+            <div class="param-row" style="margin:4px 0;">
+                <label>Status:</label>
+                <span class="job-status" style="font-weight:bold;">PENDING</span>
+            </div>
+            <div style="margin-top:6px;">
+                <button class="btn btn-danger btn-cancel" style="font-size:0.75em; padding:2px 8px;">Cancel</button>
+                <button class="btn btn-success btn-download" style="font-size:0.75em; padding:2px 8px; display:none;">Download</button>
+                <button class="btn btn-toggle-log" style="font-size:0.75em; padding:2px 8px; background:#555; color:#ccc;">Log</button>
+            </div>
+            <pre class="job-log output-console" style="max-height:150px; display:none; margin-top:6px; font-size:0.75em;"></pre>
+        `;
+
         // Cancel button
-        document.getElementById('karolina-cancel-btn').addEventListener('click', async () => {
+        entry.querySelector('.btn-cancel').addEventListener('click', async () => {
             try {
-                await this.karolinaRunner.cancel();
-                this.karolinaRunner.stopPolling();
-                document.getElementById('karolina-job-status').textContent = 'CANCELLED';
-                document.getElementById('karolina-cancel-btn').style.display = 'none';
+                await this.karolinaRunner.cancel(jobId);
+                this.karolinaRunner.stopPolling(jobId);
+                entry.querySelector('.job-status').textContent = 'CANCELLED';
+                entry.querySelector('.job-status').style.color = '#e94560';
+                entry.querySelector('.btn-cancel').style.display = 'none';
             } catch (e) {
                 alert('Cancel failed: ' + e.message);
             }
         });
 
         // Download button
-        document.getElementById('karolina-download-btn').addEventListener('click', async () => {
-            const btn = document.getElementById('karolina-download-btn');
-            const statusEl = document.getElementById('karolina-download-status');
-            const progressEl = document.getElementById('karolina-download-progress');
-            const progressBar = document.getElementById('karolina-download-bar');
-            const progressText = document.getElementById('karolina-download-text');
+        entry.querySelector('.btn-download').addEventListener('click', async () => {
+            const btn = entry.querySelector('.btn-download');
             btn.disabled = true;
             btn.textContent = 'Downloading...';
-            statusEl.style.display = 'none';
-            progressEl.style.display = 'block';
-            progressBar.style.width = '0%';
-            progressText.textContent = 'Starting download...';
-
             try {
-                const result = await this.karolinaRunner.downloadResults(undefined, (data) => {
-                    const pct = data.bytes_total > 0
-                        ? Math.round(100 * data.bytes_done / data.bytes_total)
-                        : 0;
-                    progressBar.style.width = pct + '%';
-                    const doneMB = (data.bytes_done / 1048576).toFixed(1);
-                    const totalMB = (data.bytes_total / 1048576).toFixed(1);
-                    progressText.textContent = data.file
-                        ? `${doneMB} / ${totalMB} MB — ${data.file}`
-                        : `${doneMB} / ${totalMB} MB`;
-                });
-                progressBar.style.width = '100%';
-                progressText.textContent = 'Done';
-                statusEl.className = 'mesh-status converted';
-                statusEl.textContent = result.message;
-                statusEl.style.display = 'block';
-                // Refresh simulation list
+                const outName = this.karolinaJobs[jobId]?.out_name;
+                await this.karolinaRunner.downloadResults(outName, () => {});
+                btn.textContent = 'Downloaded';
                 await this.loadSimulationList();
+                this.updateCompareSelector();
             } catch (e) {
-                statusEl.className = 'mesh-status error';
-                statusEl.textContent = 'Download failed: ' + e.message;
-                statusEl.style.display = 'block';
+                btn.textContent = 'Download Failed';
             } finally {
-                btn.disabled = false;
-                btn.textContent = 'Download Results';
-                setTimeout(() => { progressEl.style.display = 'none'; }, 2000);
+                setTimeout(() => { btn.textContent = 'Download'; btn.disabled = false; }, 3000);
             }
         });
+
+        // Toggle log
+        entry.querySelector('.btn-toggle-log').addEventListener('click', () => {
+            const log = entry.querySelector('.job-log');
+            log.style.display = log.style.display === 'none' ? 'block' : 'none';
+        });
+
+        container.prepend(entry);
+    }
+
+    updateJobStatus(jobId, data) {
+        const entry = document.getElementById(`karolina-job-${jobId}`);
+        if (!entry) return;
+
+        const statusEl = entry.querySelector('.job-status');
+        const cancelBtn = entry.querySelector('.btn-cancel');
+        const downloadBtn = entry.querySelector('.btn-download');
+        const logEl = entry.querySelector('.job-log');
+
+        statusEl.textContent = data.status || '-';
+        if (data.log) {
+            logEl.textContent = data.log;
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        const s = data.status;
+        if (s === 'RUNNING') {
+            statusEl.style.color = '#4ade80';
+        } else if (s === 'PENDING') {
+            statusEl.style.color = '#fbbf24';
+        } else if (s === 'COMPLETED') {
+            statusEl.style.color = '#4ade80';
+            cancelBtn.style.display = 'none';
+            downloadBtn.style.display = 'inline-block';
+            // Auto-download iterations for comparison
+            this.autoDownloadIterations(jobId);
+        } else if (['FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY'].includes(s)) {
+            statusEl.style.color = '#e94560';
+            cancelBtn.style.display = 'none';
+        }
+    }
+
+    async autoDownloadIterations(jobId) {
+        const job = this.karolinaJobs[jobId];
+        if (!job?.out_name || job._iterationsDownloaded) return;
+        job._iterationsDownloaded = true;
+
+        try {
+            await this.karolinaRunner.downloadIterations(job.out_name);
+            await this.loadSimulationList();
+            this.updateCompareSelector();
+        } catch (e) {
+            console.warn(`Auto-download iterations for job ${jobId} failed:`, e);
+        }
     }
 
     async downloadKarolinaSimulation() {
@@ -975,7 +1126,19 @@ class App {
         // Initialize solver config state
         this.solverConfig = {
             backend: 'petsc',
-            petsc: { kspType: 'preonly', pcType: 'lu' },
+            petsc: {
+                kspType: 'preonly',
+                pcType: 'lu',
+                bddc: {
+                    scaling: 'stiffness',
+                    localSolver: 'mumps',
+                    coarseSolver: 'mumps',
+                    coarsePcType: 'lu',
+                    useVertices: true,
+                    useEdges: true,
+                    useFaces: false
+                }
+            },
             ginkgo: {
                 nativeAssembly: true,  // Default to native assembly
                 ddMatrix: false,       // Domain decomposition matrix format
@@ -1003,6 +1166,15 @@ class App {
                         maxLevels: 10,
                         coarseSolver: 'direct',
                         relaxationFactor: 0.9
+                    },
+                    localHypre: {
+                        cycleType: 1,
+                        coarseningType: 10,
+                        strengthThreshold: 0.25,
+                        smootherType: 6,
+                        numSweeps: 1,
+                        interpolationType: 0,
+                        maxLevels: 25
                     }
                 }
             },
@@ -1041,8 +1213,33 @@ class App {
         });
 
         // PETSc preconditioner
+        const petscBddcOptions = document.getElementById('petsc-bddc-options');
         petscPcType.addEventListener('change', () => {
             this.solverConfig.petsc.pcType = petscPcType.value;
+            petscBddcOptions.style.display = petscPcType.value === 'bddc' ? 'block' : 'none';
+        });
+
+        // PETSc BDDC options
+        document.getElementById('petsc-bddc-scaling').addEventListener('change', (e) => {
+            this.solverConfig.petsc.bddc.scaling = e.target.value;
+        });
+        document.getElementById('petsc-bddc-local-solver').addEventListener('change', (e) => {
+            this.solverConfig.petsc.bddc.localSolver = e.target.value;
+        });
+        document.getElementById('petsc-bddc-coarse-solver').addEventListener('change', (e) => {
+            this.solverConfig.petsc.bddc.coarseSolver = e.target.value;
+        });
+        document.getElementById('petsc-bddc-coarse-pc').addEventListener('change', (e) => {
+            this.solverConfig.petsc.bddc.coarsePcType = e.target.value;
+        });
+        document.getElementById('petsc-bddc-vertices').addEventListener('change', (e) => {
+            this.solverConfig.petsc.bddc.useVertices = e.target.checked;
+        });
+        document.getElementById('petsc-bddc-edges').addEventListener('change', (e) => {
+            this.solverConfig.petsc.bddc.useEdges = e.target.checked;
+        });
+        document.getElementById('petsc-bddc-faces').addEventListener('change', (e) => {
+            this.solverConfig.petsc.bddc.useFaces = e.target.checked;
         });
 
         // Ginkgo native assembly - also controls DD matrix visibility
@@ -1116,13 +1313,16 @@ class App {
 
         // BDDC options
         const bddcLocalAmgOptions = document.getElementById('bddc-local-amg-options');
+        const bddcLocalHypreOptions = document.getElementById('bddc-local-hypre-options');
         const bddcLocalStoppingOptions = document.getElementById('bddc-local-stopping-options');
         document.getElementById('bddc-local-solver').addEventListener('change', (e) => {
             this.solverConfig.ginkgo.bddc.localSolver = e.target.value;
             // Show/hide local AMG options
             bddcLocalAmgOptions.style.display = e.target.value === 'amg' ? 'block' : 'none';
-            // Show/hide local stopping criteria (for iterative solvers: ilu, ic, amg)
-            bddcLocalStoppingOptions.style.display = e.target.value !== 'direct' ? 'block' : 'none';
+            // Show/hide local Hypre options
+            bddcLocalHypreOptions.style.display = e.target.value === 'hypre' ? 'block' : 'none';
+            // Show/hide local stopping criteria (for iterative solvers: ilu, ic, amg, hypre)
+            bddcLocalStoppingOptions.style.display = (e.target.value !== 'direct' && e.target.value !== 'direct_lu') ? 'block' : 'none';
         });
 
         document.getElementById('bddc-local-max-iter').addEventListener('change', (e) => {
@@ -1199,6 +1399,29 @@ class App {
             this.solverConfig.ginkgo.bddc.coarseBddcLocalSolver = e.target.value;
         });
 
+        // BDDC local Hypre BoomerAMG options
+        document.getElementById('bddc-local-hypre-cycle').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localHypre.cycleType = parseInt(e.target.value);
+        });
+        document.getElementById('bddc-local-hypre-coarsening').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localHypre.coarseningType = parseInt(e.target.value);
+        });
+        document.getElementById('bddc-local-hypre-strength').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localHypre.strengthThreshold = parseFloat(e.target.value);
+        });
+        document.getElementById('bddc-local-hypre-smoother').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localHypre.smootherType = parseInt(e.target.value);
+        });
+        document.getElementById('bddc-local-hypre-sweeps').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localHypre.numSweeps = parseInt(e.target.value);
+        });
+        document.getElementById('bddc-local-hypre-interpolation').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localHypre.interpolationType = parseInt(e.target.value);
+        });
+        document.getElementById('bddc-local-hypre-max-levels').addEventListener('change', (e) => {
+            this.solverConfig.ginkgo.bddc.localHypre.maxLevels = parseInt(e.target.value);
+        });
+
         // Tolerance and max iterations
         document.getElementById('solver-rtol').addEventListener('change', (e) => {
             this.solverConfig.rtol = e.target.value;
@@ -1246,6 +1469,11 @@ class App {
             petscPcRow.style.display = 'flex';
         }
 
+        // PETSc PC type -> BDDC options
+        const petscBddcOptions = document.getElementById('petsc-bddc-options');
+        const petscPcType = document.getElementById('petsc-pc-type');
+        petscBddcOptions.style.display = petscPcType.value === 'bddc' ? 'block' : 'none';
+
         // Native assembly -> DD matrix row
         if (!nativeAssemblyCheckbox.checked) {
             ddMatrixRow.style.display = 'none';
@@ -1257,9 +1485,10 @@ class App {
         amgOptions.style.display = ginkgoPrecond.value === 'amg' ? 'block' : 'none';
         bddcOptions.style.display = ginkgoPrecond.value === 'bddc' ? 'block' : 'none';
 
-        // BDDC local solver -> local AMG options and stopping criteria
+        // BDDC local solver -> local AMG/Hypre options and stopping criteria
         bddcLocalAmgOptions.style.display = bddcLocalSolver.value === 'amg' ? 'block' : 'none';
-        document.getElementById('bddc-local-stopping-options').style.display = bddcLocalSolver.value !== 'direct' ? 'block' : 'none';
+        document.getElementById('bddc-local-hypre-options').style.display = bddcLocalSolver.value === 'hypre' ? 'block' : 'none';
+        document.getElementById('bddc-local-stopping-options').style.display = (bddcLocalSolver.value !== 'direct' && bddcLocalSolver.value !== 'direct_lu') ? 'block' : 'none';
 
         // BDDC coarse solver -> coarse BDDC local solver options
         const bddcCoarseSolver = document.getElementById('bddc-coarse-solver');
@@ -1274,6 +1503,110 @@ class App {
         this.solverConfig.ginkgo.backend = document.getElementById('ginkgo-backend').value;
         this.solverConfig.ginkgo.solver = document.getElementById('ginkgo-solver').value;
         this.solverConfig.ginkgo.preconditioner = ginkgoPrecond.value;
+    }
+
+    async loadConfigFromYaml() {
+        try {
+            const config = await this.configManager.getConfig();
+            if (!config || config.error) return;
+
+            // Helper to set a select/input value
+            const setVal = (id, val) => {
+                const el = document.getElementById(id);
+                if (el && val !== undefined && val !== null) {
+                    el.value = String(val);
+                }
+            };
+            const setChecked = (id, val) => {
+                const el = document.getElementById(id);
+                if (el && val !== undefined && val !== null) {
+                    el.checked = Boolean(val);
+                }
+            };
+
+            // Top-level solver settings
+            setVal('solver-backend', config.solver_backend || 'petsc');
+            setVal('petsc-ksp-type', config.ksp_type || 'preonly');
+            setVal('petsc-pc-type', config.pc_type || 'lu');
+            setVal('solver-rtol', config.ksp_rtol || '1e-8');
+            setVal('solver-atol', config.ksp_atol || '1e-12');
+            setVal('solver-max-iter', config.max_iterations || 1000);
+
+            // Simulation parameters
+            if (config.dt !== undefined) {
+                setVal('dt-input', config.dt);
+                this.dt = parseFloat(config.dt);
+            }
+            if (config.time_steps !== undefined) {
+                setVal('timesteps-input', config.time_steps);
+                this.timeSteps = parseInt(config.time_steps);
+            }
+
+            // PETSc BDDC options
+            const petscBddc = config.petsc_bddc || {};
+            if (petscBddc.scaling) setVal('petsc-bddc-scaling', petscBddc.scaling);
+            if (petscBddc.local_solver) setVal('petsc-bddc-local-solver', petscBddc.local_solver);
+            if (petscBddc.coarse_solver) setVal('petsc-bddc-coarse-solver', petscBddc.coarse_solver);
+            if (petscBddc.coarse_pc_type) setVal('petsc-bddc-coarse-pc', petscBddc.coarse_pc_type);
+            if (petscBddc.use_vertices !== undefined) setChecked('petsc-bddc-vertices', petscBddc.use_vertices);
+            if (petscBddc.use_edges !== undefined) setChecked('petsc-bddc-edges', petscBddc.use_edges);
+            if (petscBddc.use_faces !== undefined) setChecked('petsc-bddc-faces', petscBddc.use_faces);
+
+            // Ginkgo options
+            const gko = config.ginkgo || {};
+            if (gko.native_assembly !== undefined) setChecked('ginkgo-native-assembly', gko.native_assembly);
+            if (gko.dd_matrix !== undefined) setChecked('ginkgo-dd-matrix', gko.dd_matrix);
+            if (gko.backend) setVal('ginkgo-backend', gko.backend);
+            if (gko.solver) setVal('ginkgo-solver', gko.solver);
+            if (gko.preconditioner) setVal('ginkgo-precond', gko.preconditioner);
+
+            // Ginkgo AMG options
+            const amg = gko.amg || {};
+            if (amg.cycle) setVal('amg-cycle', amg.cycle);
+            if (amg.smoother) setVal('amg-smoother', amg.smoother);
+            if (amg.max_levels) setVal('amg-max-levels', amg.max_levels);
+
+            // Ginkgo BDDC options
+            const bddc = gko.bddc || {};
+            if (bddc.local_solver) setVal('bddc-local-solver', bddc.local_solver);
+            if (bddc.local_max_iterations) setVal('bddc-local-max-iter', bddc.local_max_iterations);
+            if (bddc.local_tolerance) setVal('bddc-local-tolerance', bddc.local_tolerance);
+            if (bddc.coarse_solver) setVal('bddc-coarse-solver', bddc.coarse_solver);
+            if (bddc.coarse_max_iterations) setVal('bddc-coarse-max-iter', bddc.coarse_max_iterations);
+            if (bddc.coarse_bddc_local_solver) setVal('bddc-coarse-bddc-local-solver', bddc.coarse_bddc_local_solver);
+            if (bddc.vertices !== undefined) setChecked('bddc-vertices', bddc.vertices);
+            if (bddc.edges !== undefined) setChecked('bddc-edges', bddc.edges);
+            if (bddc.faces !== undefined) setChecked('bddc-faces', bddc.faces);
+            if (bddc.repartition_coarse !== undefined) setChecked('bddc-repartition-coarse', bddc.repartition_coarse);
+
+            // Ginkgo BDDC Local AMG options
+            const localAmg = bddc.local_amg || {};
+            if (localAmg.coarsening) setVal('bddc-local-amg-coarsening', localAmg.coarsening);
+            if (localAmg.strength_threshold) setVal('bddc-local-amg-strength-threshold', localAmg.strength_threshold);
+            if (localAmg.cycle) setVal('bddc-local-amg-cycle', localAmg.cycle);
+            if (localAmg.smoother) setVal('bddc-local-amg-smoother', localAmg.smoother);
+            if (localAmg.smooth_steps) setVal('bddc-local-amg-smooth-steps', localAmg.smooth_steps);
+            if (localAmg.max_levels) setVal('bddc-local-amg-max-levels', localAmg.max_levels);
+            if (localAmg.coarse_solver) setVal('bddc-local-amg-coarse-solver', localAmg.coarse_solver);
+            if (localAmg.relaxation_factor) setVal('bddc-local-amg-relaxation', localAmg.relaxation_factor);
+
+            // Ginkgo BDDC Local Hypre BoomerAMG options
+            const localHypre = bddc.local_hypre || {};
+            if (localHypre.cycle_type) setVal('bddc-local-hypre-cycle', localHypre.cycle_type);
+            if (localHypre.coarsening_type !== undefined) setVal('bddc-local-hypre-coarsening', localHypre.coarsening_type);
+            if (localHypre.strength_threshold) setVal('bddc-local-hypre-strength', localHypre.strength_threshold);
+            if (localHypre.smoother_type !== undefined) setVal('bddc-local-hypre-smoother', localHypre.smoother_type);
+            if (localHypre.num_sweeps) setVal('bddc-local-hypre-sweeps', localHypre.num_sweeps);
+            if (localHypre.interpolation_type !== undefined) setVal('bddc-local-hypre-interpolation', localHypre.interpolation_type);
+            if (localHypre.max_levels) setVal('bddc-local-hypre-max-levels', localHypre.max_levels);
+
+            // Now sync UI visibility and internal state with loaded form values
+            this.initSolverSettingsUI();
+
+            console.log('Config loaded from YAML:', this.configManager.configFile);
+        } catch (error) {
+            console.warn('Could not load config from YAML:', error.message);
+        }
     }
 
     setupMpiRanks() {
@@ -1396,6 +1729,9 @@ class App {
                 simSelector.value = data.simulations[0].name;
                 this.selectedSimulation = data.simulations[0].name;
             }
+
+            // Update comparison selector
+            this.updateCompareSelector();
         } catch (error) {
             console.error('Failed to load simulation list:', error);
         }
@@ -1793,6 +2129,7 @@ class App {
     onBoundingBoxChange() {
         this.updateVinitExpression();
         this.updateBoundingBoxVisualization();
+        this.saveMeshConfig();
     }
 
     updateVinitExpression() {
@@ -2163,6 +2500,20 @@ class App {
                 body: JSON.stringify(scarPayload),
             });
 
+            // If using PETSc BDDC, update petsc_bddc config via special endpoint
+            if (solverBackend === 'petsc' && pcType === 'bddc') {
+                const petscBddcConfig = {
+                    scaling: document.getElementById('petsc-bddc-scaling').value,
+                    localSolver: document.getElementById('petsc-bddc-local-solver').value,
+                    coarseSolver: document.getElementById('petsc-bddc-coarse-solver').value,
+                    coarsePcType: document.getElementById('petsc-bddc-coarse-pc').value,
+                    useVertices: document.getElementById('petsc-bddc-vertices').checked,
+                    useEdges: document.getElementById('petsc-bddc-edges').checked,
+                    useFaces: document.getElementById('petsc-bddc-faces').checked
+                };
+                await this.configManager.updatePetscBddcConfig(petscBddcConfig);
+            }
+
             // If using Ginkgo, update ginkgo config via special endpoint
             if (solverBackend === 'ginkgo') {
                 // Read Ginkgo values from DOM
@@ -2200,6 +2551,15 @@ class App {
                             maxLevels: parseInt(document.getElementById('bddc-local-amg-max-levels').value),
                             coarseSolver: document.getElementById('bddc-local-amg-coarse-solver').value,
                             relaxationFactor: parseFloat(document.getElementById('bddc-local-amg-relaxation').value)
+                        },
+                        localHypre: {
+                            cycleType: parseInt(document.getElementById('bddc-local-hypre-cycle').value),
+                            coarseningType: parseInt(document.getElementById('bddc-local-hypre-coarsening').value),
+                            strengthThreshold: parseFloat(document.getElementById('bddc-local-hypre-strength').value),
+                            smootherType: parseInt(document.getElementById('bddc-local-hypre-smoother').value),
+                            numSweeps: parseInt(document.getElementById('bddc-local-hypre-sweeps').value),
+                            interpolationType: parseInt(document.getElementById('bddc-local-hypre-interpolation').value),
+                            maxLevels: parseInt(document.getElementById('bddc-local-hypre-max-levels').value)
                         }
                     }
                 };
@@ -2209,6 +2569,21 @@ class App {
             statusEl.className = 'status visible error';
             statusEl.textContent = 'Failed to save configuration: ' + error.message;
             return;
+        }
+
+        // Save conditions for local runs (Karolina jobs handle this in submit)
+        if (this.runTarget !== 'karolina') {
+            try {
+                const meshName = this.meshLoader.currentMesh || 'unknown';
+                const outName = meshName + '_sim';
+                await fetch('/api/config/conditions', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ out_name: outName, conditions: this.getConditionsSnapshot() }),
+                });
+            } catch (e) {
+                console.warn('Failed to save conditions:', e);
+            }
         }
 
         // Branch on run target
@@ -2299,23 +2674,65 @@ class App {
         }
     }
 
-    async runSimulationKarolina(statusEl, outputEl, runBtn) {
-        // Hide the local simulation output console — Karolina has its own log
-        outputEl.style.display = 'none';
+    getConditionsSnapshot() {
+        const solverBackend = document.getElementById('solver-backend').value;
+        const precond = solverBackend === 'ginkgo'
+            ? document.getElementById('ginkgo-precond').value
+            : document.getElementById('petsc-pc-type').value;
+        let localSolver = null;
+        if (solverBackend === 'ginkgo' && precond === 'bddc') {
+            localSolver = document.getElementById('bddc-local-solver').value;
+        } else if (solverBackend === 'petsc' && precond === 'bddc') {
+            localSolver = document.getElementById('petsc-bddc-local-solver').value;
+        }
 
+        const nodesEl = document.getElementById('karolina-nodes');
+        const ntasksEl = document.getElementById('karolina-ntasks');
+        const mpiRanksEl = document.getElementById('mpi-ranks');
+        const nRanks = nodesEl && ntasksEl
+            ? (parseInt(nodesEl.value) || 1) * (parseInt(ntasksEl.value) || 1)
+            : (mpiRanksEl ? parseInt(mpiRanksEl.value) || 1 : 1);
+
+        const conditions = {
+            mesh: this.meshLoader.currentMesh,
+            solver: solverBackend,
+            preconditioner: precond,
+            localSolver: localSolver,
+            nRanks: nRanks,
+            boundingBox: { ...this.boundingBox },
+            vExcited: this.vExcited,
+            vResting: this.vResting,
+            scarEnabled: this.scarEnabled,
+        };
+        if (this.scarEnabled) {
+            conditions.scarBox = { ...this.scarBox };
+            conditions.scarMargin = this.scarMargin;
+            conditions.scarConductivities = {
+                dense: {
+                    sigma_i: parseFloat(document.getElementById('scar-si-dense').value),
+                    sigma_e: parseFloat(document.getElementById('scar-se-dense').value),
+                },
+                border: {
+                    sigma_i: parseFloat(document.getElementById('scar-si-border').value),
+                    sigma_e: parseFloat(document.getElementById('scar-se-border').value),
+                },
+            };
+        }
+        return conditions;
+    }
+
+    async runSimulationKarolina(statusEl, outputEl, runBtn) {
+        outputEl.style.display = 'none';
         const jobSection = document.getElementById('karolina-job-section');
-        const jobIdEl = document.getElementById('karolina-job-id');
-        const jobStatusEl = document.getElementById('karolina-job-status');
-        const cancelBtn = document.getElementById('karolina-cancel-btn');
-        const downloadBtn = document.getElementById('karolina-download-btn');
-        const logOutput = document.getElementById('karolina-log-output');
 
         try {
-            runBtn.disabled = true;
             statusEl.className = 'status visible running';
             statusEl.textContent = 'Submitting to Karolina...';
 
             const configFile = this.configManager.configFile || 'input_pepe36_colored.yml';
+            const label = document.getElementById('karolina-job-label').value.trim() || undefined;
+            const conditions = this.getConditionsSnapshot();
+
             const options = {
                 config: configFile,
                 nodes: parseInt(document.getElementById('karolina-nodes').value) || 1,
@@ -2324,51 +2741,37 @@ class App {
                 partition: document.getElementById('karolina-partition').value || 'qcpu_exp',
                 account: document.getElementById('karolina-account').value || 'eu-26-11',
                 solver_backend: document.getElementById('solver-backend').value || 'petsc',
+                label,
+                conditions,
             };
 
             const result = await this.karolinaRunner.submit(options);
+            const jobId = result.job_id;
 
-            // Show job section
+            // Store job info
+            this.karolinaJobs[jobId] = {
+                ...result,
+                conditions_hash: result.conditions_hash,
+            };
+
+            // Show job section and render entry
             jobSection.style.display = 'block';
-            jobIdEl.textContent = result.job_id;
-            jobStatusEl.textContent = 'PENDING';
-            cancelBtn.style.display = 'inline-block';
-            downloadBtn.style.display = 'none';
-            logOutput.textContent = '';
+            this.renderJobEntry(result);
 
             statusEl.className = 'status visible success';
-            statusEl.textContent = `Job ${result.job_id} submitted!`;
+            statusEl.textContent = `Job ${jobId} submitted!`;
 
-            // Start polling
-            this.karolinaRunner.startPolling((data) => {
-                jobStatusEl.textContent = data.status || '-';
-                if (data.log) {
-                    logOutput.textContent = data.log;
-                    logOutput.scrollTop = logOutput.scrollHeight;
-                }
-
-                // Style status
-                const s = data.status;
-                if (s === 'RUNNING') {
-                    jobStatusEl.style.color = '#4ade80';
-                } else if (s === 'PENDING') {
-                    jobStatusEl.style.color = '#fbbf24';
-                } else if (s === 'COMPLETED') {
-                    jobStatusEl.style.color = '#4ade80';
-                    cancelBtn.style.display = 'none';
-                    downloadBtn.style.display = 'inline-block';
-                    runBtn.disabled = false;
-                } else if (s === 'FAILED' || s === 'CANCELLED' || s === 'TIMEOUT' || s === 'OUT_OF_MEMORY') {
-                    jobStatusEl.style.color = '#e94560';
-                    cancelBtn.style.display = 'none';
-                    runBtn.disabled = false;
+            // Start polling this job
+            this.karolinaRunner.startPolling(jobId, (data) => {
+                this.updateJobStatus(jobId, data);
+                if (data.out_name) {
+                    this.karolinaJobs[jobId].out_name = data.out_name;
                 }
             });
 
         } catch (error) {
             statusEl.className = 'status visible error';
             statusEl.textContent = 'Submission failed: ' + error.message;
-            runBtn.disabled = false;
         }
     }
 
@@ -2705,7 +3108,8 @@ class App {
                 animation: false,
                 plugins: {
                     legend: {
-                        display: false
+                        display: true,
+                        labels: { color: '#ccc', font: { size: 10 }, filter: (item) => item.text !== 'Current' }
                     },
                     tooltip: {
                         mode: 'index',
@@ -2750,6 +3154,7 @@ class App {
     showIterationsChart() {
         const container = document.getElementById('iterations-chart-container');
         container.style.display = 'block';
+        this.updateCompareSelector();
     }
 
     hideIterationsChart() {
@@ -2759,8 +3164,11 @@ class App {
 
     clearIterationsChart() {
         this.iterationsData = [];
+        this.compareDatasets = [];
         if (this.iterationsChart) {
             this.iterationsChart.data.labels = [];
+            // Keep only the two base datasets (solver iterations + current marker)
+            this.iterationsChart.data.datasets = this.iterationsChart.data.datasets.slice(0, 2);
             this.iterationsChart.data.datasets[0].data = [];
             this.iterationsChart.data.datasets[1].data = [];
             this.iterationsChart.update('none');
@@ -2768,11 +3176,15 @@ class App {
     }
 
     initIterationsChartAxis(totalSteps) {
-        // Pre-populate x-axis with full time range
+        // Pre-populate x-axis with full time range, keep comparison datasets
         if (this.iterationsChart) {
-            this.iterationsChart.data.labels = Array.from({ length: totalSteps }, (_, i) => i);
-            this.iterationsChart.data.datasets[0].data = new Array(totalSteps).fill(null);
-            this.iterationsChart.data.datasets[1].data = [];
+            const maxLen = Math.max(totalSteps, ...this.compareDatasets.map(d => d.data.length));
+            this.iterationsChart.data.labels = Array.from({ length: maxLen }, (_, i) => i);
+            this.iterationsChart.data.datasets = [
+                { ...this.iterationsChart.data.datasets[0], data: new Array(totalSteps).fill(null) },
+                { ...this.iterationsChart.data.datasets[1], data: [] },
+                ...this.compareDatasets,
+            ];
             this.iterationsChart.update('none');
         }
     }
@@ -2794,9 +3206,14 @@ class App {
     setIterationsData(iterations) {
         this.iterationsData = iterations.map((count, i) => ({ step: i, count }));
         if (this.iterationsChart) {
-            this.iterationsChart.data.labels = iterations.map((_, i) => i);
-            this.iterationsChart.data.datasets[0].data = iterations;
-            this.iterationsChart.data.datasets[1].data = [];
+            const maxLen = Math.max(iterations.length, ...this.compareDatasets.map(d => d.data.length));
+            this.iterationsChart.data.labels = Array.from({ length: maxLen }, (_, i) => i);
+            // Rebuild datasets: base + current marker + comparisons
+            this.iterationsChart.data.datasets = [
+                { ...this.iterationsChart.data.datasets[0], data: iterations },
+                { ...this.iterationsChart.data.datasets[1], data: [] },
+                ...this.compareDatasets,
+            ];
             this.iterationsChart.update('none');
         }
     }
@@ -2971,6 +3388,170 @@ class App {
             this.residualChart.data.datasets[0].data = absData;
             this.residualChart.data.datasets[1].data = relData;
             this.residualChart.update('none');
+        }
+    }
+
+    // ---- Iteration Comparison (overlaid on main chart) ----
+
+    async updateCompareSelector() {
+        const container = document.getElementById('compare-sim-selector');
+        if (!container) return;
+
+        let sims = [];
+        try {
+            const resp = await fetch('/api/simulations/with-iterations');
+            const data = await resp.json();
+            sims = data.simulations || [];
+        } catch (e) {
+            console.warn('Failed to fetch simulations with iterations:', e);
+        }
+
+        // Remember currently checked items
+        const checked = new Set();
+        container.querySelectorAll('input:checked').forEach(cb => checked.add(cb.value));
+
+        container.innerHTML = '';
+
+        if (sims.length === 0) return;
+
+        // Show chart container if it's hidden (so user can compare even without active run)
+        const chartContainer = document.getElementById('iterations-chart-container');
+        if (chartContainer.style.display === 'none') {
+            chartContainer.style.display = 'block';
+        }
+
+        // Group by mesh
+        const groups = {};
+        for (const sim of sims) {
+            const match = sim.name.match(/^(.+?)_sim/);
+            const mesh = match ? match[1] : 'other';
+            if (!groups[mesh]) groups[mesh] = [];
+            groups[mesh].push(sim);
+        }
+
+        for (const [mesh, meshSims] of Object.entries(groups).sort((a, b) => a[0].localeCompare(b[0]))) {
+            const group = document.createElement('details');
+            group.style.cssText = 'margin-bottom: 4px;';
+            const summary = document.createElement('summary');
+            summary.style.cssText = 'cursor:pointer; font-size:0.8em; font-weight:bold; color:#888; padding:2px 0;';
+            summary.textContent = `${mesh} (${meshSims.length})`;
+            group.appendChild(summary);
+
+            for (const sim of meshSims) {
+                const label = document.createElement('label');
+                label.style.cssText = 'display:block; margin:2px 0 2px 16px; font-size:0.75em; cursor:pointer;';
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.value = sim.name;
+                cb.style.marginRight = '6px';
+                if (checked.has(sim.name)) cb.checked = true;
+                cb.addEventListener('change', () => this.onCompareSelectionChange());
+                label.appendChild(cb);
+
+                let displayLabel = '';
+                if (sim.solver || sim.preconditioner) {
+                    const parts = [sim.preconditioner || sim.solver];
+                    if (sim.localSolver) parts[0] += `(${sim.localSolver})`;
+                    if (sim.nRanks) parts.push(`${sim.nRanks}r`);
+                    displayLabel = parts.join(' ');
+                } else {
+                    displayLabel = sim.name.replace(/^.+?_sim_?/, '') || 'default';
+                }
+                label.appendChild(document.createTextNode(displayLabel));
+                group.appendChild(label);
+            }
+
+            container.appendChild(group);
+        }
+    }
+
+    _getCompareLabel(simName) {
+        const cb = document.querySelector(`#compare-sim-selector input[value="${simName}"]`);
+        if (cb && cb.parentElement) {
+            const text = cb.parentElement.textContent.trim();
+            if (text) return text;
+        }
+        return simName;
+    }
+
+    async onCompareSelectionChange() {
+        const checkboxes = document.querySelectorAll('#compare-sim-selector input:checked');
+        const selected = Array.from(checkboxes).map(cb => cb.value);
+
+        // Remove old comparison datasets, keep first 2 (solver iterations + current marker)
+        if (this.iterationsChart) {
+            this.iterationsChart.data.datasets = this.iterationsChart.data.datasets.slice(0, 2);
+        }
+        this.compareDatasets = [];
+
+        if (selected.length === 0) {
+            document.getElementById('compare-conditions-warning').style.display = 'none';
+            if (this.iterationsChart) this.iterationsChart.update('none');
+            return;
+        }
+
+        // Use distinct colors that differ from the primary red (#e94560)
+        const colors = ['#4a9de9', '#4ade80', '#e9c74a', '#c74ae9', '#e9844a', '#4ae9c7', '#e94ac7', '#9de94a'];
+        const conditionsHashes = new Map();
+
+        for (let i = 0; i < selected.length; i++) {
+            try {
+                const data = await this.karolinaRunner.fetchIterations(selected[i]);
+                const iters = data.iterations || [];
+
+                const ds = {
+                    label: this._getCompareLabel(selected[i]),
+                    data: iters,
+                    borderColor: colors[i % colors.length],
+                    borderWidth: 1.5,
+                    fill: false,
+                    tension: 0.1,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                };
+                this.compareDatasets.push(ds);
+
+                if (data.conditions) {
+                    // Hash only physics conditions (mesh, IC, scar) — not solver config
+                    const phys = {
+                        mesh: data.conditions.mesh,
+                        boundingBox: data.conditions.boundingBox,
+                        vExcited: data.conditions.vExcited,
+                        vResting: data.conditions.vResting,
+                        scarEnabled: data.conditions.scarEnabled,
+                        scarBox: data.conditions.scarBox,
+                        scarMargin: data.conditions.scarMargin,
+                        scarConductivities: data.conditions.scarConductivities,
+                    };
+                    conditionsHashes.set(selected[i], JSON.stringify(phys, Object.keys(phys).sort()));
+                }
+            } catch (e) {
+                console.warn(`Failed to fetch iterations for ${selected[i]}:`, e);
+            }
+        }
+
+        // Conditions mismatch warning
+        const warningEl = document.getElementById('compare-conditions-warning');
+        const uniqueHashes = new Set(conditionsHashes.values());
+        if (conditionsHashes.size >= 2 && uniqueHashes.size > 1) {
+            warningEl.textContent = 'Different conditions';
+            warningEl.style.display = 'inline-block';
+        } else {
+            warningEl.style.display = 'none';
+        }
+
+        // Add comparison datasets to the main chart
+        if (this.iterationsChart) {
+            // Ensure x-axis is long enough for all datasets
+            const maxCompareLen = Math.max(0, ...this.compareDatasets.map(d => d.data.length));
+            const currentLen = this.iterationsChart.data.labels.length;
+            if (maxCompareLen > currentLen) {
+                this.iterationsChart.data.labels = Array.from({ length: maxCompareLen }, (_, i) => i);
+            }
+            for (const ds of this.compareDatasets) {
+                this.iterationsChart.data.datasets.push(ds);
+            }
+            this.iterationsChart.update('none');
         }
     }
 }

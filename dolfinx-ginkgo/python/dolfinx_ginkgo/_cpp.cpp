@@ -183,6 +183,7 @@ NB_MODULE(_cpp, m) {
         .value("ILU", BDDCConfig::LocalSolver::ILU)
         .value("IC", BDDCConfig::LocalSolver::IC)
         .value("AMG", BDDCConfig::LocalSolver::AMG)
+        .value("HYPRE", BDDCConfig::LocalSolver::HYPRE)
         .export_values();
 
     nb::enum_<BDDCConfig::CoarseSolver>(bddc_config, "CoarseSolver", "Coarse level solver")
@@ -232,6 +233,19 @@ NB_MODULE(_cpp, m) {
         .def_rw("coarse_solver", &BDDCConfig::LocalAMGConfig::coarse_solver)
         .def_rw("coarse_max_iterations", &BDDCConfig::LocalAMGConfig::coarse_max_iterations);
 
+    // Local Hypre BoomerAMG configuration (nested in BDDCConfig)
+    nb::class_<BDDCConfig::LocalHypreConfig> local_hypre_config(bddc_config, "LocalHypreConfig",
+        "Hypre BoomerAMG configuration for local subdomain solver");
+    local_hypre_config
+        .def(nb::init<>())
+        .def_rw("cycle_type", &BDDCConfig::LocalHypreConfig::cycle_type)
+        .def_rw("coarsening_type", &BDDCConfig::LocalHypreConfig::coarsening_type)
+        .def_rw("strength_threshold", &BDDCConfig::LocalHypreConfig::strength_threshold)
+        .def_rw("smoother_type", &BDDCConfig::LocalHypreConfig::smoother_type)
+        .def_rw("num_sweeps", &BDDCConfig::LocalHypreConfig::num_sweeps)
+        .def_rw("interpolation_type", &BDDCConfig::LocalHypreConfig::interpolation_type)
+        .def_rw("max_levels", &BDDCConfig::LocalHypreConfig::max_levels);
+
     bddc_config
         .def(nb::init<>())
         .def_rw("vertices", &BDDCConfig::vertices)
@@ -242,6 +256,7 @@ NB_MODULE(_cpp, m) {
         .def_rw("local_max_iterations", &BDDCConfig::local_max_iterations)
         .def_rw("local_tolerance", &BDDCConfig::local_tolerance)
         .def_rw("local_amg", &BDDCConfig::local_amg)
+        .def_rw("local_hypre", &BDDCConfig::local_hypre)
         .def_rw("coarse_solver", &BDDCConfig::coarse_solver)
         .def_rw("coarse_max_iterations", &BDDCConfig::coarse_max_iterations)
         .def_rw("coarse_tolerance", &BDDCConfig::coarse_tolerance)
