@@ -1235,7 +1235,7 @@ def get_interfaces():
     # Use the most recently modified *_sim directory to match the current IF files.
     matrix_to_vertex = None
     sim_dirs = sorted(
-        [d for d in PROJECT_ROOT.glob('*_sim') if (d / 'matrix_to_vertex.pickle').exists()],
+        [d for d in PROJECT_ROOT.glob('*_sim*') if d.is_dir() and (d / 'matrix_to_vertex.pickle').exists()],
         key=lambda d: (d / 'matrix_to_vertex.pickle').stat().st_mtime,
         reverse=True
     )
