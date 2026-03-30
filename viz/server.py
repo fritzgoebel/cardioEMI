@@ -154,11 +154,66 @@ def update_config():
         # Remove empty lines that were marked for deletion
         lines = [l for l in lines if l != '']
 
+        # Ensure essential keys exist (for remote-only meshes where config was created without them)
+        mesh_name = config_file.replace('input_', '').replace('.yml', '')
+        essential_defaults = [
+            ('mesh_file', f'data/{mesh_name}.xdmf'),
+            ('tags_dictionary_file', f'data/{mesh_name}.pickle'),
+            ('mesh_conversion_factor', '0.0001'),
+            ('save_output', 'true'),
+            ('save_interval', '10'),
+        ]
+        insert_lines = []
+        for key, default_value in essential_defaults:
+            pattern = rf'^(\s*){re.escape(key)}\s*:'
+            if not any(re.match(pattern, line) for line in lines):
+                insert_lines.append(f'{key}: {default_value}\n')
+        # Add ionic_model as block-style YAML if missing
+        if not any(re.match(r'^(\s*)ionic_model\s*:', line) for line in lines):
+            insert_lines.append('ionic_model:\n')
+            insert_lines.append('  intra_intra: Passive\n')
+            insert_lines.append('  intra_extra: AP\n')
+        for line in reversed(insert_lines):
+            lines.insert(0, line)
+
         # Write back
         with open(config_path, 'w') as f:
             f.writelines(lines)
 
         return jsonify({'success': True, 'message': 'Config updated'})
+    except FileNotFoundError:
+        # Config file doesn't exist - create from template for remote mesh
+        try:
+            import yaml
+            mesh_name = config_file.replace('input_', '').replace('.yml', '')
+            template = {
+                'mesh_file': f'data/{mesh_name}.xdmf',
+                'tags_dictionary_file': f'data/{mesh_name}.pickle',
+                'mesh_conversion_factor': 0.0001,
+                'fem_order': 1,
+                'dt': 0.001,
+                'time_steps': 1000,
+                'C_M': 1,
+                'sigma_i': 4,
+                'sigma_e': 20,
+                'R_g': 0.003,
+                'v_init': '(-80.0) + (80.0) * ((x[0] >= -0.0062) * (x[0] <= 0.0015) * (x[1] >= -0.0019) * (x[1] <= 0.0068) * (x[2] >= -0.002) * (x[2] <= 0.0118))',
+                'Dirichlet_points': 1,
+                'ionic_model': {'intra_intra': 'Passive', 'intra_extra': 'AP'},
+                'solver_backend': 'petsc',
+                'ksp_type': 'preonly',
+                'pc_type': 'lu',
+                'ksp_rtol': '1e-4',
+                'ksp_atol': '1e-8',
+            }
+            # Apply updates
+            for key, value in updates.items():
+                template[key] = value
+            with open(config_path, 'w') as f:
+                yaml.dump(template, f, default_flow_style=False, sort_keys=False)
+            return jsonify({'success': True, 'message': 'Config created from template'})
+        except Exception as e2:
+            return jsonify({'error': str(e2)}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -950,8 +1005,6 @@ def get_results():
     output_dir = request.args.get('dir', 'pepe36_colored_sim')
 
     sim_output_dir = PROJECT_ROOT / output_dir
-    if not sim_output_dir.exists():
-        return jsonify({'error': f'Simulation output not found: {output_dir}'}), 404
 
     # Use simulation output directory name as viz data source
     sim_name = Path(output_dir).name
@@ -959,7 +1012,11 @@ def get_results():
     viz_mesh_path = mesh_data_dir / 'mesh_vertices.bin'
     metadata_path = mesh_data_dir / 'mesh_metadata.json'
 
+    # Allow loading from viz data even if sim output dir doesn't exist locally
+    # (e.g. viz data downloaded from Karolina without full results)
     if not viz_mesh_path.exists():
+        if not sim_output_dir.exists():
+            return jsonify({'error': f'Simulation output not found: {output_dir}'}), 404
         return jsonify({'error': f'Visualization data not found for: {sim_name}'}), 404
 
     try:
@@ -1000,6 +1057,60 @@ def get_results():
         voltages_dir = mesh_data_dir / 'voltages'
         voltages_dir.mkdir(parents=True, exist_ok=True)
 
+        # If voltage binaries already exist (e.g. downloaded from Karolina), use them directly
+        existing_bins = sorted(voltages_dir.glob('*.bin'))
+        if existing_bins:
+            # Use times/vMin/vMax from metadata if available (saved by generate_viz_from_output)
+            times = metadata.get('times')
+            v_min = metadata.get('vMin')
+            v_max = metadata.get('vMax')
+
+            if times is None or v_min is None:
+                # Fallback: scan binaries
+                times = []
+                v_min = float('inf')
+                v_max = float('-inf')
+                for ti, bin_path in enumerate(sorted(existing_bins)):
+                    v_data = np.fromfile(bin_path, dtype=np.float32)
+                    v_min = min(v_min, float(np.min(v_data)))
+                    v_max = max(v_max, float(np.max(v_data)))
+                    dt = metadata.get('dt', 0.001)
+                    times.append(ti * dt)
+                if v_min == float('inf'):
+                    v_min, v_max = 0.0, 0.0
+
+            # Load iterations/residuals if available
+            iterations_path = sim_output_dir / 'iterations.pickle'
+            iterations = None
+            if iterations_path.exists():
+                import pickle
+                with open(iterations_path, 'rb') as f:
+                    iterations = pickle.load(f)
+            residuals_path = sim_output_dir / 'residuals.pickle'
+            residuals = None
+            if residuals_path.exists():
+                import pickle
+                with open(residuals_path, 'rb') as f:
+                    residuals = pickle.load(f)
+
+            # Load scar config
+            scar_config = None
+            conditions_path = sim_output_dir / 'conditions.json'
+            if conditions_path.exists():
+                with open(conditions_path) as f:
+                    cond = json.load(f)
+                    scar_config = cond.get('scar')
+
+            return jsonify({
+                'times': times,
+                'vMin': v_min,
+                'vMax': v_max,
+                'vizDataDir': sim_name,
+                'iterations': iterations or [],
+                'residuals': residuals,
+                'scarConfig': scar_config,
+            })
+
         if use_per_facet:
             first_vij_path = list(vij_files.values())[0]
             with h5py.File(first_vij_path, 'r') as f:
@@ -1007,10 +1118,10 @@ def get_results():
                 v_group = f['Function'][func_name]
                 timestep_keys = sorted(v_group.keys(), key=parse_time)
 
-            max_timesteps = 50
+            max_timesteps = 100
             if len(timestep_keys) > max_timesteps:
                 step = len(timestep_keys) // max_timesteps
-                timestep_keys = timestep_keys[::step]
+                timestep_keys = timestep_keys[::step][:max_timesteps]
 
             # Load vij data for all pairs and timesteps
             vij_data = {}
@@ -1056,10 +1167,10 @@ def get_results():
                 v_group = f['Function']['v']
                 timestep_keys = sorted(v_group.keys(), key=parse_time)
 
-                max_timesteps = 50
+                max_timesteps = 100
                 if len(timestep_keys) > max_timesteps:
                     step = len(timestep_keys) // max_timesteps
-                    timestep_keys = timestep_keys[::step]
+                    timestep_keys = timestep_keys[::step][:max_timesteps]
 
                 times = []
                 v_min = float('inf')
@@ -1544,22 +1655,30 @@ def download_video(filename):
 try:
     from karolina import (
         karolina_state, karolina_jobs, mesh_convert_state,
-        check_ssh, check_containers, upload_config, submit_job,
+        check_ssh, check_containers, upload_config, submit_job, submit_jobs,
         check_job_status, cancel_job, tail_remote_log,
+        get_cached_status,
         download_results_streaming, download_iterations,
         list_remote_simulations,
-        list_remote_meshes, convert_remote_mesh, finish_conversion,
-        download_mesh_data
+        list_remote_meshes, fetch_mesh_metadata,
+        convert_remote_mesh, finish_conversion,
+        download_mesh_data,
+        generate_remote_video, check_video_job, download_video,
+        generate_remote_viz, check_viz_job, download_viz_data_streaming
     )
 except ImportError:
     from viz.karolina import (
         karolina_state, karolina_jobs, mesh_convert_state,
-        check_ssh, check_containers, upload_config, submit_job,
+        check_ssh, check_containers, upload_config, submit_job, submit_jobs,
         check_job_status, cancel_job, tail_remote_log,
+        get_cached_status,
         download_results_streaming, download_iterations,
         list_remote_simulations,
-        list_remote_meshes, convert_remote_mesh, finish_conversion,
-        download_mesh_data
+        list_remote_meshes, fetch_mesh_metadata,
+        convert_remote_mesh, finish_conversion,
+        download_mesh_data,
+        generate_remote_video, check_video_job, download_video,
+        generate_remote_viz, check_viz_job, download_viz_data_streaming
     )
 
 @app.route('/api/karolina/check')
@@ -1571,10 +1690,14 @@ def karolina_check():
 
 @app.route('/api/karolina/submit', methods=['POST'])
 def karolina_submit():
-    """Upload config and submit SLURM job to Karolina."""
+    """Upload config and submit SLURM job(s) to Karolina.
+
+    Accepts 'nodes' as a single int or comma-separated string (e.g. "1,2,4")
+    to submit multiple jobs with different node counts in one go.
+    """
     data = request.json
     config_file = data.get('config', 'input_pepe36_colored.yml')
-    nodes = data.get('nodes', 1)
+    nodes_raw = data.get('nodes', 1)
     ntasks_per_node = data.get('ntasks_per_node', 128)
     walltime = data.get('walltime', '01:00:00')
     partition = data.get('partition', 'qcpu_exp')
@@ -1583,26 +1706,53 @@ def karolina_submit():
     label = data.get('label')
     conditions = data.get('conditions')
 
+    # Parse node counts: single int or comma-separated string
+    if isinstance(nodes_raw, str):
+        node_counts = [int(n.strip()) for n in nodes_raw.split(',') if n.strip()]
+    elif isinstance(nodes_raw, list):
+        node_counts = [int(n) for n in nodes_raw]
+    else:
+        node_counts = [int(nodes_raw)]
+
     try:
         config_path = PROJECT_ROOT / config_file
         if not config_path.exists():
             return jsonify({'error': f'Config file not found: {config_file}'}), 404
 
-        # Submit SLURM job (updates config out_name, uploads config + script, submits)
-        job_info = submit_job(
-            config_file, nodes, ntasks_per_node,
-            walltime, partition, account,
-            solver_backend=solver_backend,
-            label=label,
-            conditions=conditions,
-            local_config_path=str(config_path)
-        )
-
-        return jsonify({
-            'success': True,
-            **job_info,
-            'message': f'Job {job_info["job_id"]} submitted to Karolina'
-        })
+        if len(node_counts) == 1:
+            # Single job: use original path
+            job_info = submit_job(
+                config_file, node_counts[0], ntasks_per_node,
+                walltime, partition, account,
+                solver_backend=solver_backend,
+                label=label,
+                conditions=conditions,
+                local_config_path=str(config_path)
+            )
+            return jsonify({
+                'success': True,
+                'jobs': [job_info],
+                **job_info,
+                'message': f'Job {job_info["job_id"]} submitted to Karolina'
+            })
+        else:
+            # Multiple node counts: batch submit
+            job_infos = submit_jobs(
+                config_file, node_counts, ntasks_per_node,
+                walltime, partition, account,
+                solver_backend=solver_backend,
+                label=label,
+                conditions=conditions,
+                local_config_path=str(config_path)
+            )
+            job_ids = [j['job_id'] for j in job_infos]
+            return jsonify({
+                'success': True,
+                'jobs': job_infos,
+                # Legacy compat: expose first job at top level
+                **(job_infos[0] if job_infos else {}),
+                'message': f'{len(job_infos)} jobs submitted: {", ".join(job_ids)}'
+            })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1627,6 +1777,19 @@ def karolina_status(job_id=None):
 
     job = karolina_jobs.get(job_id, {})
 
+    # Use cached status from background poller (non-blocking)
+    cached_status, cached_log = get_cached_status(job_id)
+    if cached_status is not None:
+        return jsonify({
+            'job_id': job_id,
+            'status': cached_status,
+            'out_name': job.get('out_name', karolina_state.get('out_name', '')),
+            'label': job.get('label', ''),
+            'conditions_hash': job.get('conditions_hash'),
+            'log': cached_log or ''
+        })
+
+    # Fallback for jobs not yet in cache (e.g. from before poller started)
     try:
         status = check_job_status(job_id)
         log = tail_remote_log(job_id)
@@ -1711,6 +1874,15 @@ def karolina_meshes():
     except Exception as e:
         return jsonify({'error': str(e), 'families': []}), 500
 
+@app.route('/api/karolina/meshes/metadata/<mesh_name>')
+def karolina_mesh_metadata(mesh_name):
+    """Fetch mesh bounding box and metadata from Karolina without downloading."""
+    try:
+        metadata = fetch_mesh_metadata(mesh_name)
+        return jsonify(metadata)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/karolina/meshes/convert', methods=['POST'])
 def karolina_convert_mesh():
     """Convert a remote mesh on Karolina inside the DOLFINx container (SSE stream)."""
@@ -1776,6 +1948,113 @@ def karolina_download_mesh():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+# --------------------- Remote Video API ---------------------
+
+# In-memory tracking for remote video jobs
+remote_video_jobs = {}
+
+@app.route('/api/karolina/video/generate', methods=['POST'])
+def karolina_generate_video():
+    """Submit a video generation job on Karolina."""
+    data = request.json
+    sim_name = data.get('sim_name')
+    if not sim_name:
+        return jsonify({'error': 'No simulation name specified'}), 400
+
+    try:
+        result = generate_remote_video(
+            sim_name,
+            width=data.get('width', 1920),
+            height=data.get('height', 1080),
+            fps=data.get('fps', 30),
+            camera_config=data.get('camera'),
+            colormap=data.get('colormap', 'coolwarm'),
+            partition=data.get('partition', 'qcpu_exp'),
+            account=data.get('account', 'eu-26-11'),
+        )
+        remote_video_jobs[result['job_id']] = result
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/karolina/video/status/<job_id>')
+def karolina_video_status(job_id):
+    """Check status of a remote video generation job."""
+    job = remote_video_jobs.get(job_id, {})
+    log_file = job.get('log_file')
+    try:
+        result = check_video_job(job_id, log_file)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/karolina/video/download/<job_id>', methods=['POST'])
+def karolina_download_video(job_id):
+    """Download a generated video from Karolina."""
+    job = remote_video_jobs.get(job_id, {})
+    log_file = job.get('log_file')
+
+    # Get video filename from job log
+    try:
+        status = check_video_job(job_id, log_file)
+        video_filename = status.get('video_filename')
+        if not video_filename:
+            return jsonify({'error': 'Video file not found in job output'}), 404
+
+        local_dir = PROJECT_ROOT / 'viz' / 'videos'
+        local_path = download_video(video_filename, local_dir)
+        return jsonify({
+            'success': True,
+            'filename': video_filename,
+            'download_url': f'/api/video/download/{video_filename}'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# --------------------- Remote Viz Data API ---------------------
+
+remote_viz_jobs = {}
+
+@app.route('/api/karolina/viz/generate', methods=['POST'])
+def karolina_generate_viz():
+    """Submit a viz data generation job on Karolina."""
+    data = request.json
+    sim_name = data.get('sim_name')
+    if not sim_name:
+        return jsonify({'error': 'No simulation name specified'}), 400
+    try:
+        result = generate_remote_viz(sim_name)
+        remote_viz_jobs[result['job_id']] = result
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/karolina/viz/status/<job_id>')
+def karolina_viz_status(job_id):
+    """Check status of a remote viz generation job."""
+    job = remote_viz_jobs.get(job_id, {})
+    try:
+        result = check_viz_job(job_id, job.get('log_file'))
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/karolina/viz/download', methods=['POST'])
+def karolina_download_viz():
+    """Download viz data from Karolina as streaming SSE."""
+    data = request.json
+    sim_name = data.get('sim_name')
+    if not sim_name:
+        return jsonify({'error': 'No simulation name specified'}), 400
+
+    local_dest = PROJECT_ROOT / 'viz' / 'data' / sim_name
+
+    def stream():
+        for event in download_viz_data_streaming(sim_name, local_dest):
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return Response(stream(), mimetype='text/event-stream')
 
 # --------------------- Main ---------------------
 

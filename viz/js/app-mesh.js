@@ -212,30 +212,22 @@ App.prototype.onKarolinaMeshSelected = async function(meshName) {
     let localInfo = this.meshesInfo?.find(m => m.name === meshName);
 
     if (!localInfo) {
-        // Need to download from Karolina
+        // Mesh not local — fetch metadata (bounds) from Karolina instead of downloading
         statusEl.className = 'mesh-status pending';
-        statusEl.textContent = `Downloading ${meshName} from Karolina...`;
+        statusEl.textContent = `Fetching bounds for ${meshName} from Karolina...`;
 
         try {
-            await this.karolinaRunner.downloadMeshData(meshName);
-            statusEl.textContent = `Downloaded ${meshName}. Checking conversion...`;
-
-            // Refresh local mesh info
-            const resp = await fetch('/api/meshes');
-            const data = await resp.json();
-            this.meshesInfo = data.meshes;
-            localInfo = data.meshes.find(m => m.name === meshName);
+            const metadata = await this.karolinaRunner.fetchMeshMetadata(meshName);
+            this.applyRemoteMeshMetadata(meshName, metadata);
+            statusEl.className = 'mesh-status converted';
+            statusEl.textContent = `Remote mesh: ${meshName} (${metadata.vertex_count.toLocaleString()} vertices) — bounds loaded`;
+            statusEl.style.display = 'block';
+            return;
         } catch (e) {
             statusEl.className = 'mesh-status error';
-            statusEl.textContent = `Download failed: ${e.message}`;
+            statusEl.textContent = `Failed to fetch metadata: ${e.message}`;
             return;
         }
-    }
-
-    if (!localInfo) {
-        statusEl.className = 'mesh-status error';
-        statusEl.textContent = `Mesh ${meshName} not found locally after download`;
-        return;
     }
 
     // Step 2: Check if viz conversion exists
@@ -255,6 +247,37 @@ App.prototype.onKarolinaMeshSelected = async function(meshName) {
 
     // Step 3: Already local and converted - just select it
     await this.selectMesh(meshName);
+};
+
+App.prototype.applyRemoteMeshMetadata = function(meshName, metadata) {
+    // Store bounds and conversion factor from remote metadata
+    this.meshBounds = metadata.bounds;
+    this.conversionFactor = metadata.mesh_conversion_factor;
+    this.remoteMeshName = meshName;
+
+    // Track this as the current mesh (used by conditions snapshot, v_init, etc.)
+    this.meshLoader.setMesh(meshName);
+
+    // Update config manager with the mesh name for YAML generation
+    const configFile = `input_${meshName}.yml`;
+    this.configManager.setConfigFile(configFile);
+    this.simulationRunner.setConfigFile(configFile);
+
+    // Re-initialize sliders with new bounds
+    this.setupSliders();
+
+    // Restore per-mesh IC/scar config from localStorage
+    this.loadMeshConfig();
+
+    // Update 3D viewer: clear old mesh, show bounds outline
+    if (this.viewer) {
+        this.viewer.clearAllMeshes();
+        this.viewer.showBoundsOutline(metadata.bounds);
+        this.updateBoundingBoxVisualization();
+    }
+
+    this.updateVinitExpression();
+    this.updateColorbar();
 };
 
 App.prototype.updateMeshStatus = function(meshName, meshes) {

@@ -13,7 +13,7 @@ import pickle
 from pathlib import Path
 
 
-def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callback=None) -> dict:
+def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callback=None, membrane_only=False) -> dict:
     """
     Generate visualization binary files from simulation output.
 
@@ -85,9 +85,12 @@ def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callb
     report(25, f"Found {len(membrane_facets)} membrane triangles")
 
     # Extract exterior boundary facets (ECS surface) - tag 0 or negative
-    exterior_mask = facet_tags <= 0
-    exterior_facets = facet_topo[exterior_mask]
-    report(26, f"Found {len(exterior_facets)} exterior boundary triangles")
+    if not membrane_only:
+        exterior_mask = facet_tags <= 0
+        exterior_facets = facet_topo[exterior_mask]
+        report(26, f"Found {len(exterior_facets)} exterior boundary triangles")
+    else:
+        exterior_facets = np.array([])
 
     # Load facet tag to pair mapping
     facet_tag_to_pair = {}
@@ -112,27 +115,28 @@ def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callb
 
     report(30, f"Found {len(vij_files)} per-membrane voltage files")
 
-    # Load DOF rank ownership if available
-    dof_ranks_pickle = sim_output_dir / 'dof_ranks.pickle'
+    # Load DOF rank ownership if available (skip for membrane_only)
     dof_rank_info = None
-    if dof_ranks_pickle.exists():
-        with open(dof_ranks_pickle, 'rb') as f:
-            dof_rank_info = pickle.load(f)
-        report(32, f"Loaded DOF rank ownership ({dof_rank_info['num_ranks']} ranks)")
-
-    # Load DOF contribution data if available (which ranks contribute to each DOF)
-    dof_contributors_pickle = sim_output_dir / 'dof_contributors.pickle'
     dof_contributors_info = None
-    if dof_contributors_pickle.exists():
-        with open(dof_contributors_pickle, 'rb') as f:
-            dof_contributors_info = pickle.load(f)
-        report(32, f"Loaded DOF contribution data ({len(dof_contributors_info['contributors'])} DOFs)")
+    if not membrane_only:
+        dof_ranks_pickle = sim_output_dir / 'dof_ranks.pickle'
+        if dof_ranks_pickle.exists():
+            with open(dof_ranks_pickle, 'rb') as f:
+                dof_rank_info = pickle.load(f)
+            report(32, f"Loaded DOF rank ownership ({dof_rank_info['num_ranks']} ranks)")
 
-    # Extract partition cut facets from cell topology if we have rank data
+        # Load DOF contribution data if available (which ranks contribute to each DOF)
+        dof_contributors_pickle = sim_output_dir / 'dof_contributors.pickle'
+        if dof_contributors_pickle.exists():
+            with open(dof_contributors_pickle, 'rb') as f:
+                dof_contributors_info = pickle.load(f)
+            report(32, f"Loaded DOF contribution data ({len(dof_contributors_info['contributors'])} DOFs)")
+
+    # Extract partition cut facets from cell topology if we have rank data (skip for membrane_only)
     # These are internal facets where adjacent intracellular cells belong to different MPI ranks
     # We exclude ECS (cell tag 0) - only show cuts through intracellular space
     partition_cut_facets = None
-    if dof_rank_info is not None:
+    if dof_rank_info is not None and not membrane_only:
         report(33, "Extracting partition cut facets from cell topology...")
         dof_ranks = dof_rank_info['ranks']
         from collections import defaultdict, Counter
@@ -527,6 +531,90 @@ def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callb
     with open(viz_output_dir / "pair_mapping.json", 'w') as f:
         json.dump(pair_mapping, f, indent=2)
 
+    # Generate per-timestep voltage binary files
+    report(75, "Generating voltage binaries...")
+    voltages_dir = viz_output_dir / 'voltages'
+    voltages_dir.mkdir(parents=True, exist_ok=True)
+
+    def parse_time(key):
+        return float(key.replace('_', '.'))
+
+    times = []
+    v_min_all = float('inf')
+    v_max_all = float('-inf')
+    num_facets = len(facet_orig_vertices)
+
+    if len(vij_files) > 0:
+        # Per-facet voltage from v_i_j.h5 files
+        first_vij_path = list(vij_files.values())[0]
+        with h5py.File(first_vij_path, 'r') as f:
+            func_name = list(f['Function'].keys())[0]
+            timestep_keys = sorted(f['Function'][func_name].keys(), key=parse_time)
+
+        max_timesteps = 100
+        if len(timestep_keys) > max_timesteps:
+            step_size = len(timestep_keys) // max_timesteps
+            timestep_keys = timestep_keys[::step_size][:max_timesteps]
+
+        vij_data = {}
+        for pair, vij_path in vij_files.items():
+            with h5py.File(vij_path, 'r') as f:
+                func_name = list(f['Function'].keys())[0]
+                v_group = f['Function'][func_name]
+                vij_data[pair] = {}
+                for key in timestep_keys:
+                    if key in v_group:
+                        vij_data[pair][key] = np.nan_to_num(
+                            v_group[key][:].flatten(), nan=0.0).astype(np.float32)
+
+        for ti, key in enumerate(timestep_keys):
+            expanded_voltages = np.zeros(num_facets * 3, dtype=np.float32)
+            for facet_idx in range(num_facets):
+                pair_idx = facet_pair_indices[facet_idx]
+                orig_verts = facet_orig_vertices[facet_idx]
+                if pair_idx < len(unique_pairs):
+                    pair = unique_pairs[pair_idx]
+                    if pair in vij_data and key in vij_data[pair]:
+                        v_data = vij_data[pair][key]
+                        for local_v, orig_v in enumerate(orig_verts):
+                            if orig_v < len(v_data):
+                                expanded_voltages[facet_idx * 3 + local_v] = v_data[orig_v]
+            expanded_voltages.tofile(voltages_dir / f'{ti}.bin')
+            v_min_all = min(v_min_all, float(np.min(expanded_voltages)))
+            v_max_all = max(v_max_all, float(np.max(expanded_voltages)))
+            times.append(parse_time(key))
+            if (ti + 1) % 10 == 0:
+                report(75 + int(25 * (ti + 1) / len(timestep_keys)),
+                       f"Voltage timestep {ti + 1}/{len(timestep_keys)}")
+    else:
+        # Fallback: single v.h5
+        v_h5 = sim_output_dir / 'v.h5'
+        if v_h5.exists():
+            with h5py.File(v_h5, 'r') as f:
+                v_group = f['Function']['v']
+                timestep_keys = sorted(v_group.keys(), key=parse_time)
+                max_timesteps = 100
+                if len(timestep_keys) > max_timesteps:
+                    step_size = len(timestep_keys) // max_timesteps
+                    timestep_keys = timestep_keys[::step_size][:max_timesteps]
+                for ti, key in enumerate(timestep_keys):
+                    v_data = np.nan_to_num(
+                        v_group[key][:].flatten(), nan=0.0).astype(np.float32)
+                    v_data.tofile(voltages_dir / f'{ti}.bin')
+                    v_min_all = min(v_min_all, float(np.min(v_data)))
+                    v_max_all = max(v_max_all, float(np.max(v_data)))
+                    times.append(parse_time(key))
+
+    if v_min_all == float('inf'):
+        v_min_all, v_max_all = 0.0, 0.0
+
+    # Save voltage metadata
+    metadata['times'] = times
+    metadata['vMin'] = v_min_all
+    metadata['vMax'] = v_max_all
+    with open(viz_output_dir / "mesh_metadata.json", 'w') as mf:
+        json.dump(metadata, mf, indent=2)
+
     report(100, "Visualization data generated!")
 
     return metadata
@@ -536,29 +624,38 @@ def main():
     """Command-line entry point."""
     import sys
 
-    if len(sys.argv) < 2:
-        print("Usage: python generate_viz_from_output.py <sim_output_dir> [viz_output_dir]")
+    # Parse --membrane-only flag
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    membrane_only = '--membrane-only' in sys.argv
+
+    if len(args) < 1:
+        print("Usage: python generate_viz_from_output.py [--membrane-only] <sim_output_dir> [viz_output_dir]")
         print("Example: python generate_viz_from_output.py pepe36_colored_sim")
         sys.exit(1)
 
     SCRIPT_DIR = Path(__file__).parent
     PROJECT_ROOT = SCRIPT_DIR.parent.parent
 
-    sim_output_dir = PROJECT_ROOT / sys.argv[1]
+    sim_output_dir = PROJECT_ROOT / args[0]
 
     # Default viz output to viz/data/{sim_name}
-    if len(sys.argv) > 2:
-        viz_output_dir = Path(sys.argv[2])
+    if len(args) > 1:
+        viz_output_dir = Path(args[1])
     else:
-        sim_name = Path(sys.argv[1]).name
+        sim_name = Path(args[0]).name
         viz_output_dir = SCRIPT_DIR.parent / 'data' / sim_name
 
     print(f"Generating visualization data...")
     print(f"  Simulation output: {sim_output_dir}")
     print(f"  Visualization output: {viz_output_dir}")
+    if membrane_only:
+        print(f"  Mode: membrane only (no ECS/rank/partition data)")
     print()
 
-    metadata = generate_viz_data(sim_output_dir, viz_output_dir)
+    def progress(percent, message):
+        print(f"PROGRESS:{percent}:{message}", flush=True)
+
+    metadata = generate_viz_data(sim_output_dir, viz_output_dir, progress_callback=progress, membrane_only=membrane_only)
 
     print()
     print(f"Done!")

@@ -1,12 +1,21 @@
-// app-video.js - Video export
+// app-video.js - Video export (local + remote Karolina)
 
 App.prototype.setupVideoExport = function() {
     const exportBtn = document.getElementById('export-video');
+    const remoteBtn = document.getElementById('export-video-remote');
     const progressBar = document.getElementById('video-progress');
     const progressFill = progressBar.querySelector('.progress-fill');
     const progressText = progressBar.querySelector('.progress-text');
     const statusEl = document.getElementById('video-status');
     const downloadLink = document.getElementById('video-download');
+
+    // Show remote button when in Karolina mode
+    if (this.runTarget === 'karolina') {
+        remoteBtn.style.display = 'block';
+    }
+
+    // Remote video generation
+    remoteBtn.addEventListener('click', () => this.exportVideoRemote());
 
     exportBtn.addEventListener('click', async () => {
         const fps = parseInt(document.getElementById('video-fps').value);
@@ -87,6 +96,146 @@ App.prototype.setupVideoExport = function() {
             setTimeout(() => { progressBar.style.display = 'none'; }, 2000);
         }
     });
+};
+
+App.prototype.exportVideoRemote = async function() {
+    const remoteBtn = document.getElementById('export-video-remote');
+    const exportBtn = document.getElementById('export-video');
+    const progressBar = document.getElementById('video-progress');
+    const progressFill = progressBar.querySelector('.progress-fill');
+    const progressText = progressBar.querySelector('.progress-text');
+    const statusEl = document.getElementById('video-status');
+    const downloadLink = document.getElementById('video-download');
+
+    const simName = this.selectedSimulation || document.getElementById('simulation-selector').value;
+    if (!simName) {
+        statusEl.className = 'mesh-status error';
+        statusEl.textContent = 'Select a simulation first';
+        statusEl.style.display = 'block';
+        return;
+    }
+
+    remoteBtn.disabled = true;
+    exportBtn.disabled = true;
+    progressBar.style.display = 'block';
+    progressFill.style.width = '0%';
+    statusEl.style.display = 'none';
+    downloadLink.style.display = 'none';
+
+    try {
+        // Step 1: Check if viz data already exists locally
+        const checkResp = await fetch(`/api/results?dir=${encodeURIComponent(simName)}`);
+        const vizExists = checkResp.ok;
+
+        if (!vizExists) {
+            // Step 1a: Generate viz data on Karolina
+            progressText.textContent = 'Generating viz data on Karolina...';
+            const vizJob = await this.karolinaRunner.generateRemoteViz(simName);
+            const vizJobId = vizJob.job_id;
+
+            statusEl.className = 'mesh-status';
+            statusEl.textContent = `Viz generation job ${vizJobId} submitted`;
+            statusEl.style.display = 'block';
+
+            // Wait for viz generation to complete
+            await new Promise((resolve, reject) => {
+                this.karolinaRunner.startVizPolling(vizJobId, (status) => {
+                    const pct = Math.round(status.progress * 0.2);
+                    progressFill.style.width = `${pct}%`;
+                    progressText.textContent = status.message || `Generating viz data (${status.status})...`;
+
+                    if (status.status === 'COMPLETED') {
+                        resolve();
+                    } else if (['FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY'].includes(status.status)) {
+                        reject(new Error(`Viz generation ${status.status}: ${status.message}`));
+                    }
+                });
+            });
+
+            progressFill.style.width = '20%';
+
+            // Step 1b: Download viz data from Karolina
+            progressText.textContent = 'Downloading viz data...';
+            await this.karolinaRunner.downloadVizData(simName, (data) => {
+                const pct = data.bytes_total > 0
+                    ? 20 + Math.round(20 * data.bytes_done / data.bytes_total) : 20;
+                progressFill.style.width = `${pct}%`;
+                progressText.textContent = data.file || 'Downloading viz data...';
+            });
+        }
+
+        progressFill.style.width = '40%';
+
+        // Step 2: Load results into viewer
+        progressText.textContent = 'Loading results into viewer...';
+        this.selectedSimulation = simName;
+        document.getElementById('simulation-selector').value = simName;
+        await this.loadResults();
+        progressFill.style.width = '50%';
+
+        if (!this.resultsVizDir || !this.resultsTimeSteps || this.resultsTimeSteps.length === 0) {
+            throw new Error('Failed to load results into viewer');
+        }
+
+        // Step 3: Capture frames using the Three.js renderer (same as local export)
+        const fps = parseInt(document.getElementById('video-fps').value);
+        progressText.textContent = 'Starting capture session...';
+
+        const startResp = await fetch('/api/video/start-capture', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ fps })
+        });
+        const { session_id } = await startResp.json();
+
+        const numFrames = this.resultsTimeSteps.length;
+        for (let i = 0; i < numFrames; i++) {
+            await this.showResultsAtTime(i);
+            this.viewer.renderer.render(this.viewer.scene, this.viewer.camera);
+
+            const blob = await this._captureViewerFrame(i);
+            await fetch(`/api/video/frame/${session_id}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'image/jpeg' },
+                body: blob
+            });
+
+            const pct = 50 + Math.round(((i + 1) / numFrames) * 42);
+            progressFill.style.width = `${pct}%`;
+            progressText.textContent = `Capturing frame ${i + 1}/${numFrames}`;
+        }
+
+        // Step 4: Encode video
+        progressText.textContent = 'Encoding video...';
+        progressFill.style.width = '94%';
+
+        const finishResp = await fetch(`/api/video/finish-capture/${session_id}`, {
+            method: 'POST'
+        });
+        const result = await finishResp.json();
+
+        if (result.error) throw new Error(result.error);
+
+        progressFill.style.width = '100%';
+        progressText.textContent = 'Complete!';
+
+        statusEl.className = 'mesh-status converted';
+        statusEl.textContent = 'Video exported successfully!';
+        statusEl.style.display = 'block';
+
+        downloadLink.href = `/api/video/download/${result.filename}`;
+        downloadLink.textContent = `Download ${result.filename}`;
+        downloadLink.style.display = 'block';
+
+    } catch (error) {
+        statusEl.className = 'mesh-status error';
+        statusEl.textContent = `Failed: ${error.message}`;
+        statusEl.style.display = 'block';
+    } finally {
+        remoteBtn.disabled = false;
+        exportBtn.disabled = false;
+        setTimeout(() => { progressBar.style.display = 'none'; }, 2000);
+    }
 };
 
 App.prototype._captureViewerFrame = function(timeIndex) {

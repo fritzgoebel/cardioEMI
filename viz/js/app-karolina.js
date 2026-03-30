@@ -39,6 +39,7 @@ App.prototype.setupRunTarget = function() {
                 statusDot.title = 'SSH check failed';
             }
             document.getElementById('download-karolina-results').style.display = 'block';
+            document.getElementById('export-video-remote').style.display = 'block';
             this.loadSimulationList();
         } else {
             karolinaOptions.style.display = 'none';
@@ -47,6 +48,7 @@ App.prototype.setupRunTarget = function() {
             refreshBtn.style.display = 'none';
             mpiRanksRow.style.display = 'flex';
             document.getElementById('download-karolina-results').style.display = 'none';
+            document.getElementById('export-video-remote').style.display = 'none';
             this.refreshMeshList();
         }
     };

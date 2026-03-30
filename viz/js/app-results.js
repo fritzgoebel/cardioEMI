@@ -170,13 +170,17 @@ App.prototype.loadResults = async function() {
         timeSlider.value = 0;
         document.getElementById('result-time-val').textContent = this.resultsTimeSteps[0].toFixed(3);
 
-        document.getElementById('v-min-result').textContent = Math.round(data.vMin);
-        document.getElementById('v-max-result').textContent = Math.round(data.vMax);
+        // Clamp to physiological voltage range (AP model can overshoot)
+        const vMin = Math.max(data.vMin, -80);
+        const vMax = Math.min(data.vMax, 30);
 
-        this.viewer.setVoltageRange(data.vMin, data.vMax);
-        document.getElementById('colorbar-max').textContent = `${Math.round(data.vMax)} mV`;
-        document.getElementById('colorbar-min').textContent = `${Math.round(data.vMin)} mV`;
-        document.getElementById('colorbar-mid').textContent = `${Math.round((data.vMax + data.vMin) / 2)} mV`;
+        document.getElementById('v-min-result').textContent = Math.round(vMin);
+        document.getElementById('v-max-result').textContent = Math.round(vMax);
+
+        this.viewer.setVoltageRange(vMin, vMax);
+        document.getElementById('colorbar-max').textContent = `${Math.round(vMax)} mV`;
+        document.getElementById('colorbar-min').textContent = `${Math.round(vMin)} mV`;
+        document.getElementById('colorbar-mid').textContent = `${Math.round((vMax + vMin) / 2)} mV`;
 
         // Apply scar config from the simulation's YAML
         if (data.scarConfig && data.scarConfig.regions && data.scarConfig.regions.length > 0) {

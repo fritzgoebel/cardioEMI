@@ -1087,12 +1087,11 @@ if comm.rank == 0:
     print("Global #DoFs =", b.getSize())
     print("Average iterations =", sum(ksp_iterations)/len(ksp_iterations))
 
-    # Save iterations and residuals to file for visualization
-    if params["save_output"]:
-        with open(out_name + "/iterations.pickle", "wb") as f:
-            pickle.dump(ksp_iterations, f)
-        with open(out_name + "/residuals.pickle", "wb") as f:
-            pickle.dump({'abs': residual_abs, 'rel': residual_rel}, f)
+    # Save iterations and residuals to file for visualization (always, they're small)
+    with open(out_name + "/iterations.pickle", "wb") as f:
+        pickle.dump(ksp_iterations, f)
+    with open(out_name + "/residuals.pickle", "wb") as f:
+        pickle.dump({'abs': residual_abs, 'rel': residual_rel}, f)
     
     if isinstance(params["ionic_model"], dict):
         print("Ionic models:")

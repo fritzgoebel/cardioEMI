@@ -34,6 +34,7 @@ class App {
 
         this.meshBounds = null;
         this.conversionFactor = 0.0001;
+        this.remoteMeshName = null;  // Set when using remote-only mesh (no local data)
 
         // Results data
         this.resultsData = null;

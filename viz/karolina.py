@@ -11,6 +11,7 @@ import json
 import os
 import hashlib
 import yaml
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -42,6 +43,129 @@ mesh_convert_state = {
     'converting': False,
     'process': None,  # subprocess.Popen for streaming output
 }
+
+# Background poller state: cached status/log per job, updated by a background thread
+_poll_cache = {}        # job_id -> {'status': str, 'log': str}
+_poll_lock = threading.Lock()
+_poll_thread = None
+_poll_stop = threading.Event()
+POLL_INTERVAL = 5  # seconds between background poll cycles
+
+TERMINAL_STATES = {'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY'}
+
+
+def _poll_active_jobs():
+    """Background thread: periodically check all active jobs via batched SSH."""
+    while not _poll_stop.is_set():
+        # Collect job IDs that still need polling
+        with _poll_lock:
+            active = {jid: karolina_jobs[jid]
+                      for jid in list(karolina_jobs)
+                      if _poll_cache.get(jid, {}).get('status') not in TERMINAL_STATES}
+
+        if active:
+            job_ids = list(active.keys())
+            job_ids_str = ','.join(job_ids)
+
+            # --- Batch status check: single SSH call for all jobs ---
+            statuses = {}
+            try:
+                stdout, _, rc = _run_ssh(
+                    f'squeue -j {job_ids_str} --noheader -o "%i %T" 2>/dev/null; '
+                    f'sacct -j {job_ids_str} --noheader -o JobID,State -P 2>/dev/null',
+                    timeout=20
+                )
+                if rc == 0 and stdout:
+                    for line in stdout.strip().split('\n'):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        parts = line.split('|') if '|' in line else line.split()
+                        if len(parts) >= 2:
+                            jid = parts[0].strip().split('.')[0]  # strip sacct sub-steps
+                            st = parts[1].strip()
+                            if jid in active and st:
+                                statuses[jid] = st
+            except (subprocess.TimeoutExpired, Exception):
+                pass
+
+            # --- Batch log tail: single SSH call for all jobs ---
+            logs = {}
+            # Build a combined tail command
+            tail_parts = []
+            for jid in job_ids:
+                job = active[jid]
+                out_name = job.get('out_name', '')
+                # Try the tee'd log first (more useful), fall back to slurm log
+                if out_name:
+                    tail_parts.append(
+                        f'echo "@@JOB {jid}@@"; '
+                        f'tail -n 50 {REMOTE_PATH}/{out_name}_slurm.log 2>/dev/null || '
+                        f'tail -n 50 {REMOTE_PATH}/slurm_{jid}.out 2>/dev/null || true'
+                    )
+                else:
+                    tail_parts.append(
+                        f'echo "@@JOB {jid}@@"; '
+                        f'tail -n 50 {REMOTE_PATH}/slurm_{jid}.out 2>/dev/null || true'
+                    )
+            try:
+                combined = '; '.join(tail_parts)
+                stdout, _, rc = _run_ssh(combined, timeout=20)
+                if rc == 0 and stdout:
+                    current_jid = None
+                    current_lines = []
+                    for line in stdout.split('\n'):
+                        if line.startswith('@@JOB ') and line.endswith('@@'):
+                            if current_jid:
+                                logs[current_jid] = '\n'.join(current_lines)
+                            current_jid = line[6:-2]
+                            current_lines = []
+                        else:
+                            current_lines.append(line)
+                    if current_jid:
+                        logs[current_jid] = '\n'.join(current_lines)
+            except (subprocess.TimeoutExpired, Exception):
+                pass
+
+            # --- Update cache ---
+            with _poll_lock:
+                for jid in job_ids:
+                    entry = _poll_cache.setdefault(jid, {'status': 'PENDING', 'log': ''})
+                    if jid in statuses:
+                        entry['status'] = statuses[jid]
+                        # Also update karolina_jobs so other code sees it
+                        if jid in karolina_jobs:
+                            karolina_jobs[jid]['status'] = statuses[jid]
+                    if jid in logs:
+                        entry['log'] = logs[jid]
+
+        _poll_stop.wait(POLL_INTERVAL)
+
+
+def start_background_poller():
+    """Start the background polling thread (idempotent)."""
+    global _poll_thread
+    if _poll_thread and _poll_thread.is_alive():
+        return
+    _poll_stop.clear()
+    _poll_thread = threading.Thread(target=_poll_active_jobs, daemon=True)
+    _poll_thread.start()
+
+
+def stop_background_poller():
+    """Stop the background polling thread."""
+    _poll_stop.set()
+    if _poll_thread:
+        _poll_thread.join(timeout=5)
+
+
+def get_cached_status(job_id):
+    """Return cached (status, log) for a job, or None if not cached."""
+    with _poll_lock:
+        entry = _poll_cache.get(job_id)
+        if entry:
+            return entry['status'], entry['log']
+    return None, None
 
 
 def _run_ssh(cmd, timeout=30):
@@ -100,6 +224,58 @@ def check_containers():
 
 
 # --------------------- Remote Mesh Operations ---------------------
+
+def fetch_mesh_metadata(mesh_name):
+    """Fetch mesh bounding box and metadata from Karolina without downloading the mesh.
+
+    Runs a tiny Python script inside the container that reads the H5 file header.
+    Returns dict with bounds, mesh_conversion_factor, vertex_count, etc.
+    """
+    pylibs = '/home/fenics/.pylibs'
+    script = (
+        'import h5py, json, numpy as np; '
+        f'f = h5py.File("data/{mesh_name}.h5", "r"); '
+        'v = f["/Mesh/mesh/geometry"][:]; '
+        'tags = f["/Mesh/facet_tags/Values"][:]; '
+        'mt = tags[tags > 0]; '
+        'ext = max(v[:,0].max()-v[:,0].min(), v[:,1].max()-v[:,1].min(), v[:,2].max()-v[:,2].min()); '
+        'cf = 0.0001 if ext > 10 else 1.0; '
+        'print(json.dumps({"bounds": {'
+        '"x": [float(v[:,0].min()), float(v[:,0].max())], '
+        '"y": [float(v[:,1].min()), float(v[:,1].max())], '
+        '"z": [float(v[:,2].min()), float(v[:,2].max())]}, '
+        '"mesh_conversion_factor": cf, '
+        '"vertex_count": len(v), '
+        '"facet_count": int((tags > 0).sum()), '
+        '"unique_tags": sorted(set(int(t) for t in mt))}))'
+    )
+    container_cmd = (
+        f'pip install --target={pylibs} -q h5py 2>/dev/null; '
+        f'export PYTHONPATH={pylibs}:$PYTHONPATH && '
+        f'python3 -c {_shell_quote(script)}'
+    )
+    apptainer_cmd = _apptainer_exec(DOLFINX_SIF, container_cmd)
+    # Unset host env vars that interfere with apptainer before running
+    full_cmd = (
+        f'unset SINGULARITY_BINDPATH SINGULARITYENV_LD_PRELOAD LD_PRELOAD; '
+        f'{apptainer_cmd}'
+    )
+    stdout, stderr, rc = _run_ssh(full_cmd, timeout=120)
+
+    # Parse JSON from stdout (may have module warnings and other noise)
+    combined = stdout + '\n' + stderr
+    for line in combined.strip().split('\n'):
+        line = line.strip()
+        if line.startswith('{'):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+    if rc != 0:
+        raise RuntimeError(f'Failed to fetch mesh metadata: {stderr or stdout}')
+    raise RuntimeError(f'No JSON output from metadata script. stdout: {stdout[:500]}')
+
 
 def list_remote_meshes():
     """List mesh families under meshes/ on Karolina.
@@ -322,11 +498,12 @@ def upload_config(local_path):
 def generate_slurm_script(config_file, nodes=1, ntasks_per_node=128,
                           walltime='01:00:00', partition='qcpu_exp',
                           account='eu-26-11', solver_backend='petsc',
-                          label=None):
+                          label=None, include_ranks_in_name=False):
     """Generate a SLURM batch script string for cardioEMI."""
     base = Path(config_file).stem.replace('input_', '') + '_sim'
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    out_name = f'{base}_{timestamp}' if label is None else f'{base}_{label}_{timestamp}'
+    ranks_suffix = f'_{nodes * ntasks_per_node}r' if include_ranks_in_name else ''
+    out_name = f'{base}_{timestamp}{ranks_suffix}' if label is None else f'{base}_{label}_{timestamp}{ranks_suffix}'
 
     # Select container image
     if solver_backend == 'ginkgo':
@@ -342,6 +519,8 @@ def generate_slurm_script(config_file, nodes=1, ntasks_per_node=128,
 #SBATCH --job-name=cardioEMI
 #SBATCH --nodes={nodes}
 #SBATCH --ntasks-per-node={ntasks_per_node}
+#SBATCH --cpus-per-task={cpus_per_task}
+#SBATCH --exclusive
 #SBATCH --time={walltime}
 #SBATCH --partition={partition}
 #SBATCH --account={account}
@@ -354,14 +533,15 @@ cd {REMOTE_PATH}
 export FI_PROVIDER=tcp
 export OMP_NUM_THREADS=1
 
-# Run inside Apptainer container
-# --cpu-bind=cores and --cpus-per-task spread ranks across NUMA domains
-# for optimal memory bandwidth (16 ranks/node = 8 cpus/task = 1 per memory channel)
-srun -n {total_ranks} --cpu-bind=cores --cpus-per-task={cpus_per_task} apptainer exec \\
+# Karolina CPU nodes: 2x AMD EPYC 7H12 (64 cores/socket, 8 memory channels/socket)
+# NPS4 = 8 NUMA domains/node. Optimal memory-bound config: 16 ranks/node = 1 rank
+# per memory channel (8 cpus-per-task). --cpu-bind=cores pins ranks to cores,
+# --distribution=block:block assigns consecutive ranks to consecutive NUMA domains.
+srun -n {total_ranks} --cpu-bind=cores --distribution=block:block apptainer exec \\
     --bind {REMOTE_PATH}:/home/fenics \\
     --pwd /home/fenics \\
     {sif} \\
-    bash -c 'unset CC CXX && export PYTHONPATH=/home/fenics/.pylibs:$PYTHONPATH && python3 -B -u main.py {config_file}' 2>&1 | tee {out_name}_slurm.log
+    bash -c 'unset CC CXX && export PYTHONPATH=/home/fenics/.pylibs:$PYTHONPATH && python3 -B -u main.py {out_name}/{config_file}' 2>&1 | tee {out_name}_slurm.log
 """
     return script, out_name
 
@@ -377,6 +557,10 @@ def submit_job(config_file, nodes=1, ntasks_per_node=128,
         solver_backend, label
     )
 
+    # Create remote job directory and upload all job files into it
+    job_dir = f'{REMOTE_PATH}/{out_name}'
+    _run_ssh(f'mkdir -p {job_dir}', timeout=10)
+
     # Update the config YAML's out_name to the timestamped version
     if local_config_path and Path(local_config_path).exists():
         with open(local_config_path, 'r') as f:
@@ -385,16 +569,22 @@ def submit_job(config_file, nodes=1, ntasks_per_node=128,
         with open(local_config_path, 'w') as f:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
-    # Upload config file
+    # Upload config file into job directory
     if local_config_path:
-        upload_config(local_config_path)
+        remote_dest = f'{REMOTE_HOST}:{job_dir}/{config_file}'
+        result = subprocess.run(
+            ['scp', str(local_config_path), remote_dest],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f'SCP upload failed: {result.stderr}')
 
-    # Write script to temp file and upload
+    # Write script to temp file and upload into job directory
     script_name = 'run_cardioemi.sh'
     local_script = Path('/tmp') / script_name
     local_script.write_text(script_content)
 
-    remote_dest = f'{REMOTE_HOST}:{REMOTE_PATH}/{script_name}'
+    remote_dest = f'{REMOTE_HOST}:{job_dir}/{script_name}'
     result = subprocess.run(
         ['scp', str(local_script), remote_dest],
         capture_output=True, text=True, timeout=30
@@ -402,24 +592,23 @@ def submit_job(config_file, nodes=1, ntasks_per_node=128,
     if result.returncode != 0:
         raise RuntimeError(f'Failed to upload SLURM script: {result.stderr}')
 
-    # Upload conditions.json to the remote output directory
+    # Upload conditions.json to the job directory
     if conditions:
         conditions_hash = hashlib.sha256(
             json.dumps(conditions, sort_keys=True).encode()
         ).hexdigest()[:12]
         conditions['_hash'] = conditions_hash
 
-        _run_ssh(f'mkdir -p {REMOTE_PATH}/{out_name}', timeout=10)
         local_cond = Path('/tmp') / 'conditions.json'
         local_cond.write_text(json.dumps(conditions, indent=2))
         subprocess.run(
-            ['scp', str(local_cond), f'{REMOTE_HOST}:{REMOTE_PATH}/{out_name}/conditions.json'],
+            ['scp', str(local_cond), f'{REMOTE_HOST}:{job_dir}/conditions.json'],
             capture_output=True, text=True, timeout=30
         )
 
-    # Submit job
+    # Submit job from its own directory
     stdout, stderr, rc = _run_ssh(
-        f'cd {REMOTE_PATH} && sbatch {script_name}',
+        f'cd {job_dir} && sbatch {script_name}',
         timeout=30
     )
     if rc != 0:
@@ -445,6 +634,11 @@ def submit_job(config_file, nodes=1, ntasks_per_node=128,
     }
     karolina_jobs[job_id] = job_info
 
+    # Register in poll cache and ensure background poller is running
+    with _poll_lock:
+        _poll_cache[job_id] = {'status': 'PENDING', 'log': ''}
+    start_background_poller()
+
     # Update legacy single-job state
     karolina_state['job_id'] = job_id
     karolina_state['status'] = 'PENDING'
@@ -453,6 +647,131 @@ def submit_job(config_file, nodes=1, ntasks_per_node=128,
     karolina_state['num_ranks'] = num_ranks
 
     return job_info
+
+
+def submit_jobs(config_file, node_counts, ntasks_per_node=128,
+                walltime='01:00:00', partition='qcpu_exp',
+                account='eu-26-11', solver_backend='petsc',
+                label=None, conditions=None, local_config_path=None):
+    """Submit multiple jobs (one per node count) using minimal SSH/SCP calls.
+
+    Returns a list of job info dicts.
+    """
+    import tempfile
+
+    if conditions:
+        conditions_hash = hashlib.sha256(
+            json.dumps(conditions, sort_keys=True).encode()
+        ).hexdigest()[:12]
+        conditions['_hash'] = conditions_hash
+
+    # --- Phase 1: Prepare all local files in a temp directory ---
+    jobs_prep = []  # list of (out_name, nodes, script_name)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        scp_sources = []
+
+        for nodes in node_counts:
+            script_content, out_name = generate_slurm_script(
+                config_file, nodes, ntasks_per_node, walltime, partition, account,
+                solver_backend, label, include_ranks_in_name=True
+            )
+
+            # Create local job directory
+            job_local = tmpdir / out_name
+            job_local.mkdir()
+
+            # Write config with this job's out_name
+            if local_config_path and Path(local_config_path).exists():
+                with open(local_config_path, 'r') as f:
+                    config = yaml.safe_load(f) or {}
+                config['out_name'] = out_name
+                local_cfg = job_local / config_file
+                with open(local_cfg, 'w') as f:
+                    yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+            # Write SLURM script
+            script_name = 'run_cardioemi.sh'
+            (job_local / script_name).write_text(script_content)
+
+            # Write conditions
+            if conditions:
+                job_conditions = dict(conditions)
+                job_conditions['nRanks'] = nodes * ntasks_per_node
+                (job_local / 'conditions.json').write_text(
+                    json.dumps(job_conditions, indent=2)
+                )
+
+            scp_sources.append(str(job_local))
+            jobs_prep.append((out_name, nodes, script_name))
+
+        # --- Phase 2: Single scp to upload all job directories ---
+        result = subprocess.run(
+            ['scp', '-r'] + scp_sources + [f'{REMOTE_HOST}:{REMOTE_PATH}/'],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f'SCP upload failed: {result.stderr}')
+
+    # --- Phase 3: Single SSH to sbatch all jobs ---
+    sbatch_cmds = '; '.join(
+        f'echo "@@JOB {out_name}@@"; cd {REMOTE_PATH}/{out_name} && sbatch {script_name}'
+        for out_name, nodes, script_name in jobs_prep
+    )
+    stdout, stderr, rc = _run_ssh(sbatch_cmds, timeout=30)
+    if rc != 0:
+        raise RuntimeError(f'sbatch failed: {stderr}')
+
+    # --- Phase 4: Parse job IDs and register ---
+    job_infos = []
+    current_out_name = None
+    for line in stdout.split('\n'):
+        line = line.strip()
+        if line.startswith('@@JOB ') and line.endswith('@@'):
+            current_out_name = line[6:-2]
+            continue
+        match = re.search(r'Submitted batch job (\d+)', line)
+        if match and current_out_name:
+            job_id = match.group(1)
+            # Find the matching prep entry
+            for out_name, nodes, _ in jobs_prep:
+                if out_name == current_out_name:
+                    num_ranks = nodes * ntasks_per_node
+                    job_info = {
+                        'job_id': job_id,
+                        'status': 'PENDING',
+                        'config_file': config_file,
+                        'out_name': out_name,
+                        'num_ranks': num_ranks,
+                        'label': label or out_name,
+                        'conditions_hash': conditions.get('_hash') if conditions else None,
+                    }
+                    karolina_jobs[job_id] = job_info
+                    with _poll_lock:
+                        _poll_cache[job_id] = {'status': 'PENDING', 'log': ''}
+                    # Update legacy state to last job
+                    karolina_state['job_id'] = job_id
+                    karolina_state['status'] = 'PENDING'
+                    karolina_state['config_file'] = config_file
+                    karolina_state['out_name'] = out_name
+                    karolina_state['num_ranks'] = num_ranks
+                    job_infos.append(job_info)
+                    break
+            current_out_name = None
+
+    if job_infos:
+        start_background_poller()
+
+    # Update local config's out_name to the last job (for consistency)
+    if local_config_path and jobs_prep:
+        last_out_name = jobs_prep[-1][0]
+        with open(local_config_path, 'r') as f:
+            config = yaml.safe_load(f) or {}
+        config['out_name'] = last_out_name
+        with open(local_config_path, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    return job_infos
 
 
 def check_job_status(job_id):
@@ -501,6 +820,9 @@ def cancel_job(job_id):
         raise RuntimeError(f'scancel failed: {stderr}')
     if job_id in karolina_jobs:
         karolina_jobs[job_id]['status'] = 'CANCELLED'
+    with _poll_lock:
+        if job_id in _poll_cache:
+            _poll_cache[job_id]['status'] = 'CANCELLED'
     karolina_state['status'] = 'CANCELLED'
     return True
 
@@ -674,3 +996,324 @@ def list_remote_simulations():
         pass
 
     return []
+
+
+# --------------------- Remote Video Generation ---------------------
+
+def generate_remote_video(sim_name, width=1920, height=1080, fps=30,
+                          camera_config=None, colormap='coolwarm',
+                          partition='qcpu_exp', account='eu-26-11'):
+    """Submit a SLURM job to generate a video on Karolina.
+
+    Returns job info dict with job_id and log_file.
+    """
+    pylibs = '/home/fenics/.pylibs'
+    video_dir = f'{REMOTE_PATH}/viz/videos'
+
+    # Ensure video output dir exists
+    _run_ssh(f'mkdir -p {video_dir}', timeout=10)
+
+    # Build the pipeline command
+    pipeline_cmd = (
+        f'export PYTHONPATH={pylibs}:$PYTHONPATH && '
+        f'pip install --target={pylibs} -q pyvista matplotlib "imageio[ffmpeg]" 2>/dev/null; '
+        f'python3 -u viz/scripts/remote_video_pipeline.py {sim_name} '
+        f'--width {width} --height {height} --fps {fps} '
+        f'--pylibs {pylibs} --project-root /home/fenics'
+    )
+    if camera_config:
+        cam_json = json.dumps(camera_config).replace('"', '\\"')
+        pipeline_cmd += f' --camera "{cam_json}"'
+    if colormap:
+        pipeline_cmd += f' --colormap {colormap}'
+
+    # Use the DOLFINx container (has h5py, numpy)
+    container_cmd = (
+        f'apptainer exec --bind {REMOTE_PATH}:/home/fenics '
+        f'--pwd /home/fenics {DOLFINX_SIF} '
+        f'bash -c {_shell_quote(pipeline_cmd)}'
+    )
+
+    # Create SLURM script for single-node video generation
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    script_content = f"""#!/bin/bash
+#SBATCH --job-name=video_{sim_name[:20]}
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=00:30:00
+#SBATCH --partition={partition}
+#SBATCH --account={account}
+#SBATCH --output={REMOTE_PATH}/video_{timestamp}_%j.log
+#SBATCH --error={REMOTE_PATH}/video_{timestamp}_%j.log
+
+cd {REMOTE_PATH}
+{container_cmd}
+"""
+
+    # Upload SLURM script
+    script_name = f'video_{timestamp}.sh'
+    local_script = Path('/tmp') / script_name
+    local_script.write_text(script_content)
+
+    remote_dest = f'{REMOTE_HOST}:{REMOTE_PATH}/{script_name}'
+    result = subprocess.run(
+        ['scp', str(local_script), remote_dest],
+        capture_output=True, text=True, timeout=30
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f'Failed to upload video script: {result.stderr}')
+
+    # Submit
+    stdout, stderr, rc = _run_ssh(
+        f'cd {REMOTE_PATH} && sbatch {script_name}',
+        timeout=30
+    )
+    if rc != 0:
+        raise RuntimeError(f'sbatch failed: {stderr}')
+
+    match = re.search(r'Submitted batch job (\d+)', stdout)
+    if not match:
+        raise RuntimeError(f'Could not parse job ID from: {stdout}')
+
+    job_id = match.group(1)
+    return {
+        'job_id': job_id,
+        'log_file': f'video_{timestamp}_{job_id}.log',
+        'script': script_name,
+        'sim_name': sim_name,
+    }
+
+
+def check_video_job(job_id, log_file=None):
+    """Check video generation job status and parse progress from log."""
+    status = check_job_status(job_id)
+
+    progress = 0
+    message = ''
+    video_filename = None
+
+    if log_file:
+        try:
+            stdout, stderr, rc = _run_ssh(
+                f'tail -20 {REMOTE_PATH}/{log_file} 2>/dev/null',
+                timeout=15
+            )
+            if rc == 0 and stdout:
+                for line in stdout.strip().split('\n'):
+                    if line.startswith('PROGRESS:'):
+                        parts = line.split(':', 2)
+                        if len(parts) >= 3:
+                            progress = int(parts[1])
+                            message = parts[2]
+                    elif line.startswith('VIDEO_FILE:'):
+                        video_filename = line.split(':', 1)[1].strip()
+                    elif line.startswith('ERROR:'):
+                        message = line.split(':', 1)[1].strip()
+        except subprocess.TimeoutExpired:
+            pass
+
+    return {
+        'status': status,
+        'progress': progress,
+        'message': message,
+        'video_filename': video_filename,
+    }
+
+
+def download_video(video_filename, local_dest):
+    """Download a generated video from Karolina."""
+    local_dest = Path(local_dest)
+    local_dest.mkdir(parents=True, exist_ok=True)
+
+    remote_file = f'{REMOTE_HOST}:{REMOTE_PATH}/viz/videos/{video_filename}'
+    local_file = local_dest / video_filename
+
+    result = subprocess.run(
+        ['scp', remote_file, str(local_file)],
+        capture_output=True, text=True, timeout=300
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f'Failed to download video: {result.stderr}')
+
+    return str(local_file)
+
+
+# --------------------- Remote Viz Data Generation ---------------------
+
+def generate_remote_viz(sim_name, partition='qcpu_exp', account='eu-26-11', membrane_only=True):
+    """Submit a SLURM job to generate viz data on Karolina (no video rendering).
+
+    Returns job info dict with job_id and log_file.
+    """
+    viz_dir = f'viz/data/{sim_name}'
+    pylibs = '/home/fenics/.pylibs'
+
+    membrane_flag = ' --membrane-only' if membrane_only else ''
+
+    # Build the command: install h5py if needed, then run generate script
+    gen_cmd = (
+        f'pip install --target={pylibs} -q h5py 2>/dev/null; '
+        f'export PYTHONPATH={pylibs}:$PYTHONPATH && '
+        f'python3 -u viz/scripts/generate_viz_from_output.py'
+        f'{membrane_flag} '
+        f'{sim_name} {viz_dir}'
+    )
+
+    container_cmd = (
+        f'apptainer exec --bind {REMOTE_PATH}:/home/fenics '
+        f'--pwd /home/fenics {DOLFINX_SIF} '
+        f'bash -c {_shell_quote(gen_cmd)}'
+    )
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    script_content = f"""#!/bin/bash
+#SBATCH --job-name=viz_{sim_name[:20]}
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=00:30:00
+#SBATCH --partition={partition}
+#SBATCH --account={account}
+#SBATCH --output={REMOTE_PATH}/vizgen_{timestamp}_%j.log
+#SBATCH --error={REMOTE_PATH}/vizgen_{timestamp}_%j.log
+
+cd {REMOTE_PATH}
+unset SINGULARITY_BINDPATH SINGULARITYENV_LD_PRELOAD LD_PRELOAD
+{container_cmd}
+"""
+
+    script_name = f'vizgen_{timestamp}.sh'
+    local_script = Path('/tmp') / script_name
+    local_script.write_text(script_content)
+
+    remote_dest = f'{REMOTE_HOST}:{REMOTE_PATH}/{script_name}'
+    result = subprocess.run(
+        ['scp', str(local_script), remote_dest],
+        capture_output=True, text=True, timeout=30
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f'Failed to upload viz script: {result.stderr}')
+
+    stdout, stderr, rc = _run_ssh(
+        f'cd {REMOTE_PATH} && sbatch {script_name}',
+        timeout=30
+    )
+    if rc != 0:
+        raise RuntimeError(f'sbatch failed: {stderr}')
+
+    match = re.search(r'Submitted batch job (\d+)', stdout)
+    if not match:
+        raise RuntimeError(f'Could not parse job ID from: {stdout}')
+
+    job_id = match.group(1)
+    return {
+        'job_id': job_id,
+        'log_file': f'vizgen_{timestamp}_{job_id}.log',
+        'sim_name': sim_name,
+    }
+
+
+def check_viz_job(job_id, log_file=None):
+    """Check viz generation job status and parse progress from log."""
+    status = check_job_status(job_id)
+
+    progress = 0
+    message = ''
+
+    if log_file:
+        try:
+            stdout, stderr, rc = _run_ssh(
+                f'tail -20 {REMOTE_PATH}/{log_file} 2>/dev/null',
+                timeout=15
+            )
+            if rc == 0 and stdout:
+                for line in stdout.strip().split('\n'):
+                    if line.startswith('PROGRESS:'):
+                        parts = line.split(':', 2)
+                        if len(parts) >= 3:
+                            progress = int(parts[1])
+                            message = parts[2]
+                    elif line.startswith('ERROR:'):
+                        message = line.split(':', 1)[1].strip()
+        except subprocess.TimeoutExpired:
+            pass
+
+    return {
+        'status': status,
+        'progress': progress,
+        'message': message,
+    }
+
+
+def download_viz_data_streaming(sim_name, local_dest):
+    """Download viz data directory from Karolina via streaming tar.
+
+    Yields progress dicts similar to download_results_streaming.
+    """
+    local_dest = Path(local_dest)
+    local_dest.mkdir(parents=True, exist_ok=True)
+
+    remote_viz_dir = f'viz/data/{sim_name}'
+
+    # Get total size
+    size_cmd = f'du -sb {REMOTE_PATH}/{remote_viz_dir} 2>/dev/null | cut -f1'
+    stdout, stderr, rc = _run_ssh(size_cmd, timeout=30)
+    if rc != 0 or not stdout.strip():
+        yield {'type': 'error', 'message': f'Viz data not found on Karolina for {sim_name}'}
+        return
+
+    bytes_total_uncompressed = int(stdout.strip())
+    bytes_total_estimate = int(bytes_total_uncompressed * 0.5)
+
+    yield {'type': 'progress', 'bytes_done': 0, 'bytes_total': bytes_total_estimate,
+           'file': 'Creating archive...'}
+
+    tar_cmd = f'cd {REMOTE_PATH} && tar czf - {remote_viz_dir}'
+    archive_path = local_dest / f'.{sim_name}_viz.tar.gz'
+
+    try:
+        process = subprocess.Popen(
+            ['ssh', REMOTE_HOST, tar_cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        bytes_done = 0
+        chunk_size = 256 * 1024
+        with open(archive_path, 'wb') as f:
+            while True:
+                chunk = process.stdout.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                bytes_done += len(chunk)
+                yield {'type': 'progress', 'bytes_done': bytes_done,
+                       'bytes_total': bytes_total_estimate,
+                       'file': f'Downloading viz data ({bytes_done // (1024*1024)} MB)...'}
+
+        process.wait()
+        if process.returncode != 0:
+            stderr_out = process.stderr.read().decode()
+            yield {'type': 'error', 'message': f'SSH tar failed: {stderr_out}'}
+            return
+
+        compressed_size = bytes_done
+        yield {'type': 'progress', 'bytes_done': compressed_size,
+               'bytes_total': compressed_size, 'file': 'Extracting...'}
+
+        # Extract — the archive contains viz/data/<sim_name>/ so extract to project root
+        result = subprocess.run(
+            ['tar', 'xzf', str(archive_path), '-C', str(local_dest.parent.parent.parent)],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode != 0:
+            yield {'type': 'error', 'message': f'Extraction failed: {result.stderr}'}
+            return
+
+        yield {'type': 'complete',
+               'message': f'Downloaded viz data ({compressed_size // (1024*1024)} MB)'}
+
+    finally:
+        if archive_path.exists():
+            archive_path.unlink()

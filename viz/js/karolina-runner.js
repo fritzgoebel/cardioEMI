@@ -185,6 +185,13 @@ class KarolinaRunner {
         return { success: true };
     }
 
+    async fetchMeshMetadata(meshName) {
+        const response = await fetch(`${this.apiBase}/meshes/metadata/${encodeURIComponent(meshName)}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Failed to fetch mesh metadata');
+        return data;
+    }
+
     async downloadMeshData(meshName) {
         const response = await fetch(`${this.apiBase}/meshes/download`, {
             method: 'POST',
@@ -196,5 +203,132 @@ class KarolinaRunner {
             throw new Error(data.error || 'Download failed');
         }
         return data;
+    }
+
+    async generateRemoteVideo(options) {
+        const response = await fetch(`${this.apiBase}/video/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(options)
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Video generation failed');
+        return data;
+    }
+
+    async checkVideoStatus(jobId) {
+        const response = await fetch(`${this.apiBase}/video/status/${jobId}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Status check failed');
+        return data;
+    }
+
+    async downloadRemoteVideo(jobId) {
+        const response = await fetch(`${this.apiBase}/video/download/${jobId}`, {
+            method: 'POST'
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Download failed');
+        return data;
+    }
+
+    startVideoPolling(jobId, onStatusUpdate) {
+        const poll = async () => {
+            try {
+                const status = await this.checkVideoStatus(jobId);
+                onStatusUpdate(status);
+                const terminal = ['COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY'];
+                if (status.status && terminal.includes(status.status)) {
+                    clearInterval(this._videoPollInterval);
+                    this._videoPollInterval = null;
+                }
+            } catch (e) {
+                console.error('Video status poll failed:', e);
+            }
+        };
+        poll();
+        this._videoPollInterval = setInterval(poll, 5000);
+    }
+
+    stopVideoPolling() {
+        if (this._videoPollInterval) {
+            clearInterval(this._videoPollInterval);
+            this._videoPollInterval = null;
+        }
+    }
+
+    // --- Remote viz data generation ---
+
+    async generateRemoteViz(simName) {
+        const response = await fetch(`${this.apiBase}/viz/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sim_name: simName })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Viz generation failed');
+        return data;
+    }
+
+    async checkVizStatus(jobId) {
+        const response = await fetch(`${this.apiBase}/viz/status/${jobId}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Status check failed');
+        return data;
+    }
+
+    startVizPolling(jobId, onStatusUpdate) {
+        const poll = async () => {
+            try {
+                const status = await this.checkVizStatus(jobId);
+                onStatusUpdate(status);
+                const terminal = ['COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY'];
+                if (status.status && terminal.includes(status.status)) {
+                    clearInterval(this._vizPollInterval);
+                    this._vizPollInterval = null;
+                }
+            } catch (e) {
+                console.error('Viz status poll failed:', e);
+            }
+        };
+        poll();
+        this._vizPollInterval = setInterval(poll, 5000);
+    }
+
+    async downloadVizData(simName, onProgress) {
+        const response = await fetch(`${this.apiBase}/viz/download`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sim_name: simName })
+        });
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                try {
+                    const data = JSON.parse(line.slice(6));
+                    if (data.type === 'progress' && onProgress) {
+                        onProgress(data);
+                    } else if (data.type === 'complete') {
+                        return data;
+                    } else if (data.type === 'error') {
+                        throw new Error(data.message);
+                    }
+                } catch (e) {
+                    if (e.message && !e.message.includes('Unexpected')) throw e;
+                }
+            }
+        }
+        return { message: 'Download complete' };
     }
 }

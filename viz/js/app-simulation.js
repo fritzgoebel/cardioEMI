@@ -23,6 +23,7 @@ App.prototype.runSimulation = async function() {
             v_init: vinitValue,
             dt: this.dt,
             time_steps: this.timeSteps,
+            save_interval: 10,
             solver_backend: solverBackend,
             ksp_type: kspType,
             pc_type: pcType,
@@ -226,7 +227,7 @@ App.prototype.runSimulationKarolina = async function(statusEl, outputEl, runBtn)
 
         const options = {
             config: configFile,
-            nodes: parseInt(document.getElementById('karolina-nodes').value) || 1,
+            nodes: document.getElementById('karolina-nodes').value.trim(),
             ntasks_per_node: parseInt(document.getElementById('karolina-ntasks').value) || 128,
             walltime: document.getElementById('karolina-walltime').value || '01:00:00',
             partition: document.getElementById('karolina-partition').value || 'qcpu_exp',
@@ -237,25 +238,29 @@ App.prototype.runSimulationKarolina = async function(statusEl, outputEl, runBtn)
         };
 
         const result = await this.karolinaRunner.submit(options);
-        const jobId = result.job_id;
-
-        this.karolinaJobs[jobId] = {
-            ...result,
-            conditions_hash: result.conditions_hash,
-        };
+        const jobs = result.jobs || [result];
 
         jobSection.style.display = 'block';
-        this.renderJobEntry(result);
+        for (const job of jobs) {
+            const jobId = job.job_id;
+            this.karolinaJobs[jobId] = {
+                ...job,
+                conditions_hash: job.conditions_hash,
+            };
+            this.renderJobEntry(job);
+            this.karolinaRunner.startPolling(jobId, (data) => {
+                this.updateJobStatus(jobId, data);
+                if (data.out_name) {
+                    this.karolinaJobs[jobId].out_name = data.out_name;
+                }
+            });
+        }
 
+        const jobIds = jobs.map(j => j.job_id).join(', ');
         statusEl.className = 'status visible success';
-        statusEl.textContent = `Job ${jobId} submitted!`;
-
-        this.karolinaRunner.startPolling(jobId, (data) => {
-            this.updateJobStatus(jobId, data);
-            if (data.out_name) {
-                this.karolinaJobs[jobId].out_name = data.out_name;
-            }
-        });
+        statusEl.textContent = jobs.length === 1
+            ? `Job ${jobIds} submitted!`
+            : `${jobs.length} jobs submitted: ${jobIds}`;
 
     } catch (error) {
         statusEl.className = 'status visible error';
@@ -298,8 +303,10 @@ App.prototype.getConditionsSnapshot = function() {
     const nodesEl = document.getElementById('karolina-nodes');
     const ntasksEl = document.getElementById('karolina-ntasks');
     const mpiRanksEl = document.getElementById('mpi-ranks');
+    // For comma-separated node counts, use the first value for the base snapshot
+    const nodesVal = nodesEl ? parseInt(nodesEl.value.split(',')[0]) || 1 : 1;
     const nRanks = nodesEl && ntasksEl
-        ? (parseInt(nodesEl.value) || 1) * (parseInt(ntasksEl.value) || 1)
+        ? nodesVal * (parseInt(ntasksEl.value) || 1)
         : (mpiRanksEl ? parseInt(mpiRanksEl.value) || 1 : 1);
 
     const conditions = {

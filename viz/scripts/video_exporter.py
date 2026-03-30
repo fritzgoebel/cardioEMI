@@ -94,28 +94,59 @@ class VideoExporter:
         mesh = pv.PolyData(self.vertices, faces)
         return mesh
 
-    def _voltage_to_color(self, v, v_min, v_max):
-        """Convert voltage to RGB color (blue -> white -> red)."""
-        t = np.clip((v - v_min) / (v_max - v_min + 1e-10), 0, 1)
+    # Colormaps matching the webapp's Three.js viewer
+    COLORMAPS = {
+        'coolwarm': {
+            'colors': [[0, 0, 1], [1, 1, 1], [1, 0, 0]],
+            'positions': [0, 0.5, 1],
+        },
+        'viridis': {
+            'colors': [
+                [0.267, 0.004, 0.329], [0.282, 0.140, 0.458],
+                [0.254, 0.265, 0.530], [0.207, 0.372, 0.553],
+                [0.164, 0.471, 0.558], [0.128, 0.567, 0.551],
+                [0.135, 0.659, 0.518], [0.267, 0.749, 0.441],
+                [0.478, 0.821, 0.318], [0.741, 0.873, 0.150],
+                [0.993, 0.906, 0.144],
+            ],
+            'positions': [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1],
+        },
+        'plasma': {
+            'colors': [
+                [0.050, 0.030, 0.528], [0.294, 0.012, 0.615],
+                [0.492, 0.012, 0.658], [0.658, 0.134, 0.588],
+                [0.798, 0.280, 0.470], [0.899, 0.434, 0.358],
+                [0.963, 0.600, 0.246], [0.984, 0.775, 0.154],
+                [0.940, 0.975, 0.131],
+            ],
+            'positions': [0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1],
+        },
+        'inferno': {
+            'colors': [
+                [0.001, 0.000, 0.014], [0.133, 0.047, 0.298],
+                [0.341, 0.062, 0.429], [0.550, 0.126, 0.405],
+                [0.735, 0.216, 0.330], [0.878, 0.352, 0.218],
+                [0.963, 0.537, 0.114], [0.988, 0.751, 0.145],
+                [0.988, 0.998, 0.645],
+            ],
+            'positions': [0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1],
+        },
+    }
 
-        # Blue (cold) -> White (mid) -> Red (hot)
-        colors = np.zeros((len(t), 3))
+    def _build_pyvista_colormap(self, name='coolwarm'):
+        """Build a matplotlib ListedColormap matching the webapp's colormaps."""
+        from matplotlib.colors import ListedColormap
+        cmap_def = self.COLORMAPS.get(name, self.COLORMAPS['coolwarm'])
+        colors = np.array(cmap_def['colors'])
+        positions = np.array(cmap_def['positions'])
 
-        # Blue to White (t < 0.5)
-        mask = t < 0.5
-        s = t[mask] * 2
-        colors[mask, 0] = s  # R
-        colors[mask, 1] = s  # G
-        colors[mask, 2] = 1  # B
-
-        # White to Red (t >= 0.5)
-        mask = t >= 0.5
-        s = (t[mask] - 0.5) * 2
-        colors[mask, 0] = 1      # R
-        colors[mask, 1] = 1 - s  # G
-        colors[mask, 2] = 1 - s  # B
-
-        return (colors * 255).astype(np.uint8)
+        # Interpolate to 256 entries
+        n = 256
+        t = np.linspace(0, 1, n)
+        rgb = np.zeros((n, 3))
+        for ch in range(3):
+            rgb[:, ch] = np.interp(t, positions, colors[:, ch])
+        return ListedColormap(rgb)
 
     def _parse_time(self, key):
         """Parse HDF5 time key to float."""
@@ -208,15 +239,16 @@ class VideoExporter:
             return timesteps
 
     def export(self, camera_config: dict = None, resolution: tuple = (1920, 1080),
-               fps: int = 30, progress_callback=None) -> str:
+               fps: int = 30, progress_callback=None, colormap: str = 'coolwarm') -> str:
         """
-        Export simulation to video.
+        Export simulation to video with webapp-matching Phong-shaded rendering.
 
         Args:
             camera_config: Dict with position, target, up, fov (from Three.js camera)
             resolution: (width, height) tuple
             fps: Frames per second
             progress_callback: Optional callback(frame, total, message)
+            colormap: Colormap name (coolwarm, viridis, plasma, inferno)
 
         Returns:
             Path to output video file
@@ -236,29 +268,53 @@ class VideoExporter:
         if total_frames == 0:
             raise ValueError("No timesteps found in results file")
 
-        # Calculate voltage range
-        all_v = np.concatenate([t[1] for t in timesteps])
-        v_min = float(np.min(all_v))
-        v_max = float(np.max(all_v))
+        # Clamp voltage range to physiological bounds
+        # AP model can overshoot significantly, wrecking the colormap
+        v_min = -80.0
+        v_max = 30.0
 
         report(0, total_frames, f"Rendering {total_frames} frames...")
 
-        # Create PyVista mesh
+        # Create PyVista mesh and compute normals for smooth Phong shading
         mesh = self._create_pyvista_mesh()
+        mesh.compute_normals(cell_normals=False, point_normals=True, inplace=True)
 
-        # Setup offscreen rendering - required for macOS and headless environments
+        # Build colormap matching the webapp
+        cmap = self._build_pyvista_colormap(colormap)
+
+        # Setup offscreen rendering
         pv.OFF_SCREEN = True
-
-        # Try to start virtual framebuffer (Linux only, ignored on macOS)
         try:
             pv.start_xvfb()
         except Exception:
             pass  # Expected on macOS/Windows
 
-        # Create offscreen plotter with proper configuration
-        plotter = pv.Plotter(off_screen=True, window_size=resolution, lighting='three_lights')
+        # Dark background matching webapp (#1a1a2e)
+        bg_color = (0.102, 0.102, 0.180)
 
-        # Determine camera position (saved and re-applied after each plotter.clear())
+        # Create plotter with no default lights (we set our own)
+        plotter = pv.Plotter(off_screen=True, window_size=resolution, lighting='none')
+        plotter.set_background(bg_color)
+
+        # Match webapp lighting: ambient 0.4, directional 0.8 from (200,200,200),
+        # directional 0.3 from (-100,-100,-100)
+        from pyvista import Light
+        ambient = Light(position=(0, 0, 0), light_type='headlight',
+                        intensity=0.4, color='white')
+        ambient.positional = False
+        plotter.add_light(ambient)
+
+        key_light = Light(position=(200, 200, 200), light_type='scene light',
+                          intensity=0.8, color='white')
+        key_light.positional = False
+        plotter.add_light(key_light)
+
+        fill_light = Light(position=(-100, -100, -100), light_type='scene light',
+                           intensity=0.3, color='white')
+        fill_light.positional = False
+        plotter.add_light(fill_light)
+
+        # Determine camera position
         if camera_config:
             cam_position = [
                 camera_config.get('position', [200, 150, 200]),
@@ -266,7 +322,6 @@ class VideoExporter:
                 camera_config.get('up', [0, 1, 0])
             ]
         else:
-            # Default camera based on mesh bounds
             bounds = self.metadata.get('bounds', {})
             center = [
                 (bounds.get('x', [0, 100])[0] + bounds.get('x', [0, 100])[1]) / 2,
@@ -293,22 +348,26 @@ class VideoExporter:
 
         try:
             for i, (time, voltages) in enumerate(timesteps):
-                # Update mesh colors
-                colors = self._voltage_to_color(voltages, v_min, v_max)
-                mesh['colors'] = colors
+                # Set voltage as scalar data for proper Phong-shaded colormap rendering
+                mesh.point_data['voltage'] = voltages
 
-                # Render
                 plotter.clear()
-                plotter.add_mesh(mesh, scalars='colors', rgb=True, show_scalar_bar=False)
+                plotter.add_mesh(
+                    mesh,
+                    scalars='voltage',
+                    cmap=cmap,
+                    clim=[v_min, v_max],
+                    show_scalar_bar=False,
+                    smooth_shading=True,
+                    specular=0.3,
+                    specular_power=30,  # matches webapp shininess: 30
+                )
 
-                # Restore camera after clear() resets it
                 plotter.camera_position = cam_position
 
-                # Add time annotation
                 plotter.add_text(f"t = {time:.3f} ms", position='upper_left',
                                font_size=14, color='white')
 
-                # Capture frame
                 img = plotter.screenshot(return_img=True)
                 writer.append_data(img)
 
@@ -337,6 +396,9 @@ def main():
     parser.add_argument('--height', type=int, default=1080, help='Video height')
     parser.add_argument('--fps', type=int, default=30, help='Frames per second')
     parser.add_argument('--camera', type=str, help='Camera config as JSON')
+    parser.add_argument('--colormap', type=str, default='coolwarm',
+                        choices=['coolwarm', 'viridis', 'plasma', 'inferno'],
+                        help='Colormap (default: coolwarm)')
 
     args = parser.parse_args()
 
@@ -383,7 +445,8 @@ def main():
             camera_config=camera_config,
             resolution=(args.width, args.height),
             fps=args.fps,
-            progress_callback=progress
+            progress_callback=progress,
+            colormap=args.colormap,
         )
 
         # Output video filename for server to parse

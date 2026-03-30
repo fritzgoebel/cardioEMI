@@ -957,6 +957,63 @@ class Viewer {
         }
     }
 
+    clearAllMeshes() {
+        if (this.meshObject) {
+            this.scene.remove(this.meshObject);
+            this.meshObject.geometry.dispose();
+            this.meshObject.material.dispose();
+            this.meshObject = null;
+        }
+        if (this.ecsMeshObject) {
+            this.scene.remove(this.ecsMeshObject);
+            this.ecsMeshObject.geometry.dispose();
+            this.ecsMeshObject.material.dispose();
+            this.ecsMeshObject = null;
+        }
+        if (this.cutMeshObject) {
+            this.scene.remove(this.cutMeshObject);
+            this.cutMeshObject.geometry.dispose();
+            this.cutMeshObject.material.dispose();
+            this.cutMeshObject = null;
+        }
+        this.meshData = null;
+        this.originalVertices = null;
+        this.originalEcsVertices = null;
+        this.originalCutVertices = null;
+    }
+
+    showBoundsOutline(bounds) {
+        // Remove old outline if any
+        if (this._boundsOutline) {
+            this.scene.remove(this._boundsOutline);
+            this._boundsOutline = null;
+        }
+
+        const sx = bounds.x[1] - bounds.x[0];
+        const sy = bounds.y[1] - bounds.y[0];
+        const sz = bounds.z[1] - bounds.z[0];
+        const cx = (bounds.x[0] + bounds.x[1]) / 2;
+        const cy = (bounds.y[0] + bounds.y[1]) / 2;
+        const cz = (bounds.z[0] + bounds.z[1]) / 2;
+
+        const geo = new THREE.BoxGeometry(sx, sy, sz);
+        const edges = new THREE.EdgesGeometry(geo);
+        const mat = new THREE.LineBasicMaterial({ color: 0x4ade80, linewidth: 2 });
+        this._boundsOutline = new THREE.LineSegments(edges, mat);
+        this._boundsOutline.position.set(cx, cy, cz);
+        this.scene.add(this._boundsOutline);
+
+        // Position camera to frame the bounds
+        const maxSize = Math.max(sx, sy, sz);
+        this.camera.position.set(
+            cx + maxSize * 0.8,
+            cy + maxSize * 0.5,
+            cz + maxSize * 0.8
+        );
+        this.controls.target.set(cx, cy, cz);
+        this.controls.update();
+    }
+
     resetCamera() {
         if (!this.meshData) return;
 

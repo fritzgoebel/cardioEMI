@@ -220,7 +220,7 @@
                     <div id="karolina-options" style="display:none;">
                         <div class="param-row">
                             <label>Nodes:</label>
-                            <input type="number" id="karolina-nodes" value="1" min="1" max="64" step="1">
+                            <input type="text" id="karolina-nodes" value="1" placeholder="e.g. 1,2,4">
                         </div>
                         <div class="param-row">
                             <label>Tasks/node:</label>
@@ -790,9 +790,14 @@
                         <input type="number" id="video-fps" value="30" min="10" max="60" step="5">
                         <span class="unit">fps</span>
                     </div>
-                    <button id="export-video" class="btn btn-primary" style="width: 100%;">
-                        Export Video
-                    </button>
+                    <div style="display: flex; gap: 6px;">
+                        <button id="export-video" class="btn btn-primary" style="flex: 1;">
+                            Export Video
+                        </button>
+                        <button id="export-video-remote" class="btn btn-primary" style="flex: 1; display: none;">
+                            Generate on Karolina
+                        </button>
+                    </div>
                     <div id="video-progress" class="progress-bar" style="display:none; margin-top: 8px;">
                         <div class="progress-fill"></div>
                         <span class="progress-text">0%</span>
