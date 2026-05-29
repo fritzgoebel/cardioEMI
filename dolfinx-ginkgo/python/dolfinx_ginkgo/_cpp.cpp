@@ -282,6 +282,7 @@ NB_MODULE(_cpp, m) {
         .def_rw("amg", &SolverConfig::amg)
         .def_rw("bddc", &SolverConfig::bddc)
         .def_rw("pure_neumann", &SolverConfig::pure_neumann)
+        .def_rw("track_iter_residuals", &SolverConfig::track_iter_residuals)
         .def_rw("verbose", &SolverConfig::verbose);
 
     // =========================================================================
@@ -537,5 +538,14 @@ NB_MODULE(_cpp, m) {
         .def("residual_norm", &Solver::residual_norm,
              "Get final residual norm from last solve")
         .def("converged", &Solver::converged,
-             "Check if last solve converged");
+             "Check if last solve converged")
+        .def("iter_history_iterations", &Solver::iter_history_iterations,
+             nb::rv_policy::copy,
+             "Per-iteration indices from the last solve (empty unless track_iter_residuals)")
+        .def("iter_history_explicit", &Solver::iter_history_explicit,
+             nb::rv_policy::copy,
+             "Per-iteration true ||b - A*x_k|| from the last solve")
+        .def("iter_history_implicit", &Solver::iter_history_implicit,
+             nb::rv_policy::copy,
+             "Per-iteration implicit (recurrence) residual norm from the last solve");
 }

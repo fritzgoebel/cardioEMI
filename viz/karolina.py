@@ -498,12 +498,12 @@ def upload_config(local_path):
 def generate_slurm_script(config_file, nodes=1, ntasks_per_node=128,
                           walltime='01:00:00', partition='qcpu_exp',
                           account='eu-26-11', solver_backend='petsc',
-                          label=None, include_ranks_in_name=False):
+                          include_ranks_in_name=False):
     """Generate a SLURM batch script string for cardioEMI."""
     base = Path(config_file).stem.replace('input_', '') + '_sim'
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     ranks_suffix = f'_{nodes * ntasks_per_node}r' if include_ranks_in_name else ''
-    out_name = f'{base}_{timestamp}{ranks_suffix}' if label is None else f'{base}_{label}_{timestamp}{ranks_suffix}'
+    out_name = f'{base}_{timestamp}{ranks_suffix}'
 
     # Select container image
     if solver_backend == 'ginkgo':
@@ -549,12 +549,12 @@ srun -n {total_ranks} --cpu-bind=cores --distribution=block:block apptainer exec
 def submit_job(config_file, nodes=1, ntasks_per_node=128,
                walltime='01:00:00', partition='qcpu_exp',
                account='eu-26-11', solver_backend='petsc',
-               label=None, conditions=None, local_config_path=None):
+               conditions=None, local_config_path=None):
     """Upload config and SLURM script, then submit via sbatch. Returns job info dict."""
     # Generate SLURM script with timestamped out_name
     script_content, out_name = generate_slurm_script(
         config_file, nodes, ntasks_per_node, walltime, partition, account,
-        solver_backend, label
+        solver_backend
     )
 
     # Create remote job directory and upload all job files into it
@@ -629,7 +629,6 @@ def submit_job(config_file, nodes=1, ntasks_per_node=128,
         'config_file': config_file,
         'out_name': out_name,
         'num_ranks': num_ranks,
-        'label': label or out_name,
         'conditions_hash': conditions.get('_hash') if conditions else None,
     }
     karolina_jobs[job_id] = job_info
@@ -652,7 +651,7 @@ def submit_job(config_file, nodes=1, ntasks_per_node=128,
 def submit_jobs(config_file, node_counts, ntasks_per_node=128,
                 walltime='01:00:00', partition='qcpu_exp',
                 account='eu-26-11', solver_backend='petsc',
-                label=None, conditions=None, local_config_path=None):
+                conditions=None, local_config_path=None):
     """Submit multiple jobs (one per node count) using minimal SSH/SCP calls.
 
     Returns a list of job info dicts.
@@ -674,7 +673,7 @@ def submit_jobs(config_file, node_counts, ntasks_per_node=128,
         for nodes in node_counts:
             script_content, out_name = generate_slurm_script(
                 config_file, nodes, ntasks_per_node, walltime, partition, account,
-                solver_backend, label, include_ranks_in_name=True
+                solver_backend, include_ranks_in_name=True
             )
 
             # Create local job directory
@@ -743,7 +742,6 @@ def submit_jobs(config_file, node_counts, ntasks_per_node=128,
                         'config_file': config_file,
                         'out_name': out_name,
                         'num_ranks': num_ranks,
-                        'label': label or out_name,
                         'conditions_hash': conditions.get('_hash') if conditions else None,
                     }
                     karolina_jobs[job_id] = job_info
@@ -825,6 +823,61 @@ def cancel_job(job_id):
             _poll_cache[job_id]['status'] = 'CANCELLED'
     karolina_state['status'] = 'CANCELLED'
     return True
+
+
+def delete_job_data(job_id, out_name, local_root):
+    """Cancel the job (if non-terminal), then remove its remote dir and local download.
+
+    Returns a list of error messages for partial failures. Empty list = full success.
+    The caller should treat any non-empty list as a warning, not a hard failure —
+    e.g. the remote dir may already be gone, but we still want to drop the entry.
+    """
+    import shutil
+
+    errors = []
+
+    # Cancel if still active. cancel_job raises if scancel fails — but a job that's
+    # already done will get a benign "Invalid job id" from scancel; just swallow.
+    terminal = {'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY'}
+    cached_status, _ = get_cached_status(job_id) if job_id else (None, None)
+    if job_id and cached_status not in terminal:
+        try:
+            _run_ssh(f'scancel {job_id}', timeout=15)
+        except Exception as e:
+            errors.append(f'scancel: {e}')
+
+    if out_name:
+        # Whitelist out_name to avoid any chance of arg injection. Slurm out_names
+        # are derived from config stem + timestamp (+ optional ranks suffix), so
+        # alphanumerics + underscore + dot + hyphen is the full alphabet.
+        if not re.fullmatch(r'[A-Za-z0-9_.\-]+', out_name):
+            errors.append(f'invalid out_name (refusing remote rm): {out_name!r}')
+        else:
+            remote_dir = f'{REMOTE_PATH}/{out_name}'
+            try:
+                _, stderr, rc = _run_ssh(f'rm -rf -- {remote_dir}', timeout=30)
+                if rc != 0:
+                    errors.append(f'remote rm: {stderr}')
+            except Exception as e:
+                errors.append(f'remote rm: {e}')
+
+            local_dir = Path(local_root) / out_name
+            if local_dir.exists():
+                try:
+                    shutil.rmtree(local_dir)
+                except Exception as e:
+                    errors.append(f'local rm: {e}')
+
+    # Drop in-memory tracking regardless.
+    if job_id:
+        karolina_jobs.pop(job_id, None)
+        with _poll_lock:
+            _poll_cache.pop(job_id, None)
+        if karolina_state.get('job_id') == job_id:
+            karolina_state['job_id'] = None
+            karolina_state['status'] = None
+
+    return errors
 
 
 def tail_remote_log(job_id, num_lines=50):
@@ -1141,7 +1194,7 @@ def download_video(video_filename, local_dest):
 
 # --------------------- Remote Viz Data Generation ---------------------
 
-def generate_remote_viz(sim_name, partition='qcpu_exp', account='eu-26-11', membrane_only=True):
+def generate_remote_viz(sim_name, partition='qcpu', account='eu-26-11', membrane_only=True):
     """Submit a SLURM job to generate viz data on Karolina (no video rendering).
 
     Returns job info dict with job_id and log_file.
@@ -1171,8 +1224,8 @@ def generate_remote_viz(sim_name, partition='qcpu_exp', account='eu-26-11', memb
 #SBATCH --job-name=viz_{sim_name[:20]}
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4
-#SBATCH --time=00:30:00
+#SBATCH --cpus-per-task=128
+#SBATCH --time=02:00:00
 #SBATCH --partition={partition}
 #SBATCH --account={account}
 #SBATCH --output={REMOTE_PATH}/vizgen_{timestamp}_%j.log

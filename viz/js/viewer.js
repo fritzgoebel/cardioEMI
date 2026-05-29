@@ -25,6 +25,24 @@ class Viewer {
         this.numRanks = 1;
         this.colorMode = 'voltage'; // 'voltage' or 'rank'
 
+        // Cross-section mode: cells (closed surfaces, colored by φ_i) + ECS cap
+        // (slice through ECS volume, colored by φ_e), each with its own colormap
+        // and range. The ECS shell mesh is also clipped at the plane in this
+        // mode so the volume below the plane stays visible.
+        this.crossSectionMode = false;
+        this.cellMeshes = new Map();          // tag -> THREE.Mesh
+        this.capMeshObject = null;
+        this._clippingPlane = null;           // THREE.Plane applied to ECS shell
+        this._planeHelper = null;             // THREE.PlaneHelper preview wireframe
+        this.vMinIntra = -80;
+        this.vMaxIntra = 40;
+        this.colormapIntra = 'coolwarm';
+        this._intraLUT = null;
+        this.vMinExtra = -5;
+        this.vMaxExtra = 5;
+        this.colormapExtra = 'viridis';
+        this._extraLUT = null;
+
         // Explosion effect
         this.explosionFactor = 0;
         this.originalVertices = null;      // Original membrane vertex positions
@@ -188,6 +206,7 @@ class Viewer {
     setColormap(colormapName) {
         if (this.colormaps[colormapName]) {
             this.colormap = colormapName;
+            this._colorLUT = null; // Invalidate cached LUT
         }
     }
 
@@ -204,17 +223,44 @@ class Viewer {
         }));
     }
 
-    // Get CSS gradient for the current colormap (for colorbar)
+    // Get CSS gradient for the current colormap (for colorbar).
+    // "to top" so the high-value end of the colormap is at the top while
+    // stops stay in ascending order (out-of-order stops get snapped by the
+    // browser, which produced solid-colour bars before this fix).
     getColormapGradient() {
         const cm = this.colormaps[this.colormap];
         const stops = cm.colors.map((color, i) => {
             const r = Math.round(color[0] * 255);
             const g = Math.round(color[1] * 255);
             const b = Math.round(color[2] * 255);
-            const pos = (1 - cm.positions[i]) * 100;  // Invert for top-to-bottom
+            const pos = cm.positions[i] * 100;
             return `rgb(${r}, ${g}, ${b}) ${pos}%`;
         });
-        return `linear-gradient(to bottom, ${stops.join(', ')})`;
+        return `linear-gradient(to top, ${stops.join(', ')})`;
+    }
+
+    // Sample a named colormap at normalised t in [0, 1]
+    sampleColormap(colormapName, t) {
+        const cm = this.colormaps[colormapName] || this.colormaps[this.colormap];
+        const colors = cm.colors;
+        const positions = cm.positions;
+        const clampedT = t <= 0 ? 0 : (t >= 1 ? 1 : t);
+        let i = 0;
+        while (i < positions.length - 1 && positions[i + 1] < clampedT) i++;
+        if (i >= positions.length - 1) {
+            const c = colors[colors.length - 1];
+            return { r: c[0], g: c[1], b: c[2] };
+        }
+        const t0 = positions[i];
+        const t1 = positions[i + 1];
+        const localT = (clampedT - t0) / (t1 - t0);
+        const c0 = colors[i];
+        const c1 = colors[i + 1];
+        return {
+            r: c0[0] + (c1[0] - c0[0]) * localT,
+            g: c0[1] + (c1[1] - c0[1]) * localT,
+            b: c0[2] + (c1[2] - c0[2]) * localT,
+        };
     }
 
     // Map value to color using the current colormap
@@ -271,7 +317,20 @@ class Viewer {
         this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
         this.renderer.setSize(width, height);
         this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        // Enable per-material clipping (used for cross-section ECS clipping)
+        this.renderer.localClippingEnabled = true;
         container.appendChild(this.renderer.domElement);
+
+        // Detect WebGL context loss (e.g. GPU memory exhaustion)
+        this.renderer.domElement.addEventListener('webglcontextlost', (event) => {
+            console.error('WebGL context lost!', event);
+            const statusEl = document.getElementById('mesh-status');
+            if (statusEl) {
+                statusEl.className = 'mesh-status error';
+                statusEl.textContent = 'WebGL context lost — mesh too large for GPU. Try closing other tabs.';
+                statusEl.style.display = 'block';
+            }
+        });
 
         // Controls
         this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
@@ -329,6 +388,11 @@ class Viewer {
             this.createCutMesh(meshData);
         }
 
+        // Cross-section per-cell surfaces (hidden until cross-section mode is on)
+        if (meshData.cells) {
+            this.createCellMeshes(meshData.cells);
+        }
+
         // Position camera
         this.resetCamera();
 
@@ -339,46 +403,107 @@ class Viewer {
         window.addEventListener('resize', () => this.onResize());
     }
 
+    /**
+     * Split geometry into draw groups if index count exceeds Firefox's
+     * webgl.max-vert-ids-per-draw limit (30M).
+     */
+    _applyDrawGroups(geometry) {
+        const MAX_INDICES = 30_000_000;
+        const indexCount = geometry.index.count;
+        geometry.clearGroups();
+        if (indexCount > MAX_INDICES) {
+            const chunkSize = Math.floor(MAX_INDICES / 3) * 3;
+            for (let start = 0; start < indexCount; start += chunkSize) {
+                geometry.addGroup(start, Math.min(chunkSize, indexCount - start), 0);
+            }
+        }
+    }
+
     createMembraneMesh(meshData) {
         const { vertices, facets, metadata } = meshData;
+        const numVertices = vertices.length / 3;
+        console.log(`createMembraneMesh: ${numVertices} vertices, ${facets.length / 3} facets`);
 
-        // Store original vertices for explosion effect
-        this.originalVertices = new Float32Array(vertices);
+        // Defer originalVertices copy until explosion data is actually needed
+        this.originalVertices = null;
+        this._pendingVerticesForExplosion = vertices;
 
         // Create BufferGeometry
         const geometry = new THREE.BufferGeometry();
 
         // Set position attribute (vertices is flat array [x0,y0,z0, x1,y1,z1, ...])
+        console.time('  setAttribute position');
         geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+        console.timeEnd('  setAttribute position');
 
         // Set index attribute (facets is [v0,v1,v2, v0,v1,v2, ...])
+        console.time('  setIndex');
         geometry.setIndex(new THREE.BufferAttribute(facets, 1));
+        console.timeEnd('  setIndex');
 
-        // Compute normals for lighting
-        geometry.computeVertexNormals();
+        // Firefox limits drawElements to 30M indices per call
+        // (webgl.max-vert-ids-per-draw). Split into draw groups to stay under the limit.
+        this._applyDrawGroups(geometry);
+        if (geometry.groups.length > 0) {
+            console.log(`  Split into ${geometry.groups.length} draw groups`);
+        }
+
+        // Use flat shading — the GPU computes face normals automatically,
+        // avoiding an expensive JS-side computeVertexNormals() pass.
+        // For large meshes (>10M vertices) the JS normal computation can
+        // freeze/crash the browser tab.
+        const useFlatShading = numVertices > 2_000_000;
+
+        if (!useFlatShading) {
+            console.time('  computeVertexNormals');
+            geometry.computeVertexNormals();
+            console.timeEnd('  computeVertexNormals');
+        } else {
+            console.log('  Skipping computeVertexNormals (flat shading for large mesh)');
+        }
 
         // Create material with vertex colors
         const material = new THREE.MeshPhongMaterial({
             vertexColors: true,
             side: THREE.DoubleSide,
-            flatShading: false,
+            flatShading: useFlatShading,
             transparent: false,
             shininess: 30
         });
 
         // Initialize vertex colors (default resting state - blue)
+        console.time('  init colors');
         const colors = new Float32Array(vertices.length);
         const restingColor = this.voltageToColor(this.vMin);
+        const rr = restingColor.r, rg = restingColor.g, rb = restingColor.b;
         for (let i = 0; i < vertices.length; i += 3) {
-            colors[i] = restingColor.r;
-            colors[i + 1] = restingColor.g;
-            colors[i + 2] = restingColor.b;
+            colors[i] = rr;
+            colors[i + 1] = rg;
+            colors[i + 2] = rb;
         }
         geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        console.timeEnd('  init colors');
 
-        // Create mesh
-        this.meshObject = new THREE.Mesh(geometry, material);
+        // Create mesh and add to scene.
+        // When draw groups are active, Three.js only uses them if the material
+        // is an array (it indexes by group.materialIndex).
+        console.time('  scene.add');
+        const meshMaterial = geometry.groups.length > 0 ? [material] : material;
+        this.meshObject = new THREE.Mesh(geometry, meshMaterial);
         this.scene.add(this.meshObject);
+        console.timeEnd('  scene.add');
+
+        // Check for WebGL errors after first render
+        if (this.renderer) {
+            const gl = this.renderer.getContext();
+            const err = gl.getError();
+            if (err !== gl.NO_ERROR) {
+                console.error(`WebGL error after mesh creation: 0x${err.toString(16)}`);
+            }
+            console.log(`  WebGL MAX_ELEMENT_INDEX: ${gl.getParameter(gl.MAX_ELEMENT_INDEX)}`);
+        }
+
+        console.log('  Mesh added to scene');
     }
 
     createEcsMesh(meshData) {
@@ -416,6 +541,7 @@ class Viewer {
         // Create mesh (hidden by default)
         this.ecsMeshObject = new THREE.Mesh(geometry, material);
         this.ecsMeshObject.visible = false;
+        this.ecsMeshObject.userData.userVisible = false;
         this.scene.add(this.ecsMeshObject);
 
         console.log(`ECS mesh created: ${ecsVertices.length / 3} vertices`);
@@ -423,7 +549,9 @@ class Viewer {
 
     setEcsVisible(visible) {
         if (this.ecsMeshObject) {
-            this.ecsMeshObject.visible = visible;
+            this.ecsMeshObject.userData.userVisible = !!visible;
+            // In cross-section mode the cap replaces the translucent ECS shell.
+            this.ecsMeshObject.visible = !!visible && !this.crossSectionMode;
         }
         // Rebuild interface points when ECS visibility changes
         // (to add/remove ECS interface points while keeping membrane ones)
@@ -505,7 +633,8 @@ class Viewer {
         if (this.meshObject) {
             this.scene.remove(this.meshObject);
             this.meshObject.geometry.dispose();
-            this.meshObject.material.dispose();
+            const mat = this.meshObject.material;
+            if (Array.isArray(mat)) { mat.forEach(m => m.dispose()); } else { mat.dispose(); }
         }
 
         // Remove old ECS mesh
@@ -527,6 +656,10 @@ class Viewer {
         // Update mesh data reference
         this.meshData = meshData;
 
+        // Dispose old cell meshes + cap before recreating
+        this.disposeCellMeshes();
+        this.disposeCapMesh();
+
         // Create new membrane mesh
         this.createMembraneMesh(meshData);
 
@@ -540,9 +673,17 @@ class Viewer {
             this.createCutMesh(meshData);
         }
 
-        // Reset explosion
+        // Cross-section per-cell surfaces (hidden until cross-section mode is on)
+        if (meshData.cells) {
+            this.createCellMeshes(meshData.cells);
+        }
+        // Reapply cross-section visibility after recreating meshes
+        this.setCrossSectionVisible(this.crossSectionMode);
+
+        // Reset explosion — defer vertex copies until explosion data is set
         this.explosionFactor = 0;
-        this.originalVertices = new Float32Array(meshData.vertices);
+        this.originalVertices = null;
+        this._pendingVerticesForExplosion = meshData.vertices;
         if (meshData.ecsVertices) {
             this.originalEcsVertices = new Float32Array(meshData.ecsVertices);
         }
@@ -560,6 +701,12 @@ class Viewer {
         this.cutRanksData = cutRanksData;
         this.rankCentroids = rankCentroids;
         this.globalCentroid = globalCentroid;
+
+        // Lazily create originalVertices copy now that explosion is possible
+        if (ranksData && !this.originalVertices && this._pendingVerticesForExplosion) {
+            this.originalVertices = new Float32Array(this._pendingVerticesForExplosion);
+        }
+        this._pendingVerticesForExplosion = null;
 
         // Initialize visible ranks to all
         if (ranksData && this.numRanks) {
@@ -727,6 +874,9 @@ class Viewer {
         const geometry = this.meshObject.geometry;
         const colors = geometry.attributes.color.array;
 
+        const excitedColor = this.voltageToColor(vExcited);
+        const restingColor = this.voltageToColor(vResting);
+
         for (let i = 0; i < vertices.length; i += 3) {
             const x = vertices[i];
             const y = vertices[i + 1];
@@ -739,9 +889,7 @@ class Viewer {
                 z >= box.zMin && z <= box.zMax
             );
 
-            // Get voltage and convert to color
-            const voltage = inside ? vExcited : vResting;
-            const color = this.voltageToColor(voltage);
+            const color = inside ? excitedColor : restingColor;
 
             colors[i] = color.r;
             colors[i + 1] = color.g;
@@ -848,11 +996,12 @@ class Viewer {
             const geometry = this.meshObject.geometry;
             const colors = geometry.attributes.color.array;
             const numVertices = colors.length / 3;
+            const restingColor = this.voltageToColor(this.vMin);
+            const rr = restingColor.r, rg = restingColor.g, rb = restingColor.b;
             for (let i = 0; i < numVertices; i++) {
-                const color = this.voltageToColor(this.vMin);
-                colors[i * 3] = color.r;
-                colors[i * 3 + 1] = color.g;
-                colors[i * 3 + 2] = color.b;
+                colors[i * 3] = rr;
+                colors[i * 3 + 1] = rg;
+                colors[i * 3 + 2] = rb;
             }
             this._applyScarDesaturation(colors, numVertices);
             geometry.attributes.color.needsUpdate = true;
@@ -884,6 +1033,27 @@ class Viewer {
     setVoltageRange(vMin, vMax) {
         this.vMin = vMin;
         this.vMax = vMax;
+        this._colorLUT = null; // Invalidate cached LUT
+    }
+
+    /**
+     * Build a color lookup table (256 entries) for the current colormap and
+     * voltage range.  Avoids calling voltageToColor() per-vertex (37M+ calls).
+     */
+    _buildColorLUT() {
+        const N = 256;
+        // Flat Float32Array: [r0,g0,b0, r1,g1,b1, ...]
+        const lut = new Float32Array(N * 3);
+        for (let j = 0; j < N; j++) {
+            const t = j / (N - 1);
+            const v = this.vMin + t * (this.vMax - this.vMin);
+            const c = this.voltageToColor(v);
+            lut[j * 3]     = c.r;
+            lut[j * 3 + 1] = c.g;
+            lut[j * 3 + 2] = c.b;
+        }
+        this._colorLUT = lut;
+        return lut;
     }
 
     updateVoltageColors(voltages) {
@@ -892,12 +1062,19 @@ class Viewer {
         const geometry = this.meshObject.geometry;
         const colors = geometry.attributes.color.array;
 
-        // voltages is array of voltage per vertex
+        // Use LUT for fast voltage -> color mapping
+        const lut = this._colorLUT || this._buildColorLUT();
+        const vMin = this.vMin;
+        const vRange = this.vMax - this.vMin;
+        const lutMax = 255;
+
         for (let i = 0; i < voltages.length; i++) {
-            const color = this.voltageToColor(voltages[i]);
-            colors[i * 3] = color.r;
-            colors[i * 3 + 1] = color.g;
-            colors[i * 3 + 2] = color.b;
+            const t = (voltages[i] - vMin) / vRange;
+            // Clamp to [0, 255] and index into LUT
+            const idx = (t <= 0 ? 0 : t >= 1 ? lutMax : (t * lutMax) | 0) * 3;
+            colors[i * 3]     = lut[idx];
+            colors[i * 3 + 1] = lut[idx + 1];
+            colors[i * 3 + 2] = lut[idx + 2];
         }
 
         // Desaturate scar zones
@@ -925,6 +1102,344 @@ class Viewer {
 
         geometry.attributes.color.needsUpdate = true;
         this.colorMode = 'rank';
+    }
+
+    // ---------------------- Cross-section mode ----------------------
+
+    _buildLUT(colormapName, vMin, vMax) {
+        const N = 256;
+        const lut = new Float32Array(N * 3);
+        const range = vMax - vMin || 1;
+        for (let j = 0; j < N; j++) {
+            const t = j / (N - 1);
+            const v = vMin + t * range;
+            const c = this.sampleColormap(colormapName, (v - vMin) / range);
+            lut[j * 3]     = c.r;
+            lut[j * 3 + 1] = c.g;
+            lut[j * 3 + 2] = c.b;
+        }
+        return lut;
+    }
+
+    _getIntraLUT() {
+        if (!this._intraLUT) {
+            this._intraLUT = this._buildLUT(this.colormapIntra, this.vMinIntra, this.vMaxIntra);
+        }
+        return this._intraLUT;
+    }
+
+    _getExtraLUT() {
+        if (!this._extraLUT) {
+            this._extraLUT = this._buildLUT(this.colormapExtra, this.vMinExtra, this.vMaxExtra);
+        }
+        return this._extraLUT;
+    }
+
+    setIntraRange(vMin, vMax) {
+        this.vMinIntra = vMin;
+        this.vMaxIntra = vMax;
+        this._intraLUT = null;
+    }
+
+    setExtraRange(vMin, vMax) {
+        this.vMinExtra = vMin;
+        this.vMaxExtra = vMax;
+        this._extraLUT = null;
+    }
+
+    setIntraColormap(colormapName) {
+        if (this.colormaps[colormapName]) {
+            this.colormapIntra = colormapName;
+            this._intraLUT = null;
+        }
+    }
+
+    setExtraColormap(colormapName) {
+        if (this.colormaps[colormapName]) {
+            this.colormapExtra = colormapName;
+            this._extraLUT = null;
+        }
+    }
+
+    getColormapGradientFor(colormapName) {
+        const cm = this.colormaps[colormapName] || this.colormaps[this.colormap];
+        const stops = cm.colors.map((color, i) => {
+            const r = Math.round(color[0] * 255);
+            const g = Math.round(color[1] * 255);
+            const b = Math.round(color[2] * 255);
+            const pos = cm.positions[i] * 100;
+            return `rgb(${r}, ${g}, ${b}) ${pos}%`;
+        });
+        return `linear-gradient(to top, ${stops.join(', ')})`;
+    }
+
+    createCellMeshes(cellsMap) {
+        this.disposeCellMeshes();
+        if (!cellsMap) return;
+        const lut = this._getIntraLUT();
+        for (const [tag, payload] of cellsMap.entries()) {
+            const { vertices, facets } = payload;
+            if (!vertices || !facets || vertices.length === 0) continue;
+            const numVerts = vertices.length / 3;
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+            geometry.setIndex(new THREE.BufferAttribute(facets, 1));
+            this._applyDrawGroups(geometry);
+            const useFlatShading = numVerts > 2_000_000;
+            if (!useFlatShading) geometry.computeVertexNormals();
+
+            const colors = new Float32Array(vertices.length);
+            const r0 = lut[0], g0 = lut[1], b0 = lut[2];
+            for (let i = 0; i < vertices.length; i += 3) {
+                colors[i]     = r0;
+                colors[i + 1] = g0;
+                colors[i + 2] = b0;
+            }
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            const material = new THREE.MeshPhongMaterial({
+                vertexColors: true,
+                side: THREE.DoubleSide,
+                flatShading: useFlatShading,
+                transparent: false,
+                shininess: 30,
+            });
+            const meshMaterial = geometry.groups.length > 0 ? [material] : material;
+            const mesh = new THREE.Mesh(geometry, meshMaterial);
+            mesh.visible = false;
+            mesh.userData.cellTag = tag;
+            this.cellMeshes.set(tag, mesh);
+            this.scene.add(mesh);
+        }
+    }
+
+    disposeCellMeshes() {
+        for (const mesh of this.cellMeshes.values()) {
+            this.scene.remove(mesh);
+            mesh.geometry.dispose();
+            const mat = mesh.material;
+            if (Array.isArray(mat)) mat.forEach(m => m.dispose());
+            else mat.dispose();
+        }
+        this.cellMeshes.clear();
+    }
+
+    createCapMesh(capData) {
+        this.disposeCapMesh();
+        if (!capData || !capData.vertices || !capData.facets) return;
+        const { vertices, facets } = capData;
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+        geometry.setIndex(new THREE.BufferAttribute(facets, 1));
+
+        const lut = this._getExtraLUT();
+        const colors = new Float32Array(vertices.length);
+        const r0 = lut[0], g0 = lut[1], b0 = lut[2];
+        for (let i = 0; i < vertices.length; i += 3) {
+            colors[i]     = r0;
+            colors[i + 1] = g0;
+            colors[i + 2] = b0;
+        }
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+        // Unlit material: per-vertex colors are interpolated linearly across
+        // each triangle (Gouraud), no lighting attenuation. Polygon offset
+        // nudges the cap slightly toward the visible side of the clip plane
+        // so it never z-fights with the clipped ECS shell.
+        const material = new THREE.MeshBasicMaterial({
+            vertexColors: true,
+            side: THREE.DoubleSide,
+            transparent: false,
+            polygonOffset: true,
+            polygonOffsetFactor: -2,
+            polygonOffsetUnits: -2,
+        });
+        this.capMeshObject = new THREE.Mesh(geometry, material);
+        this.capMeshObject.visible = this.crossSectionMode;
+        this.capMeshObject.renderOrder = 1;
+        this.scene.add(this.capMeshObject);
+    }
+
+    disposeCapMesh() {
+        if (this.capMeshObject) {
+            this.scene.remove(this.capMeshObject);
+            this.capMeshObject.geometry.dispose();
+            this.capMeshObject.material.dispose();
+            this.capMeshObject = null;
+        }
+    }
+
+    setCrossSectionVisible(visible) {
+        this.crossSectionMode = !!visible;
+        for (const mesh of this.cellMeshes.values()) {
+            mesh.visible = this.crossSectionMode;
+        }
+        if (this.capMeshObject) {
+            this.capMeshObject.visible = this.crossSectionMode;
+        }
+        if (this.meshObject) {
+            this.meshObject.visible = !this.crossSectionMode;
+        }
+        if (this.ecsMeshObject) {
+            const mat = this.ecsMeshObject.material;
+            if (this.crossSectionMode) {
+                // Cross-section: render ECS shell opaque, clipped at the plane
+                // so the volume below the plane stays visible. Cap closes it.
+                // Hidden until the user has applied a plane (otherwise the
+                // unclipped shell would obscure the cells).
+                this.ecsMeshObject.visible = !!this._clippingPlane;
+                mat.transparent = false;
+                mat.opacity = 1.0;
+                mat.depthWrite = true;
+                mat.clippingPlanes = this._clippingPlane ? [this._clippingPlane] : null;
+                mat.needsUpdate = true;
+            } else {
+                mat.transparent = true;
+                mat.opacity = 0.15;
+                mat.depthWrite = false;
+                mat.clippingPlanes = null;
+                mat.needsUpdate = true;
+                this.ecsMeshObject.visible = !!this.ecsMeshObject.userData.userVisible;
+            }
+        }
+        if (this._planeHelper) {
+            this._planeHelper.visible = this.crossSectionMode;
+        }
+    }
+
+    // Configure the clipping plane that crops the ECS shell.
+    // Convention: `normal` and `offset` describe the user's cut plane n·x = offset.
+    // The portion below (n·x < offset) stays visible.
+    setClippingPlane(normal, offset) {
+        const len = Math.hypot(normal[0], normal[1], normal[2]);
+        if (len < 1e-12) return;
+        const inv = 1 / len;
+        const n = new THREE.Vector3(-normal[0] * inv, -normal[1] * inv, -normal[2] * inv);
+        const constant = offset * inv;
+        if (!this._clippingPlane) {
+            this._clippingPlane = new THREE.Plane(n, constant);
+        } else {
+            this._clippingPlane.normal.copy(n);
+            this._clippingPlane.constant = constant;
+        }
+        if (this.crossSectionMode && this.ecsMeshObject) {
+            this.ecsMeshObject.material.clippingPlanes = [this._clippingPlane];
+            this.ecsMeshObject.material.needsUpdate = true;
+            this.ecsMeshObject.visible = true;
+        }
+    }
+
+    clearClippingPlane() {
+        this._clippingPlane = null;
+        if (this.ecsMeshObject) {
+            this.ecsMeshObject.material.clippingPlanes = null;
+            this.ecsMeshObject.material.needsUpdate = true;
+        }
+    }
+
+    // Wireframe preview rectangle showing the configured plane before applying.
+    setPlanePreview(normal, offset, visible) {
+        if (!visible) {
+            if (this._planeHelper) this._planeHelper.visible = false;
+            return;
+        }
+        const len = Math.hypot(normal[0], normal[1], normal[2]);
+        if (len < 1e-12) return;
+        const inv = 1 / len;
+        const n = new THREE.Vector3(normal[0] * inv, normal[1] * inv, normal[2] * inv);
+        // Three.js plane equation is n·p + constant = 0, so constant = -offset.
+        const constant = -offset * inv;
+        const plane = new THREE.Plane(n, constant);
+        const size = this._planeHelperSize || 1;
+        if (!this._planeHelper) {
+            this._planeHelper = new THREE.PlaneHelper(plane, size, 0xe94560);
+            this.scene.add(this._planeHelper);
+        } else {
+            this._planeHelper.plane.copy(plane);
+            this._planeHelper.size = size;
+            this._planeHelper.updateMatrixWorld(true);
+        }
+        this._planeHelper.visible = !!this.crossSectionMode;
+    }
+
+    setPlanePreviewSize(size) {
+        this._planeHelperSize = size;
+        if (this._planeHelper) this._planeHelper.size = size;
+    }
+
+    updatePhiEShellColors(phi) {
+        if (!this.ecsMeshObject || !phi) return;
+        const lut = this._getExtraLUT();
+        const vMin = this.vMinExtra;
+        const vRange = (this.vMaxExtra - this.vMinExtra) || 1;
+        const lutMax = 255;
+        const colors = this.ecsMeshObject.geometry.attributes.color.array;
+        const limit = Math.min(phi.length, colors.length / 3);
+        for (let i = 0; i < limit; i++) {
+            const t = (phi[i] - vMin) / vRange;
+            const idx = (t <= 0 ? 0 : t >= 1 ? lutMax : (t * lutMax) | 0) * 3;
+            colors[i * 3]     = lut[idx];
+            colors[i * 3 + 1] = lut[idx + 1];
+            colors[i * 3 + 2] = lut[idx + 2];
+        }
+        this.ecsMeshObject.geometry.attributes.color.needsUpdate = true;
+    }
+
+    refreshShellColors(phi) {
+        this.updatePhiEShellColors(phi);
+    }
+
+    // Update vertex colors on every cell mesh from per-tag φ_i arrays.
+    // phiByTag: Map<tag, Float32Array> aligned with each cell's expanded vertex order
+    updatePhiIColors(phiByTag) {
+        if (!phiByTag) return;
+        const lut = this._getIntraLUT();
+        const vMin = this.vMinIntra;
+        const vRange = (this.vMaxIntra - this.vMinIntra) || 1;
+        const lutMax = 255;
+        for (const [tag, mesh] of this.cellMeshes.entries()) {
+            const phi = phiByTag.get(tag);
+            if (!phi) continue;
+            const colors = mesh.geometry.attributes.color.array;
+            const limit = Math.min(phi.length, colors.length / 3);
+            for (let i = 0; i < limit; i++) {
+                const t = (phi[i] - vMin) / vRange;
+                const idx = (t <= 0 ? 0 : t >= 1 ? lutMax : (t * lutMax) | 0) * 3;
+                colors[i * 3]     = lut[idx];
+                colors[i * 3 + 1] = lut[idx + 1];
+                colors[i * 3 + 2] = lut[idx + 2];
+            }
+            mesh.geometry.attributes.color.needsUpdate = true;
+        }
+    }
+
+    updatePhiECapColors(phi) {
+        if (!this.capMeshObject || !phi) return;
+        const lut = this._getExtraLUT();
+        const vMin = this.vMinExtra;
+        const vRange = (this.vMaxExtra - this.vMinExtra) || 1;
+        const lutMax = 255;
+        const colors = this.capMeshObject.geometry.attributes.color.array;
+        const limit = Math.min(phi.length, colors.length / 3);
+        for (let i = 0; i < limit; i++) {
+            const t = (phi[i] - vMin) / vRange;
+            const idx = (t <= 0 ? 0 : t >= 1 ? lutMax : (t * lutMax) | 0) * 3;
+            colors[i * 3]     = lut[idx];
+            colors[i * 3 + 1] = lut[idx + 1];
+            colors[i * 3 + 2] = lut[idx + 2];
+        }
+        this.capMeshObject.geometry.attributes.color.needsUpdate = true;
+    }
+
+    // Re-apply current LUTs to all existing cell / cap geometry (when range or
+    // colormap changes but data hasn't refetched). Caller passes the most
+    // recent data so we don't need to keep an internal copy.
+    refreshIntraColors(phiByTag) {
+        this.updatePhiIColors(phiByTag);
+    }
+
+    refreshExtraColors(phi) {
+        this.updatePhiECapColors(phi);
     }
 
     setNumRanks(numRanks) {
@@ -961,7 +1476,8 @@ class Viewer {
         if (this.meshObject) {
             this.scene.remove(this.meshObject);
             this.meshObject.geometry.dispose();
-            this.meshObject.material.dispose();
+            const mat = this.meshObject.material;
+            if (Array.isArray(mat)) { mat.forEach(m => m.dispose()); } else { mat.dispose(); }
             this.meshObject = null;
         }
         if (this.ecsMeshObject) {
@@ -976,10 +1492,16 @@ class Viewer {
             this.cutMeshObject.material.dispose();
             this.cutMeshObject = null;
         }
+        this.disposeCellMeshes();
+        this.disposeCapMesh();
         this.meshData = null;
         this.originalVertices = null;
+        this._pendingVerticesForExplosion = null;
         this.originalEcsVertices = null;
         this.originalCutVertices = null;
+        this._colorLUT = null;
+        this._intraLUT = null;
+        this._extraLUT = null;
     }
 
     showBoundsOutline(bounds) {
@@ -1132,6 +1654,7 @@ class Viewer {
 
         // Update geometry index
         geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(filteredIndices), 1));
+        this._applyDrawGroups(geometry);
 
         // Update colors for visible vertices (with interface highlighting)
         for (let i = 0; i < this.ranksData.length; i++) {
@@ -1250,16 +1773,19 @@ class Viewer {
         if (this.meshObject && this.originalFacets) {
             const geometry = this.meshObject.geometry;
             geometry.setIndex(new THREE.BufferAttribute(this.originalFacets, 1));
+            this._applyDrawGroups(geometry);
             geometry.computeVertexNormals();
         }
         if (this.ecsMeshObject && this.originalEcsFacets) {
             const ecsGeometry = this.ecsMeshObject.geometry;
             ecsGeometry.setIndex(new THREE.BufferAttribute(this.originalEcsFacets, 1));
+            this._applyDrawGroups(ecsGeometry);
             ecsGeometry.computeVertexNormals();
         }
         if (this.cutMeshObject && this.originalCutFacets) {
             const cutGeometry = this.cutMeshObject.geometry;
             cutGeometry.setIndex(new THREE.BufferAttribute(this.originalCutFacets, 1));
+            this._applyDrawGroups(cutGeometry);
             cutGeometry.computeVertexNormals();
         }
 

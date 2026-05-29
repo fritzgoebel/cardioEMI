@@ -426,6 +426,11 @@ t1 = time.perf_counter()
 solver_backend = params.get("solver_backend", "petsc").lower()
 use_ginkgo = solver_backend == "ginkgo" and GINKGO_AVAILABLE
 ginkgo_cfg = params.get("ginkgo", {}) if use_ginkgo else {}
+
+# Backend-independent diagnostic: capture per-iteration true ||b - A*x|| for each
+# timestep solve, persisted into residuals.pickle['iter_history']. Opt-in because
+# Ginkgo's Record clones b/x/r each iter and PETSc's monitor pays an extra matvec.
+track_iter_residuals = bool(params.get("track_iter_residuals", False))
 use_native_assembly = use_ginkgo and ginkgo_cfg.get("native_assembly", False)
 
 use_dd_matrix = use_ginkgo and ginkgo_cfg.get("dd_matrix", False)
@@ -590,6 +595,7 @@ if use_ginkgo:
         amg_config=amg_config,
         bddc_config=bddc_config,
         pure_neumann=not Dirichletbc,
+        track_iter_residuals=track_iter_residuals,
         verbose=params.get("verbose", False)
     )
 
@@ -641,6 +647,12 @@ else:
     if params['pc_type'] == "bddc":
         bddc_cfg = params.get("petsc_bddc", {})
 
+        # One-time BDDC stats printed at PCSetUp (interface analysis) and at
+        # MUMPS factorization (memory estimates). No per-iteration or
+        # per-solve monitors — those flood the log when looped over timesteps.
+        opts.setValue('pc_bddc_check_level', 1)
+        opts.setValue('mat_mumps_icntl_4', 2)
+
         # Primal constraint selection
         if "use_vertices" in bddc_cfg:
             opts.setValue('pc_bddc_use_vertices', bddc_cfg["use_vertices"])
@@ -649,29 +661,66 @@ else:
         if "use_faces" in bddc_cfg:
             opts.setValue('pc_bddc_use_faces', bddc_cfg["use_faces"])
 
-        # Scaling type: multiplicity, stiffness, or deluxe
-        scaling = bddc_cfg.get("scaling", "stiffness")
-        opts.setValue('pc_bddc_scaling_kind', scaling)
+        # Scaling. PETSc's BDDC default is multiplicity/cardinality (pcis->D=1).
+        # "stiffness" enables PCIS diagonal-based partition of unity; "deluxe"
+        # uses sub-Schur complements. Note: stiffness option lives on PCIS
+        # (-pc_is_use_stiffness_scaling), not on PCBDDC.
+        scaling = bddc_cfg.get("scaling", "multiplicity")
+        if scaling == "deluxe":
+            opts.setValue('pc_bddc_use_deluxe_scaling', True)
+        elif scaling == "stiffness":
+            opts.setValue('pc_is_use_stiffness_scaling', True)
 
-        # Local subdomain solver
+        # Local subdomain solvers (Dirichlet + Neumann).
+        # local_solver == "mumps" -> exact LU. Anything else (hypre/gamg/
+        # jacobi/bjacobi/icc/ilu/...) is treated as approximate: the chosen
+        # type is used as the sub-PC and *_approximate is set so BDDC adds
+        # the inexact-solver nullspace correction.
         local_solver = bddc_cfg.get("local_solver", "mumps")
-        opts.setValue('pc_bddc_dirichlet_pc_type', 'lu')
-        opts.setValue('pc_bddc_dirichlet_pc_factor_solver_type', local_solver)
-        opts.setValue('pc_bddc_neumann_pc_type', 'lu')
-        opts.setValue('pc_bddc_neumann_pc_factor_solver_type', local_solver)
+        local_approximate = local_solver != "mumps"
 
-        # Coarse solver
+        for side in ("dirichlet", "neumann"):
+            if local_approximate:
+                opts.setValue(f'pc_bddc_{side}_pc_type', local_solver)
+                opts.setValue(f'pc_bddc_{side}_approximate', True)
+                # Optional: extra options under the same prefix from YAML
+                for opt_key, opt_val in bddc_cfg.get(f"{side}_options", {}).items():
+                    opts.setValue(f'pc_bddc_{side}_{opt_key}', opt_val)
+            else:
+                opts.setValue(f'pc_bddc_{side}_pc_type', 'lu')
+                opts.setValue(f'pc_bddc_{side}_pc_factor_mat_solver_type', 'mumps')
+
+        # Coarse solver (kept direct: small problem, robustness matters)
         coarse_solver = bddc_cfg.get("coarse_solver", "mumps")
         coarse_pc = bddc_cfg.get("coarse_pc_type", "lu")
         opts.setValue('pc_bddc_coarse_redundant_pc_type', coarse_pc)
-        opts.setValue('pc_bddc_coarse_redundant_pc_factor_solver_type', coarse_solver)
+        if coarse_pc == "lu":
+            opts.setValue('pc_bddc_coarse_redundant_pc_factor_mat_solver_type',
+                          coarse_solver)
 
         if comm.rank == 0:
-            print(f"  PCBDDC: scaling={scaling}, local_solver={local_solver}, "
+            tag = "approximate" if local_approximate else "direct"
+            print(f"  PCBDDC: scaling={scaling}, "
+                  f"local_solver={local_solver} ({tag}), "
                   f"coarse_solver={coarse_solver}")
 
     ksp.setFromOptions()
     ginkgo_solver = None  # Not using Ginkgo
+
+    # Per-iteration true-residual monitor (symmetric to Ginkgo's Record-based capture).
+    # Recomputes ||b - A*x_k|| each iteration; cleared per timestep below.
+    _petsc_iter_buf = {"iters": [], "abs": []}
+    if track_iter_residuals:
+        def _petsc_true_resid_monitor(ksp_, it, _rnorm):
+            A_op, _ = ksp_.getOperators()
+            b_vec = ksp_.getRhs()
+            x_k = ksp_.buildSolution()
+            r = b_vec.duplicate()
+            A_op.mult(x_k, r)
+            r.aypx(-1.0, b_vec)  # r = b - A*x_k
+            _petsc_iter_buf["iters"].append(it)
+            _petsc_iter_buf["abs"].append(r.norm())
+        ksp.setMonitor(_petsc_true_resid_monitor)
 
 # intial time
 t = 0.0
@@ -890,8 +939,9 @@ I_ion = {}
 
 # init auxiliary data structures
 ksp_iterations = []
-residual_abs = []  # Absolute residual norms
-residual_rel = []  # Relative residual norms (||r|| / ||b||)
+residual_abs = []  # Absolute residual norms (final per timestep)
+residual_rel = []  # Relative residual norms (||r|| / ||b||) (final per timestep)
+iter_history = []  # Per-timestep dict of per-iter residual trajectories (opt-in)
 #I_ion = dict()
 
 if comm.rank == 0: print("\n#-----------SOLVE----------#")
@@ -997,10 +1047,16 @@ for time_step in range(params["time_steps"]):
     b_norm = b.norm()
 
     if use_ginkgo:
+        # Match PETSc's default: zero initial guess every timestep.
+        sol_vec.array[:] = 0
+        sol_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
         ginkgo_solver.solve(b, sol_vec)
         ksp_iterations.append(ginkgo_solver.iterations)
         res_abs = ginkgo_solver.residual_norm
     else:
+        if track_iter_residuals:
+            _petsc_iter_buf["iters"].clear()
+            _petsc_iter_buf["abs"].clear()
         ksp.solve(b, sol_vec)
         ksp_iterations.append(ksp.getIterationNumber())
         res_abs = ksp.getResidualNorm()
@@ -1009,6 +1065,19 @@ for time_step in range(params["time_steps"]):
     res_rel = res_abs / b_norm if b_norm > 0 else res_abs
     residual_abs.append(res_abs)
     residual_rel.append(res_rel)
+
+    if track_iter_residuals:
+        if use_ginkgo:
+            iter_history.append({
+                'iters': list(ginkgo_solver.iter_history_iterations),
+                'abs_explicit': list(ginkgo_solver.iter_history_explicit),
+                'abs_implicit': list(ginkgo_solver.iter_history_implicit),
+            })
+        else:
+            iter_history.append({
+                'iters': list(_petsc_iter_buf["iters"]),
+                'abs_explicit': list(_petsc_iter_buf["abs"]),
+            })
 
     # Output iteration count and residuals for real-time plotting (filtered by server)
     if comm.rank == 0:
@@ -1091,7 +1160,8 @@ if comm.rank == 0:
     with open(out_name + "/iterations.pickle", "wb") as f:
         pickle.dump(ksp_iterations, f)
     with open(out_name + "/residuals.pickle", "wb") as f:
-        pickle.dump({'abs': residual_abs, 'rel': residual_rel}, f)
+        pickle.dump({'abs': residual_abs, 'rel': residual_rel,
+                     'iter_history': iter_history}, f)
     
     if isinstance(params["ionic_model"], dict):
         print("Ionic models:")

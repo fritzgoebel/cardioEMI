@@ -118,6 +118,7 @@ class App {
             this.setupVideoExport();
             this.setupIterationsChart();
             this.setupResidualChart();
+            this.setupResidualHistoryChart();
             this.setupVoltagePlot();
 
             // Setup vertex picking

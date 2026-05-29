@@ -4,6 +4,7 @@
 
 App.prototype.setupIterationsChart = function() {
     const ctx = document.getElementById('iterations-chart').getContext('2d');
+    const self = this;
 
     this.iterationsChart = new Chart(ctx, {
         type: 'line',
@@ -74,6 +75,11 @@ App.prototype.setupIterationsChart = function() {
                 mode: 'nearest',
                 axis: 'x',
                 intersect: false
+            },
+            onHover: (event, elements) => {
+                if (elements && elements.length > 0) {
+                    self.setCompareResidualHistoryForStep(elements[0].index);
+                }
             }
         }
     });
@@ -201,29 +207,98 @@ App.prototype.updateCompareSelector = async function() {
         summary.textContent = `${mesh} (${meshSims.length})`;
         group.appendChild(summary);
 
+        // First level: group by physical conditions
+        const condGroups = {};
         for (const sim of meshSims) {
-            const label = document.createElement('label');
-            label.style.cssText = 'display:block; margin:2px 0 2px 16px; font-size:0.75em; cursor:pointer;';
-            const cb = document.createElement('input');
-            cb.type = 'checkbox';
-            cb.value = sim.name;
-            cb.style.marginRight = '6px';
-            if (checked.has(sim.name)) cb.checked = true;
-            cb.addEventListener('change', () => this.onCompareSelectionChange());
-            label.appendChild(cb);
-
-            let displayLabel = '';
-            if (sim.solver || sim.preconditioner) {
-                const parts = [sim.preconditioner || sim.solver];
-                if (sim.localSolver) parts[0] += `(${sim.localSolver})`;
-                if (sim.nRanks) parts.push(`${sim.nRanks}r`);
-                displayLabel = parts.join(' ');
-            } else {
-                displayLabel = sim.name.replace(/^.+?_sim_?/, '') || 'default';
-            }
-            label.appendChild(document.createTextNode(displayLabel));
-            group.appendChild(label);
+            const condKey = sim.physical_hash || sim.name;
+            if (!condGroups[condKey]) condGroups[condKey] = [];
+            condGroups[condKey].push(sim);
         }
+
+        // Build a conditions label from the physical_hash JSON
+        function conditionsLabel(condKey, index) {
+            try {
+                const phys = JSON.parse(condKey);
+                if (phys.scarEnabled && phys.scarBox) {
+                    const b = phys.scarBox;
+                    const cx = ((b.xMin + b.xMax) / 2).toFixed(0);
+                    const cy = ((b.yMin + b.yMax) / 2).toFixed(0);
+                    const cz = ((b.zMin + b.zMax) / 2).toFixed(0);
+                    return `scar @ (${cx}, ${cy}, ${cz})`;
+                }
+                return 'no scar';
+            } catch {
+                return `conditions ${index + 1}`;
+            }
+        }
+
+        const condEntries = Object.entries(condGroups);
+        const condColumnsDiv = document.createElement('div');
+        condColumnsDiv.style.cssText = 'display:flex; gap:16px; margin-left:4px; flex-wrap:wrap;';
+
+        for (let ci = 0; ci < condEntries.length; ci++) {
+            const [condKey, condSims] = condEntries[ci];
+            const condCol = document.createElement('div');
+
+            // Conditions header (show when multiple conditions groups exist)
+            if (condEntries.length > 1) {
+                const condHeader = document.createElement('div');
+                condHeader.style.cssText = 'font-size:0.7em; color:#999; border-bottom:1px solid #444; padding-bottom:1px; margin-bottom:3px; white-space:nowrap;';
+                condHeader.textContent = conditionsLabel(condKey, ci);
+                condCol.appendChild(condHeader);
+            }
+
+            // Second level: group by solver config
+            const configGroups = {};
+            for (const sim of condSims) {
+                const configKey = [sim.solver || '', sim.preconditioner || '', sim.localSolver || ''].join('|');
+                if (!configGroups[configKey]) configGroups[configKey] = [];
+                configGroups[configKey].push(sim);
+            }
+
+            const configColumnsDiv = document.createElement('div');
+            configColumnsDiv.style.cssText = 'display:flex; gap:12px; flex-wrap:wrap;';
+
+            for (const [configKey, configSims] of Object.entries(configGroups).sort((a, b) => a[0].localeCompare(b[0]))) {
+                const col = document.createElement('div');
+                col.style.cssText = 'min-width:80px;';
+
+                // Column header from config
+                const parts = configKey.split('|').filter(Boolean);
+                let header = parts.length > 0 ? (parts[1] || parts[0]) : 'default';
+                if (parts[2]) header += `(${parts[2]})`;
+                const headerEl = document.createElement('div');
+                headerEl.style.cssText = 'font-size:0.7em; color:#666; font-weight:bold; margin-bottom:2px; white-space:nowrap;';
+                headerEl.textContent = header;
+                col.appendChild(headerEl);
+
+                // Sort by nRanks
+                configSims.sort((a, b) => (a.nRanks || 0) - (b.nRanks || 0));
+
+                for (const sim of configSims) {
+                    const label = document.createElement('label');
+                    label.style.cssText = 'display:block; margin:2px 0; font-size:0.75em; cursor:pointer; white-space:nowrap;';
+                    const cb = document.createElement('input');
+                    cb.type = 'checkbox';
+                    cb.value = sim.name;
+                    cb.style.marginRight = '6px';
+                    if (checked.has(sim.name)) cb.checked = true;
+                    cb.addEventListener('change', () => this.onCompareSelectionChange());
+                    label.appendChild(cb);
+
+                    const displayLabel = sim.nRanks ? `${sim.nRanks}r` : (sim.name.replace(/^.+?_sim_?/, '') || 'default');
+                    label.appendChild(document.createTextNode(displayLabel));
+                    col.appendChild(label);
+                }
+
+                configColumnsDiv.appendChild(col);
+            }
+
+            condCol.appendChild(configColumnsDiv);
+            condColumnsDiv.appendChild(condCol);
+        }
+
+        group.appendChild(condColumnsDiv);
 
         container.appendChild(group);
     }
@@ -247,10 +322,16 @@ App.prototype.onCompareSelectionChange = async function() {
         this.iterationsChart.data.datasets = this.iterationsChart.data.datasets.slice(0, 2);
     }
     this.compareDatasets = [];
+    this.compareIterHistory = {};        // simName -> per-timestep iter_history array
+    this.compareIterHistoryOrder = [];   // preserve selection order for colour mapping
+    this.compareIterHistoryColors = {};
+    this.compareBNorms = {};             // simName -> array of ||b|| per timestep (for relative residual)
 
     if (selected.length === 0) {
         document.getElementById('compare-conditions-warning').style.display = 'none';
         if (this.iterationsChart) this.iterationsChart.update('none');
+        const c = document.getElementById('residual-history-chart-container');
+        if (c) c.style.display = 'none';
         return;
     }
 
@@ -274,6 +355,22 @@ App.prototype.onCompareSelectionChange = async function() {
                 pointHoverRadius: 4,
             };
             this.compareDatasets.push(ds);
+
+            // Cache iter_history (true ||b-Ax|| per Krylov iter, per timestep) for hover-driven sub-plot
+            const ih = data.residuals && data.residuals.iter_history;
+            if (Array.isArray(ih) && ih.length > 0) {
+                this.compareIterHistory[selected[i]] = ih;
+                this.compareIterHistoryOrder.push(selected[i]);
+                this.compareIterHistoryColors[selected[i]] = colors[i % colors.length];
+                // Recover ||b|| per timestep from final residuals (abs / rel) so we can
+                // scale the per-iter explicit residual into a relative one.
+                const absArr = (data.residuals && data.residuals.abs) || [];
+                const relArr = (data.residuals && data.residuals.rel) || [];
+                this.compareBNorms[selected[i]] = absArr.map((a, t) => {
+                    const r = relArr[t];
+                    return (r && isFinite(r) && r > 0) ? (a / r) : null;
+                });
+            }
 
             if (data.conditions) {
                 // Hash only physics conditions (mesh, IC, scar) -- not solver config
@@ -316,6 +413,59 @@ App.prototype.onCompareSelectionChange = async function() {
         }
         this.iterationsChart.update('none');
     }
+
+    // Show/hide per-iter sub-plot based on whether any selected run carries iter_history
+    const subContainer = document.getElementById('residual-history-chart-container');
+    if (subContainer) {
+        subContainer.style.display = this.compareIterHistoryOrder.length ? 'block' : 'none';
+    }
+    this.setCompareResidualHistoryForStep(0);
+};
+
+App.prototype.setCompareResidualHistoryForStep = function(stepIdx) {
+    if (!this.residualHistoryChart) return;
+    const order = this.compareIterHistoryOrder || [];
+    if (order.length === 0) return;
+
+    // Build one dataset per selected sim showing its true ||b - A·x|| at this timestep.
+    const sanitize = arr => (arr || []).map(v =>
+        (v === null || v === undefined || !isFinite(v) || v <= 0) ? null : v);
+
+    let maxIters = 0;
+    const datasets = [];
+    for (const simName of order) {
+        const ih = this.compareIterHistory[simName];
+        const entry = ih && ih[stepIdx];
+        if (!entry || !Array.isArray(entry.iters) || entry.iters.length === 0) continue;
+        maxIters = Math.max(maxIters, entry.iters.length);
+        const color = this.compareIterHistoryColors[simName] || '#aaa';
+        const label = this._getCompareLabel(simName);
+        const absExplicit = sanitize(entry.abs_explicit);
+        datasets.push({
+            label: label + ' (abs)', data: absExplicit,
+            borderColor: color, borderWidth: 2, fill: false,
+            pointRadius: 0, pointHoverRadius: 3, tension: 0,
+        });
+        // Relative residual = abs / ||b|| at this timestep — dotted, same colour.
+        const bNorms = this.compareBNorms[simName] || [];
+        const bNorm = bNorms[stepIdx];
+        if (bNorm && isFinite(bNorm) && bNorm > 0) {
+            const relExplicit = absExplicit.map(v => v == null ? null : v / bNorm);
+            datasets.push({
+                label: label + ' (rel)', data: relExplicit,
+                borderColor: color, borderDash: [2, 3], borderWidth: 1.5, fill: false,
+                pointRadius: 0, pointHoverRadius: 3, tension: 0,
+            });
+        }
+    }
+
+    this.residualHistoryChart.data.labels = Array.from({ length: maxIters }, (_, i) => i);
+    this.residualHistoryChart.data.datasets = datasets;
+    this.residualHistoryChart.options.plugins.title = {
+        display: true, color: '#aaa', font: { size: 10 },
+        text: `Residual norms vs Krylov iteration — timestep ${stepIdx}`,
+    };
+    this.residualHistoryChart.update('none');
 };
 
 // ==================== Residual Chart ====================
@@ -595,4 +745,76 @@ App.prototype.hideVoltagePlot = function() {
     this.pickedVertexIndex = null;
     this._pickedVertexSeries = null;
     if (this.viewer) this.viewer.clearPickMarker();
+};
+
+// ==================== Residual History (per-timestep, per Krylov iter) ====================
+// Driven by the timestep slider via setResidualHistoryForStep(stepIdx).
+// Data source: residuals.pickle["iter_history"][stepIdx] -> {iters, abs_explicit, abs_implicit?}
+
+App.prototype.setupResidualHistoryChart = function() {
+    const el = document.getElementById('residual-history-chart');
+    if (!el) return;
+    const ctx = el.getContext('2d');
+
+    this.residualHistoryChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                { label: 'true ||b - A·x||', data: [], borderColor: '#e94560',
+                  borderWidth: 2, fill: false, pointRadius: 0, pointHoverRadius: 3, tension: 0 },
+                { label: 'implicit', data: [], borderColor: '#4ade80', borderDash: [4, 3],
+                  borderWidth: 2, fill: false, pointRadius: 0, pointHoverRadius: 3, tension: 0 },
+            ]
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false, animation: false,
+            plugins: {
+                legend: { display: true, position: 'top',
+                          labels: { color: '#888', boxWidth: 12, padding: 8, font: { size: 10 } } },
+                tooltip: {
+                    mode: 'index', intersect: false,
+                    backgroundColor: '#16213e', titleColor: '#fff', bodyColor: '#ccc',
+                    callbacks: {
+                        label: c => `${c.dataset.label}: ${c.parsed.y.toExponential(2)}`
+                    }
+                }
+            },
+            scales: {
+                x: { title: { display: true, text: 'Krylov iteration', color: '#888' },
+                     ticks: { color: '#888' }, grid: { color: 'rgba(255,255,255,0.1)' } },
+                y: { type: 'logarithmic',
+                     title: { display: true, text: 'Residual Norm', color: '#888' },
+                     ticks: { color: '#888',
+                              callback: v => v.toExponential(0) },
+                     grid: { color: 'rgba(255,255,255,0.1)' } }
+            },
+            interaction: { mode: 'nearest', axis: 'x', intersect: false }
+        }
+    });
+};
+
+App.prototype.setIterHistoryCache = function(history) {
+    // history: array (per-timestep) of {iters, abs_explicit, abs_implicit?} or null/missing
+    this.iterHistoryCache = Array.isArray(history) ? history : [];
+    const container = document.getElementById('residual-history-chart-container');
+    if (!container) return;
+    const hasAny = this.iterHistoryCache.some(e => e && Array.isArray(e.iters) && e.iters.length > 0);
+    container.style.display = hasAny ? 'block' : 'none';
+};
+
+App.prototype.setResidualHistoryForStep = function(stepIdx) {
+    if (!this.residualHistoryChart || !this.iterHistoryCache) return;
+    const entry = this.iterHistoryCache[stepIdx];
+    const sanitize = arr => (arr || []).map(v =>
+        (v === null || v === undefined || !isFinite(v) || v <= 0) ? null : v);
+
+    const iters = (entry && Array.isArray(entry.iters)) ? entry.iters : [];
+    const expl = sanitize(entry && entry.abs_explicit);
+    const impl = sanitize(entry && entry.abs_implicit);
+
+    this.residualHistoryChart.data.labels = iters;
+    this.residualHistoryChart.data.datasets[0].data = expl;
+    this.residualHistoryChart.data.datasets[1].data = impl;
+    this.residualHistoryChart.update('none');
 };

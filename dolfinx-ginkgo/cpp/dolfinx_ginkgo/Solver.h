@@ -9,9 +9,12 @@
 #include <ginkgo/ginkgo.hpp>
 #include <mpi.h>
 
+#include <cmath>
+#include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
-#include <iostream>
+#include <vector>
 
 #include "ginkgo.h"
 
@@ -107,6 +110,17 @@ public:
         last_iterations_ = 0;
         last_residual_ = 0;
 
+        // Optional per-iteration residual capture (opt-in: clones b, x, r each iter)
+        iter_history_iters_.clear();
+        iter_history_explicit_.clear();
+        iter_history_implicit_.clear();
+        if (config_.track_iter_residuals) {
+            // max_storage=0 means unlimited; the default (1) only keeps the last iter.
+            iter_record_ = gko::log::Record::create(
+                gko::log::Logger::iteration_complete_mask, 0);
+            solver_->add_logger(iter_record_);
+        }
+
         // Create a copy of x as initial guess (Ginkgo modifies in place)
         auto x_copy = x.clone();
 
@@ -132,6 +146,13 @@ public:
             }
         }
 
+        // Post-process Record: compute true explicit residual ||b - A*x_k|| per iter
+        if (iter_record_) {
+            extract_iter_history(b);
+            solver_->remove_logger(iter_record_);
+            iter_record_.reset();
+        }
+
         if (config_.verbose && comm_->rank() == 0) {
             std::cout << "Ginkgo solver: " << last_iterations_ << " iterations, "
                       << "residual = " << last_residual_
@@ -154,6 +175,17 @@ public:
     /// Get the solver configuration
     const SolverConfig& config() const { return config_; }
 
+    /// Per-iteration history from the last solve (empty if track_iter_residuals was off)
+    const std::vector<std::size_t>& iter_history_iterations() const {
+        return iter_history_iters_;
+    }
+    const std::vector<ValueType>& iter_history_explicit() const {
+        return iter_history_explicit_;
+    }
+    const std::vector<ValueType>& iter_history_implicit() const {
+        return iter_history_implicit_;
+    }
+
 private:
     std::shared_ptr<gko::Executor> exec_;
     std::shared_ptr<gko::experimental::mpi::communicator> comm_;
@@ -163,9 +195,66 @@ private:
     std::shared_ptr<gko::LinOp> solver_;
     std::shared_ptr<gko::log::Convergence<ValueType>> logger_;
 
+    // Per-iteration diagnostic capture (only populated when track_iter_residuals).
+    // Record clones b, x, r each iter and is detached/dropped after extraction.
+    std::shared_ptr<gko::log::Record> iter_record_;
+    std::vector<std::size_t> iter_history_iters_;
+    std::vector<ValueType> iter_history_explicit_;
+    std::vector<ValueType> iter_history_implicit_;
+
     int last_iterations_ = 0;
     ValueType last_residual_ = 0;
     bool last_converged_ = false;
+
+    /// Walk Record's iteration_completed deque and fill iter_history_* vectors.
+    /// Explicit norm: ||b - A*x_k|| via one matvec per iter. Skipped (NaN) if
+    /// the cast to gko_dist::Vector fails (e.g. BDDC's DdVector).
+    void extract_iter_history(const vector_type& b_ref) {
+        auto neg_one = gko::initialize<gko::matrix::Dense<ValueType>>({-1.0}, exec_);
+        auto host = exec_->get_master();
+
+        // Compute ||v||_2 for a Ginkgo distributed vector (norm scalar -> host).
+        auto vec_norm2 = [&](const vector_type& v) {
+            auto nrm = gko::matrix::Dense<ValueType>::create(exec_, gko::dim<2>{1, 1});
+            v.compute_norm2(nrm.get());
+            auto host_nrm = gko::clone(host, nrm.get());
+            return host_nrm->at(0, 0);
+        };
+
+        for (const auto& entry_ptr : iter_record_->get().iteration_completed) {
+            const auto& data = *entry_ptr;
+            iter_history_iters_.push_back(data.num_iterations);
+
+            // Implicit norm: prefer sqrt(rho), fall back to residual_norm, then ||r||
+            ValueType impl_norm = std::numeric_limits<ValueType>::quiet_NaN();
+            if (data.implicit_sq_residual_norm) {
+                auto h = gko::clone(host, data.implicit_sq_residual_norm.get());
+                auto d = gko::as<gko::matrix::Dense<ValueType>>(h.get());
+                impl_norm = std::sqrt(d->at(0, 0));
+            } else if (data.residual_norm) {
+                auto h = gko::clone(host, data.residual_norm.get());
+                auto d = gko::as<gko::matrix::Dense<ValueType>>(h.get());
+                impl_norm = d->at(0, 0);
+            } else if (data.residual) {
+                auto rv = dynamic_cast<const vector_type*>(data.residual.get());
+                if (rv) impl_norm = vec_norm2(*rv);
+            }
+            iter_history_implicit_.push_back(impl_norm);
+
+            // Explicit norm: ||A*x_k - b|| via one matvec
+            ValueType expl_norm = std::numeric_limits<ValueType>::quiet_NaN();
+            if (data.solution) {
+                auto xv = dynamic_cast<const vector_type*>(data.solution.get());
+                if (xv && A_) {
+                    auto scratch = gko::clone(exec_, &b_ref);
+                    A_->apply(xv, scratch.get());                  // scratch = A*x_k
+                    scratch->add_scaled(neg_one.get(), &b_ref);    // scratch -= b
+                    expl_norm = vec_norm2(*scratch);
+                }
+            }
+            iter_history_explicit_.push_back(expl_norm);
+        }
+    }
 
     /// Build the preconditioner based on configuration
     std::shared_ptr<gko::LinOpFactory> build_preconditioner_factory() {

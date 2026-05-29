@@ -269,6 +269,11 @@ def read_input_file(input_yml_file):
         if 'original_mesh_file' in config:
             input_parameters['original_mesh_file'] = config['original_mesh_file']
 
+        ######### Diagnostics #########
+        # Opt-in: capture per-iteration true ||b - A*x|| (and implicit norm) for both backends.
+        if 'track_iter_residuals' in config:
+            input_parameters['track_iter_residuals'] = bool(config['track_iter_residuals'])
+
         # sanuty checks
         parse_nonneg_int(input_parameters['P'])
         parse_nonneg_int(input_parameters['time_steps'])

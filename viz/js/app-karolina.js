@@ -9,12 +9,16 @@ App.prototype.setupRunTarget = function() {
     const mpiRanksRow = document.getElementById('mpi-ranks').closest('.param-row');
 
     const applyTarget = async (target) => {
+        const jobSection = document.getElementById('karolina-job-section');
         if (target === 'karolina') {
             karolinaOptions.style.display = 'block';
             containerStatusRow.style.display = 'flex';
             statusDot.style.display = 'inline';
             refreshBtn.style.display = 'inline-block';
             mpiRanksRow.style.display = 'none';
+            if (this.karolinaJobs && Object.keys(this.karolinaJobs).length > 0) {
+                jobSection.style.display = 'block';
+            }
             statusDot.textContent = '...';
             statusDot.title = 'Checking SSH...';
             try {
@@ -47,6 +51,7 @@ App.prototype.setupRunTarget = function() {
             statusDot.style.display = 'none';
             refreshBtn.style.display = 'none';
             mpiRanksRow.style.display = 'flex';
+            jobSection.style.display = 'none';
             document.getElementById('download-karolina-results').style.display = 'none';
             document.getElementById('export-video-remote').style.display = 'none';
             this.refreshMeshList();
@@ -82,6 +87,9 @@ App.prototype.setupKarolinaOptions = function() {
 
     this.karolinaJobs = {};
     this.compareDatasets = [];
+
+    // Persistence + mesh filter + remove flow live in app-karolina-jobs.js
+    this.setupKarolinaJobsPersistence();
 };
 
 App.prototype.renderJobEntry = function(jobInfo) {
@@ -94,16 +102,20 @@ App.prototype.renderJobEntry = function(jobInfo) {
     const entry = document.createElement('div');
     entry.id = entryId;
     entry.style.cssText = 'border:1px solid #444; border-radius:6px; padding:8px; margin-bottom:8px; background:#1a1a1a;';
+    const lbl = this.formatSimulationLabel(jobInfo);
     entry.innerHTML = `
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <span style="font-weight:bold; color:#ccc;">${jobInfo.label || jobId}</span>
-            <span style="font-size:0.8em; color:#888;">ID: ${jobId}</span>
+        <div class="job-entry-header" style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px;">
+            <div class="job-entry-title" style="min-width:0; flex:1;" title="${jobInfo.out_name || jobId}">
+                <div style="font-weight:bold; color:#ccc; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${lbl.line1}</div>
+                <div style="font-size:0.85em; color:#aaa;">${lbl.line2}</div>
+                <div style="font-size:0.85em; color:#888;">${lbl.line3 || ''}</div>
+            </div>
         </div>
         <div class="param-row" style="margin:4px 0;">
             <label>Status:</label>
             <span class="job-status" style="font-weight:bold;">PENDING</span>
         </div>
-        <div style="margin-top:6px;">
+        <div class="job-actions" style="margin-top:6px;">
             <button class="btn btn-danger btn-cancel" style="font-size:0.75em; padding:2px 8px;">Cancel</button>
             <button class="btn btn-success btn-download" style="font-size:0.75em; padding:2px 8px; display:none;">Download</button>
             <button class="btn btn-toggle-log" style="font-size:0.75em; padding:2px 8px; background:#555; color:#ccc;">Log</button>
@@ -176,6 +188,11 @@ App.prototype.updateJobStatus = function(jobId, data) {
     } else if (['FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY'].includes(s)) {
         statusEl.style.color = '#e94560';
         cancelBtn.style.display = 'none';
+    }
+
+    if (this.karolinaJobs[jobId] && s) {
+        this.karolinaJobs[jobId].status = s;
+        this.saveKarolinaJobs();
     }
 };
 

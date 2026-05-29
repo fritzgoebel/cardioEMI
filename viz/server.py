@@ -475,6 +475,24 @@ def update_petsc_bddc_config():
             'use_faces': bddc_config.get('useFaces', False)
         }
 
+        # Forward sub-PC options when the local solver is hypre BoomerAMG.
+        # main.py reads dirichlet_options/neumann_options and prepends the
+        # -pc_bddc_<side>_ prefix, so keys here are the inner option names.
+        if petsc_bddc_dict['local_solver'] == 'hypre':
+            h = bddc_config.get('localHypre', {})
+            hypre_options = {
+                'pc_hypre_type': 'boomeramg',
+                'pc_hypre_boomeramg_cycle_type': h.get('cycleType', 'V'),
+                'pc_hypre_boomeramg_coarsen_type': h.get('coarsenType', 'HMIS'),
+                'pc_hypre_boomeramg_strong_threshold': float(h.get('strongThreshold', 0.7)),
+                'pc_hypre_boomeramg_relax_type_all': h.get('relaxType', 'symmetric-SOR/Jacobi'),
+                'pc_hypre_boomeramg_grid_sweeps_all': int(h.get('numSweeps', 1)),
+                'pc_hypre_boomeramg_interp_type': h.get('interpType', 'classical'),
+                'pc_hypre_boomeramg_max_levels': int(h.get('maxLevels', 25)),
+            }
+            petsc_bddc_dict['dirichlet_options'] = hypre_options
+            petsc_bddc_dict['neumann_options'] = dict(hypre_options)
+
         config['petsc_bddc'] = petsc_bddc_dict
 
         # Write back with YAML formatting
@@ -848,11 +866,29 @@ def list_simulations():
                 viz_data_dir = Path(__file__).parent / 'data' / item.name
                 has_viz = (viz_data_dir / 'mesh_metadata.json').exists()
 
+                # Pull solver/mesh info from conditions.json for compact labels
+                solver_info = {}
+                cond_file = item / 'conditions.json'
+                if cond_file.exists():
+                    try:
+                        with open(cond_file, 'r') as f:
+                            cond = json.load(f)
+                        solver_info = {
+                            'mesh': cond.get('mesh'),
+                            'solver': cond.get('solver'),
+                            'preconditioner': cond.get('preconditioner'),
+                            'localSolver': cond.get('localSolver'),
+                            'nRanks': cond.get('nRanks'),
+                        }
+                    except Exception:
+                        pass
+
                 simulations.append({
                     'name': item.name,
                     'path': str(item),
                     'has_viz_data': has_viz,
-                    'size': sum(f.stat().st_size for f in item.glob('*.h5'))
+                    'size': sum(f.stat().st_size for f in item.glob('*.h5')),
+                    **solver_info,
                 })
 
     return jsonify({
@@ -869,6 +905,7 @@ def list_simulations_with_iterations():
             if iters_file.exists():
                 cond_file = item / 'conditions.json'
                 conditions_hash = None
+                physical_hash = None
                 solver_info = {}
                 if cond_file.exists():
                     try:
@@ -881,11 +918,18 @@ def list_simulations_with_iterations():
                             'localSolver': cond.get('localSolver'),
                             'nRanks': cond.get('nRanks'),
                         }
+                        # Physical conditions hash (same keys used in JS warning)
+                        phys = {k: cond.get(k) for k in (
+                            'mesh', 'boundingBox', 'vExcited', 'vResting',
+                            'scarEnabled', 'scarBox', 'scarMargin', 'scarConductivities'
+                        ) if cond.get(k) is not None}
+                        physical_hash = json.dumps(phys, sort_keys=True)
                     except Exception:
                         pass
                 simulations.append({
                     'name': item.name,
                     'conditions_hash': conditions_hash,
+                    'physical_hash': physical_hash,
                     **solver_info,
                 })
     return jsonify({
@@ -1101,6 +1145,19 @@ def get_results():
                     cond = json.load(f)
                     scar_config = cond.get('scar')
 
+            # Rank metadata for partition view (same as full path below)
+            rank_metadata_path = mesh_data_dir / 'rank_metadata.json'
+            num_ranks = None
+            rank_centroids = None
+            global_centroid = None
+            has_rank_data = (mesh_data_dir / 'dof_ranks.bin').exists()
+            if has_rank_data and rank_metadata_path.exists():
+                with open(rank_metadata_path, 'r') as f:
+                    rank_meta = json.load(f)
+                    num_ranks = rank_meta.get('num_ranks')
+                    rank_centroids = rank_meta.get('rank_centroids')
+                    global_centroid = rank_meta.get('global_centroid')
+
             return jsonify({
                 'times': times,
                 'vMin': v_min,
@@ -1109,6 +1166,14 @@ def get_results():
                 'iterations': iterations or [],
                 'residuals': residuals,
                 'scarConfig': scar_config,
+                'hasRankData': has_rank_data,
+                'numRanks': num_ranks,
+                'rankCentroids': rank_centroids,
+                'globalCentroid': global_centroid,
+                'hasEcsRanks': (mesh_data_dir / 'ecs_ranks.bin').exists(),
+                'hasCutRanks': (mesh_data_dir / 'cut_ranks.bin').exists(),
+                'hasDofIndices': (mesh_data_dir / 'facet_orig_vertices.bin').exists(),
+                'hasEcsDofIndices': (mesh_data_dir / 'ecs_orig_vertices.bin').exists(),
             })
 
         if use_per_facet:
@@ -1305,6 +1370,287 @@ def get_results_binary(sim_name, filename):
 
     return send_from_directory(str(file_path.parent), file_path.name,
                                mimetype='application/octet-stream')
+
+
+# --------------------- Cross-section API ---------------------
+
+def _is_timestep_filename(name):
+    return name.endswith('.bin') and name[:-4].isdigit()
+
+
+def _resolve_cross_section_path(sim_name, filepath):
+    """Validate and resolve a cross-section binary path.
+
+    Allows: cells/<tag>_(vertices|facets|orig_verts).bin,
+            phi_i/<tag>/<ti>.bin,
+            phi_e/<ti>.bin,
+            ecs_volume/(vertices|tets|orig_verts).bin,
+            cap/(vertices|facets).bin,
+            cap/phi_e/<ti>.bin.
+    Returns the absolute Path or None.
+    """
+    parts = filepath.split('/')
+    base = Path(__file__).parent / 'data' / sim_name
+
+    if any(p in ('', '.', '..') for p in parts):
+        return None
+
+    if len(parts) == 2 and parts[0] == 'cells':
+        fname = parts[1]
+        if not fname.endswith('.bin'):
+            return None
+        stem = fname[:-4]
+        if '_' not in stem:
+            return None
+        tag_part, suffix = stem.split('_', 1)
+        if not tag_part.lstrip('-').isdigit():
+            return None
+        if suffix not in ('vertices', 'facets', 'orig_verts'):
+            return None
+        return base / 'cells' / fname
+
+    if len(parts) == 3 and parts[0] == 'phi_i':
+        tag_part = parts[1]
+        if not tag_part.lstrip('-').isdigit():
+            return None
+        if not _is_timestep_filename(parts[2]):
+            return None
+        return base / 'phi_i' / tag_part / parts[2]
+
+    if len(parts) == 2 and parts[0] == 'phi_e':
+        if not _is_timestep_filename(parts[1]):
+            return None
+        return base / 'phi_e' / parts[1]
+
+    if len(parts) == 2 and parts[0] == 'phi_e_shell':
+        if not _is_timestep_filename(parts[1]):
+            return None
+        return base / 'phi_e_shell' / parts[1]
+
+    if len(parts) == 2 and parts[0] == 'ecs_volume':
+        if parts[1] not in ('vertices.bin', 'tets.bin', 'orig_verts.bin'):
+            return None
+        return base / 'ecs_volume' / parts[1]
+
+    if len(parts) == 2 and parts[0] == 'cap':
+        if parts[1] not in ('vertices.bin', 'facets.bin'):
+            return None
+        return base / 'cap' / parts[1]
+
+    if len(parts) == 3 and parts[0] == 'cap' and parts[1] == 'phi_e':
+        if not _is_timestep_filename(parts[2]):
+            return None
+        return base / 'cap' / 'phi_e' / parts[2]
+
+    return None
+
+
+@app.route('/api/cross-section/binary/<sim_name>/<path:filepath>')
+def get_cross_section_binary(sim_name, filepath):
+    """Serve cross-section binary files (cells/, phi_i/, phi_e/, ecs_volume/, cap/)."""
+    file_path = _resolve_cross_section_path(sim_name, filepath)
+    if file_path is None:
+        return jsonify({'error': 'Invalid path'}), 400
+    if not file_path.exists():
+        return jsonify({'error': 'File not found'}), 404
+    return send_from_directory(str(file_path.parent), file_path.name,
+                               mimetype='application/octet-stream')
+
+
+def _slice_ecs_volume(ecs_vertices, ecs_tets, normal, offset):
+    """Compute the cap triangulation of the plane n·x = offset cutting the ECS tets.
+
+    Returns dict with cap geometry plus per-cap-vertex interpolation weights
+    (edge endpoints in ECS volume vertex indices + t in [0,1]) so that
+    cap value = (1-t) * f(a) + t * f(b).
+    Returns None if the plane misses every tet.
+    """
+    normal = np.asarray(normal, dtype=np.float64)
+    norm_mag = np.linalg.norm(normal)
+    if norm_mag < 1e-12:
+        return None
+    normal = normal / norm_mag
+    offset = float(offset)
+
+    d = (ecs_vertices.astype(np.float64) @ normal) - offset
+    tet_dists = d[ecs_tets]
+    pos_mask = tet_dists > 0.0
+    n_pos = pos_mask.sum(axis=1)
+
+    cap_edges = []   # list of (a, b, t), a < b
+    cap_facets = []
+    edge_cache = {}
+
+    def edge_index(va, vb, da, db):
+        if va == vb:
+            return None
+        a, b = (va, vb) if va < vb else (vb, va)
+        key = (a, b)
+        cached = edge_cache.get(key)
+        if cached is not None:
+            return cached
+        # t such that (1-t)*pos_a + t*pos_b is on the plane, with t referring to b
+        # Solve (1-t)*da + t*db = 0 → t = da / (da - db)
+        denom = (da - db) if a == va else (db - da)
+        da_eff = da if a == va else db
+        if denom == 0.0:
+            t = 0.0
+        else:
+            t = da_eff / denom
+            if t < 0.0:
+                t = 0.0
+            elif t > 1.0:
+                t = 1.0
+        idx = len(cap_edges)
+        cap_edges.append((int(a), int(b), float(t)))
+        edge_cache[key] = idx
+        return idx
+
+    n_tets = ecs_tets.shape[0]
+    for ti in range(n_tets):
+        np_pos = n_pos[ti]
+        if np_pos == 0 or np_pos == 4:
+            continue
+        verts = ecs_tets[ti]
+        dists = tet_dists[ti]
+        positives = [i for i in range(4) if dists[i] > 0.0]
+        negatives = [i for i in range(4) if dists[i] <= 0.0]
+
+        if np_pos == 1:
+            p = positives[0]
+            n0, n1, n2 = negatives
+            i0 = edge_index(int(verts[p]), int(verts[n0]), dists[p], dists[n0])
+            i1 = edge_index(int(verts[p]), int(verts[n1]), dists[p], dists[n1])
+            i2 = edge_index(int(verts[p]), int(verts[n2]), dists[p], dists[n2])
+            cap_facets.append((i0, i1, i2))
+        elif np_pos == 3:
+            n = negatives[0]
+            p0, p1, p2 = positives
+            i0 = edge_index(int(verts[n]), int(verts[p0]), dists[n], dists[p0])
+            i1 = edge_index(int(verts[n]), int(verts[p1]), dists[n], dists[p1])
+            i2 = edge_index(int(verts[n]), int(verts[p2]), dists[n], dists[p2])
+            cap_facets.append((i0, i1, i2))
+        else:  # np_pos == 2 → quad → two triangles
+            p0, p1 = positives
+            n0, n1 = negatives
+            i00 = edge_index(int(verts[p0]), int(verts[n0]), dists[p0], dists[n0])
+            i01 = edge_index(int(verts[p0]), int(verts[n1]), dists[p0], dists[n1])
+            i11 = edge_index(int(verts[p1]), int(verts[n1]), dists[p1], dists[n1])
+            i10 = edge_index(int(verts[p1]), int(verts[n0]), dists[p1], dists[n0])
+            cap_facets.append((i00, i01, i11))
+            cap_facets.append((i00, i11, i10))
+
+    if not cap_edges:
+        return None
+
+    edges = np.array(cap_edges, dtype=np.float64)
+    a_idx = edges[:, 0].astype(np.int64)
+    b_idx = edges[:, 1].astype(np.int64)
+    t = edges[:, 2].astype(np.float32)
+    cap_vertices = (
+        ecs_vertices[a_idx].astype(np.float32) * (1.0 - t[:, None])
+        + ecs_vertices[b_idx].astype(np.float32) * t[:, None]
+    ).astype(np.float32)
+    cap_facets_arr = np.array(cap_facets, dtype=np.uint32)
+    return {
+        'vertices': cap_vertices,
+        'facets': cap_facets_arr,
+        'weights_a': a_idx.astype(np.int64),
+        'weights_b': b_idx.astype(np.int64),
+        'weights_t': t,
+    }
+
+
+@app.route('/api/cross-section/slice', methods=['POST'])
+def slice_cross_section():
+    """Compute the ECS cap for a user-configured plane and pre-render per-timestep
+    φ_e interpolated onto the cap. Plane is n · x = offset (normal+offset in the
+    same coordinate frame as the visualization mesh)."""
+    data = request.get_json() or {}
+    sim_name = data.get('sim_name')
+    if not sim_name:
+        return jsonify({'error': 'sim_name is required'}), 400
+    normal = data.get('normal')
+    offset = data.get('offset')
+    if normal is None or offset is None:
+        return jsonify({'error': 'normal and offset are required'}), 400
+    try:
+        normal_arr = [float(x) for x in normal]
+        if len(normal_arr) != 3:
+            raise ValueError
+        offset_val = float(offset)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'normal must be 3 floats, offset must be float'}), 400
+
+    sim_dir = Path(__file__).parent / 'data' / sim_name
+    ecs_vert_file = sim_dir / 'ecs_volume' / 'vertices.bin'
+    ecs_tets_file = sim_dir / 'ecs_volume' / 'tets.bin'
+    if not ecs_vert_file.exists() or not ecs_tets_file.exists():
+        return jsonify({'error': 'ECS volume data not available for this simulation'}), 404
+
+    ecs_vertices = np.fromfile(ecs_vert_file, dtype=np.float32).reshape(-1, 3)
+    ecs_tets = np.fromfile(ecs_tets_file, dtype=np.uint32).reshape(-1, 4)
+
+    cap = _slice_ecs_volume(ecs_vertices, ecs_tets, normal_arr, offset_val)
+    if cap is None:
+        return jsonify({'error': 'Plane does not intersect ECS volume'}), 400
+
+    cap_dir = sim_dir / 'cap'
+    cap_dir.mkdir(parents=True, exist_ok=True)
+    (cap_dir / 'phi_e').mkdir(parents=True, exist_ok=True)
+    cap['vertices'].tofile(cap_dir / 'vertices.bin')
+    cap['facets'].tofile(cap_dir / 'facets.bin')
+
+    phi_e_dir = sim_dir / 'phi_e'
+    timesteps_done = 0
+    phi_e_min = float('inf')
+    phi_e_max = float('-inf')
+    skip_reason = None
+    if not phi_e_dir.exists():
+        skip_reason = f"phi_e dir not found: {phi_e_dir}"
+    else:
+        weights_a = cap['weights_a']
+        weights_b = cap['weights_b']
+        weights_t = cap['weights_t']
+        max_idx = max(int(weights_a.max()), int(weights_b.max())) if len(weights_a) else 0
+        ti = 0
+        while True:
+            src = phi_e_dir / f'{ti}.bin'
+            if not src.exists():
+                if ti == 0:
+                    skip_reason = f"phi_e/0.bin missing in {phi_e_dir}"
+                break
+            phi_e_vol = np.fromfile(src, dtype=np.float32)
+            if max_idx >= len(phi_e_vol):
+                skip_reason = (
+                    f"index mismatch at ti={ti}: cap weight max_idx={max_idx} "
+                    f">= len(phi_e/{ti}.bin)={len(phi_e_vol)} "
+                    f"(re-run generate_viz_from_output.py to regenerate ECS volume + φ_e in sync)"
+                )
+                break
+            cap_phi = (
+                phi_e_vol[weights_a] * (1.0 - weights_t)
+                + phi_e_vol[weights_b] * weights_t
+            ).astype(np.float32)
+            cap_phi.tofile(cap_dir / 'phi_e' / f'{ti}.bin')
+            if cap_phi.size:
+                phi_e_min = min(phi_e_min, float(cap_phi.min()))
+                phi_e_max = max(phi_e_max, float(cap_phi.max()))
+            ti += 1
+            timesteps_done += 1
+
+    if phi_e_min == float('inf'):
+        phi_e_min, phi_e_max = 0.0, 0.0
+
+    return jsonify({
+        'cap_vertex_count': int(len(cap['vertices'])),
+        'cap_facet_count': int(len(cap['facets'])),
+        'num_timesteps': int(timesteps_done),
+        'phi_e_range': [phi_e_min, phi_e_max],
+        'normal': normal_arr,
+        'offset': offset_val,
+        'warning': skip_reason,
+    })
 
 # --------------------- Interface Data API ---------------------
 
@@ -1656,7 +2002,7 @@ try:
     from karolina import (
         karolina_state, karolina_jobs, mesh_convert_state,
         check_ssh, check_containers, upload_config, submit_job, submit_jobs,
-        check_job_status, cancel_job, tail_remote_log,
+        check_job_status, cancel_job, delete_job_data, tail_remote_log,
         get_cached_status,
         download_results_streaming, download_iterations,
         list_remote_simulations,
@@ -1670,7 +2016,7 @@ except ImportError:
     from viz.karolina import (
         karolina_state, karolina_jobs, mesh_convert_state,
         check_ssh, check_containers, upload_config, submit_job, submit_jobs,
-        check_job_status, cancel_job, tail_remote_log,
+        check_job_status, cancel_job, delete_job_data, tail_remote_log,
         get_cached_status,
         download_results_streaming, download_iterations,
         list_remote_simulations,
@@ -1703,7 +2049,6 @@ def karolina_submit():
     partition = data.get('partition', 'qcpu_exp')
     account = data.get('account', 'eu-26-11')
     solver_backend = data.get('solver_backend', 'petsc')
-    label = data.get('label')
     conditions = data.get('conditions')
 
     # Parse node counts: single int or comma-separated string
@@ -1725,7 +2070,6 @@ def karolina_submit():
                 config_file, node_counts[0], ntasks_per_node,
                 walltime, partition, account,
                 solver_backend=solver_backend,
-                label=label,
                 conditions=conditions,
                 local_config_path=str(config_path)
             )
@@ -1741,7 +2085,6 @@ def karolina_submit():
                 config_file, node_counts, ntasks_per_node,
                 walltime, partition, account,
                 solver_backend=solver_backend,
-                label=label,
                 conditions=conditions,
                 local_config_path=str(config_path)
             )
@@ -1784,7 +2127,6 @@ def karolina_status(job_id=None):
             'job_id': job_id,
             'status': cached_status,
             'out_name': job.get('out_name', karolina_state.get('out_name', '')),
-            'label': job.get('label', ''),
             'conditions_hash': job.get('conditions_hash'),
             'log': cached_log or ''
         })
@@ -1798,7 +2140,6 @@ def karolina_status(job_id=None):
             'job_id': job_id,
             'status': status,
             'out_name': job.get('out_name', karolina_state.get('out_name', '')),
-            'label': job.get('label', ''),
             'conditions_hash': job.get('conditions_hash'),
             'log': log
         })
@@ -1821,6 +2162,21 @@ def karolina_cancel():
     try:
         cancel_job(job_id)
         return jsonify({'success': True, 'message': f'Job {job_id} cancelled'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/karolina/delete', methods=['POST'])
+def karolina_delete():
+    """Cancel a job (if running), then remove its remote dir and local download."""
+    data = request.json or {}
+    job_id = data.get('job_id')
+    out_name = data.get('out_name')
+    if not job_id and not out_name:
+        return jsonify({'error': 'job_id or out_name required'}), 400
+
+    try:
+        errors = delete_job_data(job_id, out_name, str(PROJECT_ROOT))
+        return jsonify({'success': True, 'errors': errors})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

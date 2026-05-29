@@ -24,7 +24,16 @@ App.prototype.setupSolverSettings = function() {
                 coarsePcType: 'lu',
                 useVertices: true,
                 useEdges: true,
-                useFaces: false
+                useFaces: false,
+                localHypre: {
+                    cycleType: 'V',
+                    coarsenType: 'HMIS',
+                    strongThreshold: 0.7,
+                    relaxType: 'symmetric-SOR/Jacobi',
+                    numSweeps: 1,
+                    interpType: 'classical',
+                    maxLevels: 25
+                }
             }
         },
         ginkgo: {
@@ -111,8 +120,33 @@ App.prototype.setupSolverSettings = function() {
     document.getElementById('petsc-bddc-scaling').addEventListener('change', (e) => {
         this.solverConfig.petsc.bddc.scaling = e.target.value;
     });
+    const petscBddcLocalHypreOptions = document.getElementById('petsc-bddc-local-hypre-options');
     document.getElementById('petsc-bddc-local-solver').addEventListener('change', (e) => {
         this.solverConfig.petsc.bddc.localSolver = e.target.value;
+        petscBddcLocalHypreOptions.style.display = e.target.value === 'hypre' ? 'block' : 'none';
+    });
+
+    const petscHypre = this.solverConfig.petsc.bddc.localHypre;
+    document.getElementById('petsc-bddc-local-hypre-cycle').addEventListener('change', (e) => {
+        petscHypre.cycleType = e.target.value;
+    });
+    document.getElementById('petsc-bddc-local-hypre-coarsen').addEventListener('change', (e) => {
+        petscHypre.coarsenType = e.target.value;
+    });
+    document.getElementById('petsc-bddc-local-hypre-strength').addEventListener('change', (e) => {
+        petscHypre.strongThreshold = parseFloat(e.target.value);
+    });
+    document.getElementById('petsc-bddc-local-hypre-relax').addEventListener('change', (e) => {
+        petscHypre.relaxType = e.target.value;
+    });
+    document.getElementById('petsc-bddc-local-hypre-sweeps').addEventListener('change', (e) => {
+        petscHypre.numSweeps = parseInt(e.target.value);
+    });
+    document.getElementById('petsc-bddc-local-hypre-interp').addEventListener('change', (e) => {
+        petscHypre.interpType = e.target.value;
+    });
+    document.getElementById('petsc-bddc-local-hypre-max-levels').addEventListener('change', (e) => {
+        petscHypre.maxLevels = parseInt(e.target.value);
     });
     document.getElementById('petsc-bddc-coarse-solver').addEventListener('change', (e) => {
         this.solverConfig.petsc.bddc.coarseSolver = e.target.value;
@@ -403,6 +437,19 @@ App.prototype.loadConfigFromYaml = async function() {
         if (petscBddc.use_vertices !== undefined) setChecked('petsc-bddc-vertices', petscBddc.use_vertices);
         if (petscBddc.use_edges !== undefined) setChecked('petsc-bddc-edges', petscBddc.use_edges);
         if (petscBddc.use_faces !== undefined) setChecked('petsc-bddc-faces', petscBddc.use_faces);
+
+        // Local Hypre BoomerAMG: read from dirichlet_options if local_solver=hypre
+        const dOpts = petscBddc.dirichlet_options || {};
+        if (dOpts.pc_hypre_boomeramg_cycle_type) setVal('petsc-bddc-local-hypre-cycle', dOpts.pc_hypre_boomeramg_cycle_type);
+        if (dOpts.pc_hypre_boomeramg_coarsen_type) setVal('petsc-bddc-local-hypre-coarsen', dOpts.pc_hypre_boomeramg_coarsen_type);
+        if (dOpts.pc_hypre_boomeramg_strong_threshold !== undefined) setVal('petsc-bddc-local-hypre-strength', dOpts.pc_hypre_boomeramg_strong_threshold);
+        if (dOpts.pc_hypre_boomeramg_relax_type_all) setVal('petsc-bddc-local-hypre-relax', dOpts.pc_hypre_boomeramg_relax_type_all);
+        if (dOpts.pc_hypre_boomeramg_grid_sweeps_all !== undefined) setVal('petsc-bddc-local-hypre-sweeps', dOpts.pc_hypre_boomeramg_grid_sweeps_all);
+        if (dOpts.pc_hypre_boomeramg_interp_type) setVal('petsc-bddc-local-hypre-interp', dOpts.pc_hypre_boomeramg_interp_type);
+        if (dOpts.pc_hypre_boomeramg_max_levels !== undefined) setVal('petsc-bddc-local-hypre-max-levels', dOpts.pc_hypre_boomeramg_max_levels);
+        // Show the hypre sub-block if local solver is hypre
+        const phlBlock = document.getElementById('petsc-bddc-local-hypre-options');
+        if (phlBlock) phlBlock.style.display = petscBddc.local_solver === 'hypre' ? 'block' : 'none';
 
         // Ginkgo options
         const gko = config.ginkgo || {};

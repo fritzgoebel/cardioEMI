@@ -10,7 +10,241 @@ import h5py
 import numpy as np
 import json
 import pickle
+import os
+from collections import Counter
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+_TET_FACE_INDICES = (
+    (0, 1, 2),
+    (0, 1, 3),
+    (0, 2, 3),
+    (1, 2, 3),
+)
+
+
+def _build_cell_surface(cell_topo, cell_tags, vertices, tag):
+    """Closed boundary surface of all tets with cell_tag == tag.
+
+    Returns expanded-mesh arrays (each triangle has its own 3 vertices) so
+    that per-vertex φ_i can be looked up via an orig-vertex map.
+    """
+    tag_tets = cell_topo[cell_tags == tag]
+    if len(tag_tets) == 0:
+        return None
+
+    face_counts = Counter()
+    for tet in tag_tets:
+        for a, b, c in _TET_FACE_INDICES:
+            face = (int(tet[a]), int(tet[b]), int(tet[c]))
+            face = tuple(sorted(face))
+            face_counts[face] += 1
+
+    boundary_faces = [face for face, count in face_counts.items() if count == 1]
+    if not boundary_faces:
+        return None
+
+    n_faces = len(boundary_faces)
+    expanded_vertices = np.empty((n_faces * 3, 3), dtype=np.float32)
+    expanded_facets = np.empty((n_faces, 3), dtype=np.uint32)
+    orig_verts = np.empty(n_faces * 3, dtype=np.uint32)
+
+    for fi, face in enumerate(boundary_faces):
+        base = fi * 3
+        for li, vidx in enumerate(face):
+            expanded_vertices[base + li] = vertices[vidx]
+            orig_verts[base + li] = vidx
+        expanded_facets[fi] = (base, base + 1, base + 2)
+
+    return expanded_vertices, expanded_facets, orig_verts
+
+
+def _generate_cross_section_data(sim_output_dir, viz_output_dir, vertices,
+                                 ecs_tag=None, timestep_keys=None, report=None,
+                                 progress_start=0, progress_end=100):
+    """Extract per-cell surfaces, ECS tetrahedral volume, and per-timestep
+    φ_i / φ_e values for the cross-section visualization mode.
+
+    Returns a dict to merge into mesh_metadata.json under `cross_section`,
+    or None if the simulation output lacks the volume potentials.
+    """
+    solution_h5 = sim_output_dir / 'solution.h5'
+    tags_h5 = sim_output_dir / 'tags.h5'
+    if not solution_h5.exists():
+        report(progress_start, "solution.h5 not found — skipping cross-section export")
+        return None
+
+    with h5py.File(tags_h5, 'r') as f:
+        cell_topo = f['MeshTags']['cell_tags']['topology'][:]
+        cell_tags = f['MeshTags']['cell_tags']['Values'][:].flatten()
+
+    unique_cell_tags = sorted(set(int(t) for t in cell_tags.tolist()))
+    if ecs_tag is None:
+        ecs_tag = unique_cell_tags[0] if unique_cell_tags else 0
+    intra_tags = [t for t in unique_cell_tags if t != ecs_tag]
+    timestep_keys = list(timestep_keys or [])
+
+    cells_dir = viz_output_dir / 'cells'
+    cells_dir.mkdir(parents=True, exist_ok=True)
+    phi_i_dir = viz_output_dir / 'phi_i'
+    phi_i_dir.mkdir(parents=True, exist_ok=True)
+    ecs_vol_dir = viz_output_dir / 'ecs_volume'
+    ecs_vol_dir.mkdir(parents=True, exist_ok=True)
+    phi_e_dir = viz_output_dir / 'phi_e'
+    phi_e_dir.mkdir(parents=True, exist_ok=True)
+
+    # ECS shell expanded mesh exists from the existing voltage pass — load the
+    # orig-vertex map so we can output φ_e aligned with shell vertex order too.
+    ecs_shell_orig_path = viz_output_dir / 'ecs_orig_vertices.bin'
+    ecs_shell_orig = None
+    if ecs_shell_orig_path.exists():
+        ecs_shell_orig = np.fromfile(ecs_shell_orig_path, dtype=np.uint32)
+        phi_e_shell_dir = viz_output_dir / 'phi_e_shell'
+        phi_e_shell_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        phi_e_shell_dir = None
+
+    progress_span = max(progress_end - progress_start, 1)
+    n_tags = max(len(intra_tags), 1)
+
+    cell_orig_verts_by_tag = {}
+    cells_meta = {}
+
+    for ti_tag, tag in enumerate(intra_tags):
+        report(
+            progress_start + int(progress_span * 0.3 * ti_tag / n_tags),
+            f"Extracting cell surface for tag {tag}...",
+        )
+        result = _build_cell_surface(cell_topo, cell_tags, vertices, tag)
+        if result is None:
+            continue
+        exp_verts, exp_facets, orig_verts = result
+        exp_verts.tofile(cells_dir / f'{tag}_vertices.bin')
+        exp_facets.tofile(cells_dir / f'{tag}_facets.bin')
+        orig_verts.tofile(cells_dir / f'{tag}_orig_verts.bin')
+        cell_orig_verts_by_tag[tag] = orig_verts
+        cells_meta[str(tag)] = {
+            "vertex_count": int(len(exp_verts)),
+            "facet_count": int(len(exp_facets)),
+        }
+
+    report(progress_start + int(progress_span * 0.35), "Extracting ECS volume mesh...")
+    ecs_mask = cell_tags == ecs_tag
+    ecs_tets = cell_topo[ecs_mask]
+    if len(ecs_tets) == 0:
+        report(progress_start + int(progress_span * 0.35),
+               "No ECS tetrahedra found — cross-section export aborted")
+        return None
+
+    ecs_vert_indices = np.unique(ecs_tets.flatten())
+    orig_to_local = -np.ones(len(vertices), dtype=np.int64)
+    orig_to_local[ecs_vert_indices] = np.arange(len(ecs_vert_indices))
+    ecs_tets_local = orig_to_local[ecs_tets].astype(np.uint32)
+    ecs_vol_vertices = vertices[ecs_vert_indices].astype(np.float32)
+    ecs_vol_vertices.tofile(ecs_vol_dir / 'vertices.bin')
+    ecs_tets_local.tofile(ecs_vol_dir / 'tets.bin')
+    ecs_vert_indices.astype(np.uint32).tofile(ecs_vol_dir / 'orig_verts.bin')
+
+    report(progress_start + int(progress_span * 0.4),
+           f"ECS volume: {len(ecs_vol_vertices)} vertices, {len(ecs_tets_local)} tets")
+
+    phi_i_min = float('inf')
+    phi_i_max = float('-inf')
+    phi_e_min = float('inf')
+    phi_e_max = float('-inf')
+
+    with h5py.File(solution_h5, 'r') as f:
+        functions = f['Function']
+        # Sanity check: which u_<tag> groups exist
+        available = set(functions.keys())
+
+        for ti, ts_key in enumerate(timestep_keys):
+            for tag in intra_tags:
+                func_name = f'u_{tag}'
+                if func_name not in available or tag not in cell_orig_verts_by_tag:
+                    continue
+                orig_verts = cell_orig_verts_by_tag[tag]
+                cell_dir = phi_i_dir / str(tag)
+                cell_dir.mkdir(parents=True, exist_ok=True)
+                u_group = functions[func_name]
+                # solution.h5 may be missing the initial t=0 frame even when
+                # v_i_j.h5 has it (main.py writes the initial state to v_i_j
+                # but not solution). Emit a zero file so the cross-section
+                # index lines up with the voltage timestep index.
+                if ts_key not in u_group:
+                    phi_i = np.zeros(len(orig_verts), dtype=np.float32)
+                    phi_i.tofile(cell_dir / f'{ti}.bin')
+                    continue
+                u_data = np.nan_to_num(
+                    u_group[ts_key][:].flatten(), nan=0.0
+                ).astype(np.float32)
+                if len(u_data) == 0:
+                    np.zeros(len(orig_verts), dtype=np.float32).tofile(
+                        cell_dir / f'{ti}.bin')
+                    continue
+                safe = np.clip(orig_verts, 0, len(u_data) - 1)
+                phi_i = u_data[safe].copy()
+                phi_i[orig_verts >= len(u_data)] = 0.0
+                phi_i.tofile(cell_dir / f'{ti}.bin')
+                if phi_i.size:
+                    phi_i_min = min(phi_i_min, float(phi_i.min()))
+                    phi_i_max = max(phi_i_max, float(phi_i.max()))
+
+            ecs_func = f'u_{ecs_tag}'
+            ecs_present = ecs_func in available and ts_key in functions[ecs_func]
+            if ecs_present:
+                u_e = np.nan_to_num(
+                    functions[ecs_func][ts_key][:].flatten(), nan=0.0
+                ).astype(np.float32)
+            else:
+                u_e = np.zeros(0, dtype=np.float32)
+
+            if len(u_e):
+                safe = np.clip(ecs_vert_indices, 0, len(u_e) - 1)
+                phi_e = u_e[safe].copy()
+                phi_e[ecs_vert_indices >= len(u_e)] = 0.0
+            else:
+                phi_e = np.zeros(len(ecs_vert_indices), dtype=np.float32)
+            phi_e.tofile(phi_e_dir / f'{ti}.bin')
+            if phi_e.size:
+                phi_e_min = min(phi_e_min, float(phi_e.min()))
+                phi_e_max = max(phi_e_max, float(phi_e.max()))
+
+            if phi_e_shell_dir is not None and ecs_shell_orig is not None:
+                if len(u_e):
+                    safe_shell = np.clip(ecs_shell_orig, 0, len(u_e) - 1)
+                    phi_shell = u_e[safe_shell].copy()
+                    phi_shell[ecs_shell_orig >= len(u_e)] = 0.0
+                else:
+                    phi_shell = np.zeros(len(ecs_shell_orig), dtype=np.float32)
+                phi_shell.tofile(phi_e_shell_dir / f'{ti}.bin')
+                if phi_shell.size:
+                    phi_e_min = min(phi_e_min, float(phi_shell.min()))
+                    phi_e_max = max(phi_e_max, float(phi_shell.max()))
+
+            if (ti + 1) % 10 == 0 or ti + 1 == len(timestep_keys):
+                pct = progress_start + int(
+                    progress_span * (0.4 + 0.6 * (ti + 1) / max(len(timestep_keys), 1))
+                )
+                report(pct, f"Cross-section timestep {ti + 1}/{len(timestep_keys)}")
+
+    if phi_i_min == float('inf'):
+        phi_i_min, phi_i_max = 0.0, 0.0
+    if phi_e_min == float('inf'):
+        phi_e_min, phi_e_max = 0.0, 0.0
+
+    return {
+        "ecs_tag": int(ecs_tag),
+        "cell_tags": [int(t) for t in intra_tags if t in cell_orig_verts_by_tag],
+        "cells": cells_meta,
+        "ecs_volume": {
+            "vertex_count": int(len(ecs_vol_vertices)),
+            "tet_count": int(len(ecs_tets_local)),
+        },
+        "phi_i_range": [phi_i_min, phi_i_max],
+        "phi_e_range": [phi_e_min, phi_e_max],
+    }
 
 
 def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callback=None, membrane_only=False) -> dict:
@@ -540,6 +774,7 @@ def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callb
         return float(key.replace('_', '.'))
 
     times = []
+    timestep_keys = []
     v_min_all = float('inf')
     v_max_all = float('-inf')
     num_facets = len(facet_orig_vertices)
@@ -567,25 +802,53 @@ def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callb
                         vij_data[pair][key] = np.nan_to_num(
                             v_group[key][:].flatten(), nan=0.0).astype(np.float32)
 
-        for ti, key in enumerate(timestep_keys):
+        # Pre-compute per-pair facet groupings for vectorized voltage lookup
+        pair_facet_groups = {}
+        for pair_idx_val, pair in enumerate(unique_pairs):
+            mask = facet_pair_indices == pair_idx_val
+            if np.any(mask):
+                facet_idxs = np.where(mask)[0]
+                pair_facet_groups[pair] = (facet_idxs, facet_orig_vertices[facet_idxs])
+
+        num_workers = min(os.cpu_count() or 1, len(timestep_keys))
+        report(76, f"Processing {len(timestep_keys)} timesteps with {num_workers} workers...")
+
+        def process_timestep(args):
+            ti, key = args
             expanded_voltages = np.zeros(num_facets * 3, dtype=np.float32)
-            for facet_idx in range(num_facets):
-                pair_idx = facet_pair_indices[facet_idx]
-                orig_verts = facet_orig_vertices[facet_idx]
-                if pair_idx < len(unique_pairs):
-                    pair = unique_pairs[pair_idx]
-                    if pair in vij_data and key in vij_data[pair]:
-                        v_data = vij_data[pair][key]
-                        for local_v, orig_v in enumerate(orig_verts):
-                            if orig_v < len(v_data):
-                                expanded_voltages[facet_idx * 3 + local_v] = v_data[orig_v]
-            expanded_voltages.tofile(voltages_dir / f'{ti}.bin')
-            v_min_all = min(v_min_all, float(np.min(expanded_voltages)))
-            v_max_all = max(v_max_all, float(np.max(expanded_voltages)))
-            times.append(parse_time(key))
-            if (ti + 1) % 10 == 0:
-                report(75 + int(25 * (ti + 1) / len(timestep_keys)),
-                       f"Voltage timestep {ti + 1}/{len(timestep_keys)}")
+            for pair, (fidxs, orig_verts) in pair_facet_groups.items():
+                if pair in vij_data and key in vij_data[pair]:
+                    v_data = vij_data[pair][key]
+                    safe_verts = np.clip(orig_verts, 0, len(v_data) - 1)
+                    voltages = v_data[safe_verts]  # (N, 3)
+                    # Zero out any that were clipped (original >= len(v_data))
+                    voltages[orig_verts >= len(v_data)] = 0.0
+                    base = fidxs * 3
+                    expanded_voltages[base] = voltages[:, 0]
+                    expanded_voltages[base + 1] = voltages[:, 1]
+                    expanded_voltages[base + 2] = voltages[:, 2]
+            out_path = str(voltages_dir / f'{ti}.bin')
+            expanded_voltages.tofile(out_path)
+            return ti, float(np.min(expanded_voltages)), float(np.max(expanded_voltages)), parse_time(key)
+
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(process_timestep, (ti, key)): ti
+                       for ti, key in enumerate(timestep_keys)}
+            results = {}
+            done_count = 0
+            for future in as_completed(futures):
+                ti, vmin, vmax, t = future.result()
+                results[ti] = (vmin, vmax, t)
+                done_count += 1
+                if done_count % 10 == 0:
+                    report(75 + int(25 * done_count / len(timestep_keys)),
+                           f"Voltage timestep {done_count}/{len(timestep_keys)}")
+
+        for ti in range(len(timestep_keys)):
+            vmin, vmax, t = results[ti]
+            v_min_all = min(v_min_all, vmin)
+            v_max_all = max(v_max_all, vmax)
+            times.append(t)
     else:
         # Fallback: single v.h5
         v_h5 = sim_output_dir / 'v.h5'
@@ -612,6 +875,22 @@ def generate_viz_data(sim_output_dir: Path, viz_output_dir: Path, progress_callb
     metadata['times'] = times
     metadata['vMin'] = v_min_all
     metadata['vMax'] = v_max_all
+
+    # Cross-section data (per-cell surfaces, ECS volume, φ_i / φ_e per timestep).
+    # Skipped in membrane_only mode and when solution.h5 is unavailable.
+    if not membrane_only and timestep_keys:
+        report(96, "Extracting cross-section volume data...")
+        cs_meta = _generate_cross_section_data(
+            sim_output_dir, viz_output_dir, vertices,
+            ecs_tag=None,
+            timestep_keys=timestep_keys,
+            report=report,
+            progress_start=96,
+            progress_end=99,
+        )
+        if cs_meta is not None:
+            metadata['cross_section'] = cs_meta
+
     with open(viz_output_dir / "mesh_metadata.json", 'w') as mf:
         json.dump(metadata, mf, indent=2)
 

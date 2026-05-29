@@ -36,6 +36,25 @@
                             <span id="colorbar-min">-80 mV</span>
                         </div>
                     </div>
+                    <!-- Cross-section dual colorbars (shown only in cross-section mode) -->
+                    <div id="colorbar-intra" class="colorbar cs-colorbar" style="display: none;">
+                        <div class="cs-colorbar-title">φᵢ (mV)</div>
+                        <div class="colorbar-gradient"></div>
+                        <div class="colorbar-labels">
+                            <span id="colorbar-intra-max">40</span>
+                            <span id="colorbar-intra-mid">-20</span>
+                            <span id="colorbar-intra-min">-80</span>
+                        </div>
+                    </div>
+                    <div id="colorbar-extra" class="colorbar cs-colorbar" style="display: none;">
+                        <div class="cs-colorbar-title">φₑ (mV)</div>
+                        <div class="colorbar-gradient"></div>
+                        <div class="colorbar-labels">
+                            <span id="colorbar-extra-max">5</span>
+                            <span id="colorbar-extra-mid">0</span>
+                            <span id="colorbar-extra-min">-5</span>
+                        </div>
+                    </div>
                 </div>
                 <div class="viewer-controls">
                     <button id="reset-camera">Reset Camera</button>
@@ -67,6 +86,76 @@
                             <option value="grayscale">Grayscale</option>
                         </select>
                     </label>
+                    <label id="cross-section-label" style="display: none;">
+                        <input type="checkbox" id="cross-section-mode">
+                        Cross-section mode
+                    </label>
+                </div>
+                <!-- Cross-section controls (shown only when cross-section mode is on) -->
+                <div id="cross-section-controls" style="display: none;">
+                    <div class="cs-section">
+                        <strong>Clipping plane</strong>
+                        <label>
+                            Axis:
+                            <select id="cs-plane-axis">
+                                <option value="z">Z</option>
+                                <option value="y">Y</option>
+                                <option value="x">X</option>
+                                <option value="custom">Custom normal…</option>
+                            </select>
+                        </label>
+                        <span id="cs-custom-normal" style="display: none;">
+                            n=(
+                            <input type="number" id="cs-nx" step="0.1" value="0" style="width: 60px;">,
+                            <input type="number" id="cs-ny" step="0.1" value="0" style="width: 60px;">,
+                            <input type="number" id="cs-nz" step="0.1" value="1" style="width: 60px;">)
+                        </span>
+                        <label class="slider-label">
+                            Offset:
+                            <input type="range" id="cs-offset-slider" class="slider" min="0" max="1" step="0.01" value="0.5" style="width: 160px;">
+                            <input type="number" id="cs-offset" step="0.1" value="0" style="width: 80px;">
+                        </label>
+                        <button id="cs-apply" class="btn-small">Apply plane</button>
+                        <span id="cs-status" style="margin-left: 8px; font-size: 0.85em; color: #aaa;"></span>
+                    </div>
+                    <div class="cs-section cs-color-scales">
+                        <div class="cs-scale">
+                            <strong>Intracellular φᵢ</strong>
+                            <label class="colormap-label">
+                                Colormap:
+                                <select id="cs-intra-colormap" class="colormap-dropdown">
+                                    <option value="coolwarm">Cool to Warm</option>
+                                    <option value="viridis">Viridis</option>
+                                    <option value="plasma">Plasma</option>
+                                    <option value="inferno">Inferno</option>
+                                    <option value="turbo">Turbo</option>
+                                    <option value="jet">Jet (Rainbow)</option>
+                                    <option value="grayscale">Grayscale</option>
+                                </select>
+                            </label>
+                            <label>Min: <input type="number" id="cs-intra-vmin" step="1" value="-80" style="width: 70px;"></label>
+                            <label>Max: <input type="number" id="cs-intra-vmax" step="1" value="40" style="width: 70px;"></label>
+                        </div>
+                        <div class="cs-scale">
+                            <strong>Extracellular φₑ</strong>
+                            <label class="colormap-label">
+                                Colormap:
+                                <select id="cs-extra-colormap" class="colormap-dropdown">
+                                    <option value="coolwarm">Cool to Warm</option>
+                                    <option value="viridis" selected>Viridis</option>
+                                    <option value="plasma">Plasma</option>
+                                    <option value="inferno">Inferno</option>
+                                    <option value="turbo">Turbo</option>
+                                    <option value="jet">Jet (Rainbow)</option>
+                                    <option value="grayscale">Grayscale</option>
+                                </select>
+                            </label>
+                            <label>Min: <input type="number" id="cs-extra-vmin" step="0.1" value="-5" style="width: 70px;"></label>
+                            <label>Max: <input type="number" id="cs-extra-vmax" step="0.1" value="5" style="width: 70px;"></label>
+                        </div>
+                        <button id="cs-autofit" class="btn-small" title="Fit φᵢ to cell values and φₑ to the cap's range at the current timestep. The ECS shell may saturate if it sits at a Dirichlet boundary value.">Auto-fit (cap + cells)</button>
+                    </div>
+                    <div id="cs-stats" style="font-size: 0.85em; color: #ccc; padding: 6px 10px; background: rgba(15, 52, 96, 0.4); border-radius: 4px;"></div>
                 </div>
                 <!-- Rank legend (shown when partition view is active) -->
                 <div id="rank-legend" style="display: none;">
@@ -125,6 +214,13 @@
                 <!-- Residual Chart -->
                 <div id="residual-chart-container" style="display: none;">
                     <canvas id="residual-chart"></canvas>
+                </div>
+                <!-- Per-iteration residual history (current timestep) -->
+                <div id="residual-history-chart-container" style="display: none;">
+                    <div style="font-size:0.75em; color:#aaa; margin-bottom:2px;">
+                        Residual norms vs Krylov iteration (current timestep)
+                    </div>
+                    <canvas id="residual-history-chart"></canvas>
                 </div>
             </div>
 
@@ -412,10 +508,71 @@
                             <div class="param-row">
                                 <label>Local Solver:</label>
                                 <select id="petsc-bddc-local-solver" class="mesh-dropdown">
-                                    <option value="mumps">MUMPS</option>
-                                    <option value="superlu_dist">SuperLU</option>
-                                    <option value="petsc">PETSc</option>
+                                    <option value="mumps">MUMPS (direct)</option>
+                                    <option value="superlu_dist">SuperLU (direct)</option>
+                                    <option value="petsc">PETSc (direct)</option>
+                                    <option value="hypre">Hypre BoomerAMG (approximate)</option>
+                                    <option value="gamg">GAMG (approximate)</option>
+                                    <option value="bjacobi">Block Jacobi (approximate)</option>
+                                    <option value="jacobi">Jacobi (approximate)</option>
                                 </select>
+                            </div>
+                            <!-- Local Hypre BoomerAMG options (shown when local solver = hypre) -->
+                            <div id="petsc-bddc-local-hypre-options" style="display: none; margin-left: 10px; border-left: 2px solid #444; padding-left: 10px;">
+                                <div class="param-row">
+                                    <label>Cycle:</label>
+                                    <select id="petsc-bddc-local-hypre-cycle" class="mesh-dropdown">
+                                        <option value="V" selected>V-cycle</option>
+                                        <option value="W">W-cycle</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Coarsening:</label>
+                                    <select id="petsc-bddc-local-hypre-coarsen" class="mesh-dropdown">
+                                        <option value="CLJP">CLJP</option>
+                                        <option value="Ruge-Stueben">Ruge-Stueben</option>
+                                        <option value="modifiedRuge-Stueben">Modified Ruge-Stueben</option>
+                                        <option value="Falgout">Falgout</option>
+                                        <option value="PMIS">PMIS</option>
+                                        <option value="HMIS" selected>HMIS</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Strength threshold:</label>
+                                    <input type="number" id="petsc-bddc-local-hypre-strength" value="0.7" min="0.0" max="1.0" step="0.05">
+                                </div>
+                                <div class="param-row">
+                                    <label>Smoother:</label>
+                                    <select id="petsc-bddc-local-hypre-relax" class="mesh-dropdown">
+                                        <option value="Jacobi">Jacobi</option>
+                                        <option value="sequential-Gauss-Seidel">Sequential Gauss-Seidel</option>
+                                        <option value="SOR/Jacobi">SOR/Jacobi</option>
+                                        <option value="symmetric-SOR/Jacobi" selected>Symmetric SOR/Jacobi</option>
+                                        <option value="l1scaled-SOR/Jacobi">l1-scaled SOR/Jacobi</option>
+                                        <option value="l1-Gauss-Seidel">l1 Gauss-Seidel</option>
+                                        <option value="Chebyshev">Chebyshev</option>
+                                        <option value="l1scaled-Jacobi">l1-scaled Jacobi</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Num sweeps:</label>
+                                    <input type="number" id="petsc-bddc-local-hypre-sweeps" value="1" min="1" max="10" step="1">
+                                </div>
+                                <div class="param-row">
+                                    <label>Interpolation:</label>
+                                    <select id="petsc-bddc-local-hypre-interp" class="mesh-dropdown">
+                                        <option value="classical" selected>Classical</option>
+                                        <option value="direct">Direct</option>
+                                        <option value="multipass">Multipass</option>
+                                        <option value="ext+i">Ext+i</option>
+                                        <option value="FF1">FF1</option>
+                                        <option value="standard">Standard</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Max levels:</label>
+                                    <input type="number" id="petsc-bddc-local-hypre-max-levels" value="25" min="2" max="50" step="1">
+                                </div>
                             </div>
                             <div class="param-row">
                                 <label>Coarse Solver:</label>
@@ -442,6 +599,13 @@
                                 </div>
                             </div>
                         </div>
+                    </div>
+
+                    <!-- Diagnostic: per-iteration true residual (both backends) -->
+                    <div class="param-row">
+                        <label>Iter residuals:</label>
+                        <input type="checkbox" id="track-iter-residuals">
+                        <span class="checkbox-label">Record ||b - A·x_k|| each iter (slow)</span>
                     </div>
 
                     <!-- Ginkgo Options -->
@@ -732,8 +896,11 @@
                 <section class="section" id="karolina-job-section" style="display:none;">
                     <h2>Karolina Jobs</h2>
                     <div class="param-row" style="margin-bottom: 8px;">
-                        <label>Job Label:</label>
-                        <input type="text" id="karolina-job-label" placeholder="optional label" style="width:140px; background:#2a2a2a; color:#eee; border:1px solid #555; border-radius:4px; padding:2px 6px;">
+                        <label>Show meshes:</label>
+                        <div id="karolina-jobs-mesh-filter" style="position:relative; display:inline-block;">
+                            <button type="button" id="karolina-jobs-mesh-filter-btn" class="btn" style="font-size:0.8em; padding:2px 8px; background:#2a2a2a; color:#eee; border:1px solid #555;">All</button>
+                            <div id="karolina-jobs-mesh-filter-panel" style="display:none; position:absolute; top:100%; left:0; z-index:10; min-width:180px; max-height:240px; overflow-y:auto; background:#1a1a1a; border:1px solid #555; border-radius:4px; padding:6px; margin-top:2px;"></div>
+                        </div>
                     </div>
                     <div id="karolina-jobs-list">
                         <!-- Dynamic job entries rendered here -->
@@ -830,6 +997,7 @@
     <script src="js/app-scar.js"></script>
     <script src="js/app-solver.js"></script>
     <script src="js/app-karolina.js"></script>
+    <script src="js/app-karolina-jobs.js"></script>
     <script src="js/app-simulation.js"></script>
     <script src="js/app-partition.js"></script>
     <script src="js/app-results.js"></script>

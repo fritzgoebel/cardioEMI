@@ -145,6 +145,7 @@ class GinkgoSolver:
         amg_config: Optional[dict] = None,
         bddc_config: Optional[dict] = None,
         pure_neumann: bool = False,
+        track_iter_residuals: bool = False,
         verbose: bool = False,
     ):
         # Import C++ bindings
@@ -197,6 +198,7 @@ class GinkgoSolver:
         config.krylov_dim = krylov_dim
         config.jacobi_block_size = jacobi_block_size
         config.pure_neumann = pure_neumann
+        config.track_iter_residuals = track_iter_residuals
         config.verbose = verbose
 
         # Configure AMG if selected
@@ -719,6 +721,21 @@ class GinkgoSolver:
     def converged(self) -> bool:
         """Whether last solve converged."""
         return self._solver.converged()
+
+    @property
+    def iter_history_iterations(self) -> list:
+        """Per-iteration indices from last solve (empty unless track_iter_residuals)."""
+        return self._solver.iter_history_iterations()
+
+    @property
+    def iter_history_explicit(self) -> list:
+        """Per-iteration true ||b - A*x_k|| from last solve."""
+        return self._solver.iter_history_explicit()
+
+    @property
+    def iter_history_implicit(self) -> list:
+        """Per-iteration implicit (recurrence) residual norm from last solve."""
+        return self._solver.iter_history_implicit()
 
     def __repr__(self) -> str:
         return (

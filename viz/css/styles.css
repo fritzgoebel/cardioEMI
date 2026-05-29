@@ -113,6 +113,95 @@ header p {
     pointer-events: none;
 }
 
+/* Dual colorbars for cross-section mode */
+#colorbar-intra,
+#colorbar-extra {
+    position: absolute;
+    right: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: rgba(0, 0, 0, 0.6);
+    padding: 10px;
+    border-radius: 4px;
+    z-index: 100;
+    pointer-events: none;
+}
+
+#colorbar-intra { top: 20px; }
+#colorbar-extra { top: 240px; }
+
+.cs-colorbar .cs-colorbar-title {
+    font-size: 0.75rem;
+    color: #fff;
+    text-align: center;
+}
+
+.cs-colorbar > div.colorbar-gradient {
+    width: 20px;
+    height: 150px;
+}
+
+.cs-colorbar .colorbar-labels {
+    flex-direction: column-reverse;
+}
+
+.cs-colorbar {
+    align-items: center;
+}
+
+#cross-section-controls {
+    padding: 10px 15px;
+    background: #0a0a1a;
+    border-top: 1px solid #0f3460;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+#cross-section-controls .cs-section {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+}
+
+#cross-section-controls .cs-section strong {
+    color: #e94560;
+    font-size: 0.9rem;
+}
+
+#cross-section-controls .cs-scale {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+    background: #16213e;
+    border-radius: 4px;
+}
+
+#cross-section-controls input[type="number"] {
+    padding: 3px 6px;
+    background: #0f3460;
+    border: 1px solid #4a90d9;
+    border-radius: 4px;
+    color: #fff;
+    font-size: 0.85rem;
+}
+
+#cross-section-controls .btn-small {
+    padding: 4px 12px;
+    background: #16213e;
+    color: white;
+    border: 1px solid #e94560;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+#cross-section-controls .btn-small:hover {
+    background: #e94560;
+}
+
 /* Three.js canvas */
 #viewer-container canvas {
     position: absolute;
@@ -389,6 +478,19 @@ header p {
 #residual-chart-container canvas {
     width: 100% !important;
     height: 100% !important;
+}
+
+/* Per-iteration Residual History Chart */
+#residual-history-chart-container {
+    padding: 15px;
+    background: #0a0a1a;
+    border-top: 1px solid #0f3460;
+    height: 300px;
+}
+
+#residual-history-chart-container canvas {
+    width: 100% !important;
+    height: calc(100% - 18px) !important;
 }
 
 /* Control Panel */

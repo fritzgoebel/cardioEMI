@@ -13,7 +13,11 @@ App.prototype.loadSimulationList = async function() {
         data.simulations.forEach(sim => {
             const option = document.createElement('option');
             option.value = sim.name;
-            option.textContent = sim.name + (sim.has_viz_data ? '' : ' (will generate viz data)');
+            const label = (sim.solver || sim.mesh)
+                ? this.formatSimulationLabelInline(sim)
+                : sim.name;
+            option.textContent = label + (sim.has_viz_data ? '' : ' (will generate viz data)');
+            option.title = sim.name;
             simSelector.appendChild(option);
         });
 
@@ -112,6 +116,18 @@ App.prototype.loadResults = async function() {
         loadBtn.textContent = 'Loading...';
         statusEl.style.display = 'none';
 
+        // Per-iter residual history loads from a separate endpoint that doesn't
+        // require voltage data — so the chart shows even if voltage gen fails.
+        try {
+            const ihResp = await fetch(`/api/results/iterations/${encodeURIComponent(simName)}`);
+            if (ihResp.ok) {
+                const ihData = await ihResp.json();
+                const ih = ihData.residuals && ihData.residuals.iter_history;
+                this.setIterHistoryCache(ih);
+                this.setResidualHistoryForStep(0);
+            }
+        } catch (e) { console.warn('iter_history fetch failed:', e); }
+
         const regenerate = document.getElementById('regenerate-viz').checked;
         const url = `/api/results?dir=${encodeURIComponent(simName)}`;
 
@@ -153,10 +169,22 @@ App.prototype.loadResults = async function() {
         if (vizDir && vizDir !== this.meshLoader.currentMesh) {
             loadBtn.textContent = 'Reloading mesh...';
             this.meshLoader.setMesh(vizDir);
-            const meshData = await this.meshLoader.load();
+            const meshData = await this.meshLoader.load((msg) => {
+                loadBtn.textContent = msg;
+            });
+            loadBtn.textContent = 'Building 3D scene...';
             this.meshBounds = meshData.metadata.bounds;
             this.conversionFactor = meshData.metadata.mesh_conversion_factor;
+            this._latestMetadata = meshData.metadata;
             await this.viewer.reloadMesh(meshData);
+        }
+
+        // Reveal cross-section toggle if volume data was exported
+        if (this._latestMetadata && this._latestMetadata.cross_section) {
+            this._applyCrossSectionDefaults(this._latestMetadata.cross_section);
+            this.showCrossSectionOption(true);
+        } else {
+            this.showCrossSectionOption(false);
         }
 
         this.resultsVizDir = vizDir;
@@ -213,6 +241,10 @@ App.prototype.loadResults = async function() {
         } else {
             this.hideResidualChart();
         }
+
+        // Per-iteration residual history (opt-in via track_iter_residuals)
+        this.setIterHistoryCache(data.residuals && data.residuals.iter_history);
+        this.setResidualHistoryForStep(0);
 
         // Load MPI rank data as binary if available
         if (data.hasRankData && data.numRanks) {
@@ -278,7 +310,9 @@ App.prototype.showResultsAtTime = async function(timeIndex) {
     if (!this.resultsVizDir || !this.viewer) return;
 
     const showPartition = document.getElementById('show-partition').checked;
-    if (!showPartition) {
+    if (this.crossSectionMode) {
+        await this._applyCrossSectionAtTime(timeIndex);
+    } else if (!showPartition) {
         if (!this._voltageCache[timeIndex]) {
             const url = `/api/results/binary/${encodeURIComponent(this.resultsVizDir)}/${timeIndex}.bin`;
             const resp = await fetch(url);
@@ -293,4 +327,251 @@ App.prototype.showResultsAtTime = async function(timeIndex) {
     }
 
     this.updateVoltagePlotTimeMarker(timeIndex);
+};
+
+// ---------------------- Cross-section mode ----------------------
+
+App.prototype._initCrossSectionCaches = function() {
+    if (!this._intraCache) this._intraCache = {};
+    if (!this._extraCache) this._extraCache = {};
+};
+
+App.prototype._fetchPhiI = async function(tag, timeIndex) {
+    this._initCrossSectionCaches();
+    const cacheKey = `${tag}:${timeIndex}`;
+    if (this._intraCache[cacheKey]) return this._intraCache[cacheKey];
+    const url = `/api/cross-section/binary/${encodeURIComponent(this.resultsVizDir)}/phi_i/${tag}/${timeIndex}.bin`;
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+    const arr = new Float32Array(await resp.arrayBuffer());
+    this._intraCache[cacheKey] = arr;
+    return arr;
+};
+
+App.prototype._fetchPhiECap = async function(timeIndex) {
+    this._initCrossSectionCaches();
+    if (this._extraCache[timeIndex]) return this._extraCache[timeIndex];
+    const url = `/api/cross-section/binary/${encodeURIComponent(this.resultsVizDir)}/cap/phi_e/${timeIndex}.bin`;
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+    const arr = new Float32Array(await resp.arrayBuffer());
+    this._extraCache[timeIndex] = arr;
+    return arr;
+};
+
+App.prototype._fetchPhiEShell = async function(timeIndex) {
+    if (!this._shellCache) this._shellCache = {};
+    if (this._shellCache[timeIndex]) return this._shellCache[timeIndex];
+    const url = `/api/cross-section/binary/${encodeURIComponent(this.resultsVizDir)}/phi_e_shell/${timeIndex}.bin`;
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+    const arr = new Float32Array(await resp.arrayBuffer());
+    this._shellCache[timeIndex] = arr;
+    return arr;
+};
+
+App.prototype._applyCrossSectionAtTime = async function(timeIndex) {
+    if (!this.viewer) return;
+    const cellTags = Array.from(this.viewer.cellMeshes.keys());
+    const fetches = cellTags.map(tag => this._fetchPhiI(tag, timeIndex).then(arr => [tag, arr]));
+    const results = await Promise.all(fetches);
+    const phiByTag = new Map();
+    for (const [tag, arr] of results) {
+        if (arr) phiByTag.set(tag, arr);
+    }
+    this._lastIntraPhi = phiByTag;
+    this.viewer.updatePhiIColors(phiByTag);
+
+    if (this.viewer.capMeshObject) {
+        const cap = await this._fetchPhiECap(timeIndex);
+        if (cap) {
+            this._lastExtraPhi = cap;
+            this.viewer.updatePhiECapColors(cap);
+        }
+    }
+    // ECS shell coloring (φ_e on the volume below the clip plane)
+    const shell = await this._fetchPhiEShell(timeIndex);
+    if (shell) {
+        this._lastShellPhi = shell;
+        this.viewer.updatePhiEShellColors(shell);
+    }
+    this._updateCrossSectionStats();
+};
+
+App.prototype._arrayStats = function(arr) {
+    if (!arr || !arr.length) return null;
+    let mn = arr[0], mx = arr[0];
+    for (let i = 1; i < arr.length; i++) {
+        const v = arr[i];
+        if (v < mn) mn = v;
+        else if (v > mx) mx = v;
+    }
+    return { min: mn, max: mx };
+};
+
+App.prototype._computeCrossSectionStats = function() {
+    let intraMin = Infinity, intraMax = -Infinity;
+    if (this._lastIntraPhi) {
+        for (const arr of this._lastIntraPhi.values()) {
+            const s = this._arrayStats(arr);
+            if (s) {
+                if (s.min < intraMin) intraMin = s.min;
+                if (s.max > intraMax) intraMax = s.max;
+            }
+        }
+    }
+    const capStats = this._arrayStats(this._lastExtraPhi);
+    const shellStats = this._arrayStats(this._lastShellPhi);
+    let extraMin = Infinity, extraMax = -Infinity;
+    for (const s of [capStats, shellStats]) {
+        if (!s) continue;
+        if (s.min < extraMin) extraMin = s.min;
+        if (s.max > extraMax) extraMax = s.max;
+    }
+    return {
+        intra: Number.isFinite(intraMin) ? { min: intraMin, max: intraMax } : null,
+        cap: capStats,
+        shell: shellStats,
+        extra: Number.isFinite(extraMin) ? { min: extraMin, max: extraMax } : null,
+    };
+};
+
+App.prototype._updateCrossSectionStats = function() {
+    const el = document.getElementById('cs-stats');
+    if (!el) return;
+    const s = this._computeCrossSectionStats();
+    const parts = [];
+    if (s.intra) parts.push(`φᵢ cells: [${s.intra.min.toFixed(2)}, ${s.intra.max.toFixed(2)}]`);
+    if (s.cap)   parts.push(`φₑ cap: [${s.cap.min.toFixed(3)}, ${s.cap.max.toFixed(3)}]`);
+    if (s.shell) parts.push(`φₑ shell: [${s.shell.min.toFixed(3)}, ${s.shell.max.toFixed(3)}]`);
+    el.textContent = parts.length ? `Current step — ${parts.join('  •  ')}` : '';
+};
+
+App.prototype.autofitCrossSectionRanges = function() {
+    const s = this._computeCrossSectionStats();
+    const pad = (lo, hi) => {
+        if (!Number.isFinite(lo) || !Number.isFinite(hi)) return null;
+        if (hi === lo) {
+            const eps = Math.max(Math.abs(lo) * 1e-3, 1e-6);
+            return [lo - eps, hi + eps];
+        }
+        const span = (hi - lo) * 0.05;
+        return [lo - span, hi + span];
+    };
+    if (s.intra) {
+        const padded = pad(s.intra.min, s.intra.max);
+        if (padded) {
+            const [lo, hi] = padded;
+            this.viewer.setIntraRange(lo, hi);
+            const minIn = document.getElementById('cs-intra-vmin');
+            const maxIn = document.getElementById('cs-intra-vmax');
+            if (minIn) minIn.value = lo.toFixed(3);
+            if (maxIn) maxIn.value = hi.toFixed(3);
+        }
+    }
+    // Fit φₑ to the cap's range (boundary shell often sits at a Dirichlet
+    // value and dominates a combined scale, hiding all cap variation). Fall
+    // back to the shell range if no cap data is available.
+    const phiERef = s.cap || s.shell;
+    if (phiERef) {
+        const padded = pad(phiERef.min, phiERef.max);
+        if (padded) {
+            const [lo, hi] = padded;
+            this.viewer.setExtraRange(lo, hi);
+            const minIn = document.getElementById('cs-extra-vmin');
+            const maxIn = document.getElementById('cs-extra-vmax');
+            if (minIn) minIn.value = lo.toFixed(4);
+            if (maxIn) maxIn.value = hi.toFixed(4);
+        }
+    }
+    if (this._refreshCsLabels) this._refreshCsLabels();
+    this.refreshCrossSectionColors();
+};
+
+App.prototype.setCrossSectionMode = async function(enabled) {
+    this.crossSectionMode = !!enabled;
+    if (this.viewer) {
+        this.viewer.setCrossSectionVisible(this.crossSectionMode);
+    }
+    if (this.crossSectionMode) {
+        const timeIndex = parseInt(document.getElementById('result-time').value, 10) || 0;
+        await this._applyCrossSectionAtTime(timeIndex);
+    }
+};
+
+App.prototype.applyCrossSectionPlane = async function(normal, offset) {
+    if (!this.resultsVizDir) {
+        throw new Error('Load results first');
+    }
+    const resp = await fetch('/api/cross-section/slice', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sim_name: this.resultsVizDir, normal, offset }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+        throw new Error(data.error || 'Failed to slice ECS volume');
+    }
+    // Cap geometry / per-timestep φ_e changed → drop cap cache, refetch geometry.
+    this._extraCache = {};
+    const capData = await this.meshLoader.loadCap();
+    this.viewer.createCapMesh(capData);
+
+    // Clip the ECS shell so the volume below the plane stays visible.
+    this.viewer.setClippingPlane(normal, offset);
+
+    // Auto-tune φ_e range to the actual cap values (cap is typically a much
+    // narrower band than the full volume range, so the metadata default looks
+    // washed out / mono-coloured).
+    if (Array.isArray(data.phi_e_range) && data.phi_e_range.length === 2) {
+        const [lo, hi] = data.phi_e_range;
+        if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) {
+            this.viewer.setExtraRange(lo, hi);
+            const minIn = document.getElementById('cs-extra-vmin');
+            const maxIn = document.getElementById('cs-extra-vmax');
+            if (minIn) minIn.value = lo.toFixed(3);
+            if (maxIn) maxIn.value = hi.toFixed(3);
+            if (this._refreshCsLabels) this._refreshCsLabels();
+        }
+    }
+
+    if (this.crossSectionMode) {
+        const timeIndex = parseInt(document.getElementById('result-time').value, 10) || 0;
+        await this._applyCrossSectionAtTime(timeIndex);
+        // Tighten φₑ to the cap's own range so the slice variation is visible
+        // even when the shell sits at a saturating Dirichlet value.
+        this.autofitCrossSectionRanges();
+    }
+    return data;
+};
+
+App.prototype.refreshCrossSectionColors = function() {
+    if (this._lastIntraPhi) this.viewer.refreshIntraColors(this._lastIntraPhi);
+    if (this._lastExtraPhi) this.viewer.refreshExtraColors(this._lastExtraPhi);
+    if (this._lastShellPhi) this.viewer.refreshShellColors(this._lastShellPhi);
+};
+
+App.prototype._applyCrossSectionDefaults = function(meta) {
+    if (!this.viewer || !meta) return;
+    const padRange = (lo, hi, padFrac = 0.05) => {
+        if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return [lo, hi];
+        const span = (hi - lo) * padFrac;
+        return [lo - span, hi + span];
+    };
+    if (Array.isArray(meta.phi_i_range) && meta.phi_i_range.length === 2) {
+        const [lo, hi] = padRange(meta.phi_i_range[0], meta.phi_i_range[1]);
+        this.viewer.setIntraRange(lo, hi);
+        const minIn = document.getElementById('cs-intra-vmin');
+        const maxIn = document.getElementById('cs-intra-vmax');
+        if (minIn) minIn.value = lo.toFixed(2);
+        if (maxIn) maxIn.value = hi.toFixed(2);
+    }
+    if (Array.isArray(meta.phi_e_range) && meta.phi_e_range.length === 2) {
+        const [lo, hi] = padRange(meta.phi_e_range[0], meta.phi_e_range[1]);
+        this.viewer.setExtraRange(lo, hi);
+        const minIn = document.getElementById('cs-extra-vmin');
+        const maxIn = document.getElementById('cs-extra-vmax');
+        if (minIn) minIn.value = lo.toFixed(3);
+        if (maxIn) maxIn.value = hi.toFixed(3);
+    }
 };

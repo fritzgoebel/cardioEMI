@@ -335,6 +335,10 @@ struct SolverConfig {
     // Nullspace handling
     bool pure_neumann = false;            ///< Set constant nullspace on DdMatrix (pure Neumann BC)
 
+    // Diagnostics: capture per-iteration true ||b - A*x|| (and implicit norm)
+    // via gko::log::Record. Opt-in because Record clones b, x, r per iteration.
+    bool track_iter_residuals = false;
+
     // Output
     bool verbose = false;                 ///< Print convergence info
 };

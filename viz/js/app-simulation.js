@@ -19,6 +19,9 @@ App.prototype.runSimulation = async function() {
         const rtol = document.getElementById('solver-rtol').value;
         const atol = document.getElementById('solver-atol').value;
 
+        const trackIterResEl = document.getElementById('track-iter-residuals');
+        const trackIterRes = !!(trackIterResEl && trackIterResEl.checked);
+
         const configUpdates = {
             v_init: vinitValue,
             dt: this.dt,
@@ -30,7 +33,8 @@ App.prototype.runSimulation = async function() {
             ksp_rtol: rtol,
             ksp_atol: atol,
             bc_type: this.bcType,
-            partition_mode: this.partitionMode
+            partition_mode: this.partitionMode,
+            track_iter_residuals: trackIterRes
         };
 
         this.solverConfig.backend = solverBackend;
@@ -63,6 +67,17 @@ App.prototype.runSimulation = async function() {
                 useEdges: document.getElementById('petsc-bddc-edges').checked,
                 useFaces: document.getElementById('petsc-bddc-faces').checked
             };
+            if (petscBddcConfig.localSolver === 'hypre') {
+                petscBddcConfig.localHypre = {
+                    cycleType: document.getElementById('petsc-bddc-local-hypre-cycle').value,
+                    coarsenType: document.getElementById('petsc-bddc-local-hypre-coarsen').value,
+                    strongThreshold: parseFloat(document.getElementById('petsc-bddc-local-hypre-strength').value),
+                    relaxType: document.getElementById('petsc-bddc-local-hypre-relax').value,
+                    numSweeps: parseInt(document.getElementById('petsc-bddc-local-hypre-sweeps').value),
+                    interpType: document.getElementById('petsc-bddc-local-hypre-interp').value,
+                    maxLevels: parseInt(document.getElementById('petsc-bddc-local-hypre-max-levels').value)
+                };
+            }
             await this.configManager.updatePetscBddcConfig(petscBddcConfig);
         }
 
@@ -222,7 +237,6 @@ App.prototype.runSimulationKarolina = async function(statusEl, outputEl, runBtn)
         statusEl.textContent = 'Submitting to Karolina...';
 
         const configFile = this.configManager.configFile || 'input_pepe36_colored.yml';
-        const label = document.getElementById('karolina-job-label').value.trim() || undefined;
         const conditions = this.getConditionsSnapshot();
 
         const options = {
@@ -233,12 +247,12 @@ App.prototype.runSimulationKarolina = async function(statusEl, outputEl, runBtn)
             partition: document.getElementById('karolina-partition').value || 'qcpu_exp',
             account: document.getElementById('karolina-account').value || 'eu-26-11',
             solver_backend: document.getElementById('solver-backend').value || 'petsc',
-            label,
             conditions,
         };
 
         const result = await this.karolinaRunner.submit(options);
         const jobs = result.jobs || [result];
+        const meshName = this.meshLoader.currentMesh || null;
 
         jobSection.style.display = 'block';
         for (const job of jobs) {
@@ -246,8 +260,13 @@ App.prototype.runSimulationKarolina = async function(statusEl, outputEl, runBtn)
             this.karolinaJobs[jobId] = {
                 ...job,
                 conditions_hash: job.conditions_hash,
+                mesh_name: meshName,
+                solver_backend: conditions.solver,
+                preconditioner: conditions.preconditioner,
+                localSolver: conditions.localSolver,
             };
             this.renderJobEntry(job);
+            this.ensureMeshInFilter(meshName);
             this.karolinaRunner.startPolling(jobId, (data) => {
                 this.updateJobStatus(jobId, data);
                 if (data.out_name) {
@@ -255,6 +274,9 @@ App.prototype.runSimulationKarolina = async function(statusEl, outputEl, runBtn)
                 }
             });
         }
+        this.saveKarolinaJobs();
+        this.renderMeshFilter();
+        this.applyMeshFilter();
 
         const jobIds = jobs.map(j => j.job_id).join(', ');
         statusEl.className = 'status visible success';
