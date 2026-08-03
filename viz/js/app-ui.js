@@ -176,7 +176,7 @@ App.prototype.setupCheckboxes = function() {
     document.getElementById('show-interfaces').addEventListener('change', (e) => {
         this.showInterfaces = e.target.checked;
         document.getElementById('interface-type-controls').style.display = this.showInterfaces ? 'block' : 'none';
-        this.updateInterfaceHighlight();
+        this.refreshInterfaceView();
         if (document.getElementById('show-ecs').checked && this.ecsRanksData && this.visibleRanks) {
             this.viewer.setVisibleRanks(this.visibleRanks);
         }
@@ -194,6 +194,14 @@ App.prototype.setupCheckboxes = function() {
     document.getElementById('show-interface-faces').addEventListener('change', (e) => {
         this.showInterfaceFaces = e.target.checked;
         this.updateInterfaceHighlight();
+    });
+
+    // Per-interface inspector: enable/disable all rows at once
+    document.getElementById('interface-list-all').addEventListener('click', () => {
+        this.setAllInterfaces(true);
+    });
+    document.getElementById('interface-list-none').addEventListener('click', () => {
+        this.setAllInterfaces(false);
     });
 
     // Rank selection buttons
@@ -470,6 +478,11 @@ App.prototype.setupResultsControls = function() {
 
     const dlBtn = document.getElementById('download-karolina-results');
     dlBtn.addEventListener('click', () => this.downloadKarolinaSimulation());
+
+    const deleteAllBtn = document.getElementById('delete-all-results');
+    if (deleteAllBtn) {
+        deleteAllBtn.addEventListener('click', () => this.deleteAllResults());
+    }
 
     timeSlider.addEventListener('input', () => {
         if (this.resultsVizDir && this.resultsTimeSteps && this.resultsTimeSteps.length > 0) {

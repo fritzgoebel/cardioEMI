@@ -165,3 +165,19 @@ dolfinx_v0.7.1.sif
 *.sif
 *.ext3
 output/
+
+# Generated mesh data (large binaries; small tracked test fixtures stay tracked)
+data/*.h5
+data/*.xdmf
+data/*.pickle
+
+# Simulation and experiment run outputs
+*_sim/
+*_sim_*/
+exp_*/
+
+# Misc artifacts / editor cruft
+*.mtx
+*.bak
+.DS_Store
+SESSION_SUMMARY.md

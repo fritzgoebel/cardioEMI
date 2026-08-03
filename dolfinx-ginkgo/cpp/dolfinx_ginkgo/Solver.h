@@ -163,6 +163,30 @@ public:
         return last_converged_ ? last_iterations_ : -last_iterations_;
     }
 
+    /// Apply the preconditioner alone: x = M * b
+    ///
+    /// Generates the preconditioner from the configured factory on first use
+    /// (independently of the Krylov solver's internal instance). Intended for
+    /// debugging preconditioner properties (symmetry, spectrum).
+    void apply_preconditioner(const vector_type& b, vector_type& x) {
+        if (!precond_) {
+            if (!A_) {
+                throw std::runtime_error("Matrix not set. Call set_operator() first.");
+            }
+            std::shared_ptr<gko::LinOpFactory> precond_factory;
+            if (config_.preconditioner == PreconditionerType::BDDC) {
+                precond_factory = build_bddc_factory();
+            } else {
+                precond_factory = build_preconditioner_factory();
+            }
+            if (!precond_factory) {
+                throw std::runtime_error("No preconditioner configured.");
+            }
+            precond_ = precond_factory->generate(A_);
+        }
+        precond_->apply(&b, &x);
+    }
+
     /// Get iteration count from last solve
     int iterations() const { return last_iterations_; }
 
@@ -193,6 +217,7 @@ private:
 
     std::shared_ptr<gko::LinOp> A_;  // System operator (Matrix or DdMatrix)
     std::shared_ptr<gko::LinOp> solver_;
+    std::shared_ptr<gko::LinOp> precond_;  // Standalone preconditioner (apply_preconditioner)
     std::shared_ptr<gko::log::Convergence<ValueType>> logger_;
 
     // Per-iteration diagnostic capture (only populated when track_iter_residuals).
@@ -421,11 +446,23 @@ private:
     std::shared_ptr<gko::LinOpFactory> build_bddc_factory() {
         using bddc_type = gko_dist::preconditioner::Bddc<ValueType, LocalIndexType, GlobalIndexType>;
         using local_bddc_type = gko_dist::preconditioner::Bddc<ValueType, LocalIndexType, LocalIndexType>;
+        // Schwarz variant used at the BDDC coarse level: the coarse matrix is
+        // gko_dist::Matrix<…, LocalIndexType, LocalIndexType> (no global indexing),
+        // so the coarse Schwarz must instantiate with both indices = LocalIndexType,
+        // not the system-level <…, LocalIndexType, GlobalIndexType> alias.
+        using local_schwarz_type = gko_dist::preconditioner::Schwarz<ValueType, LocalIndexType, LocalIndexType>;
         const auto& bddc_cfg = config_.bddc;
 
-        // Build local solver factory (local problems are not distributed)
+        // Build a local-type subsolver factory (local problems are not
+        // distributed). Used for both the local/Neumann solve and, with its
+        // own independent tuning, the interior/inner (A_II) solve.
+        auto build_subsolver = [&](BDDCConfig::LocalSolver solver_type,
+                                   int sub_max_iters, double sub_tol,
+                                   const BDDCConfig::LocalAMGConfig& amg_cfg,
+                                   const BDDCConfig::LocalHypreConfig& hypre_cfg)
+            -> std::shared_ptr<gko::LinOpFactory> {
         std::shared_ptr<gko::LinOpFactory> local_solver_factory;
-        switch (bddc_cfg.local_solver) {
+        switch (solver_type) {
             case BDDCConfig::LocalSolver::DIRECT: {
                 // Use MUMPS direct solver for SPD local problems
                 local_solver_factory = gko::experimental::solver::Mumps<ValueType, LocalIndexType>::build()
@@ -443,9 +480,9 @@ private:
                 local_solver_factory = gko::solver::Gmres<ValueType>::build()
                     .with_criteria(
                         gko::stop::Iteration::build()
-                            .with_max_iters(static_cast<gko::size_type>(bddc_cfg.local_max_iterations)),
+                            .with_max_iters(static_cast<gko::size_type>(sub_max_iters)),
                         gko::stop::ResidualNorm<ValueType>::build()
-                            .with_reduction_factor(bddc_cfg.local_tolerance))
+                            .with_reduction_factor(sub_tol))
                     .with_preconditioner(
                         gko::factorization::ParIlu<ValueType, LocalIndexType>::build())
                     .on(exec_);
@@ -456,9 +493,9 @@ private:
                 local_solver_factory = gko::solver::Cg<ValueType>::build()
                     .with_criteria(
                         gko::stop::Iteration::build()
-                            .with_max_iters(static_cast<gko::size_type>(bddc_cfg.local_max_iterations)),
+                            .with_max_iters(static_cast<gko::size_type>(sub_max_iters)),
                         gko::stop::ResidualNorm<ValueType>::build()
-                            .with_reduction_factor(bddc_cfg.local_tolerance))
+                            .with_reduction_factor(sub_tol))
                     .with_preconditioner(
                         gko::factorization::ParIc<ValueType, LocalIndexType>::build())
                     .on(exec_);
@@ -466,7 +503,6 @@ private:
             }
             case BDDCConfig::LocalSolver::AMG: {
                 // Standalone AMG for local solves
-                const auto& amg_cfg = bddc_cfg.local_amg;
 
                 // Build smoother
                 std::shared_ptr<gko::LinOpFactory> smoother_factory;
@@ -551,15 +587,14 @@ private:
                     .with_cycle(local_cycle_type)
                     .with_criteria(
                         gko::stop::Iteration::build()
-                            .with_max_iters(static_cast<gko::size_type>(bddc_cfg.local_max_iterations)),
+                            .with_max_iters(static_cast<gko::size_type>(sub_max_iters)),
                         gko::stop::ResidualNorm<ValueType>::build()
-                            .with_reduction_factor(bddc_cfg.local_tolerance))
+                            .with_reduction_factor(sub_tol))
                     .on(exec_);
                 break;
             }
             case BDDCConfig::LocalSolver::HYPRE: {
 #if GKO_HAVE_HYPRE
-                const auto& hypre_cfg = bddc_cfg.local_hypre;
                 local_solver_factory =
                     gko::experimental::solver::HypreBoomerAmg<ValueType>::build()
                         .with_cycle_type(hypre_cfg.cycle_type)
@@ -569,6 +604,10 @@ private:
                         .with_num_sweeps(hypre_cfg.num_sweeps)
                         .with_interpolation_type(hypre_cfg.interpolation_type)
                         .with_max_levels(hypre_cfg.max_levels)
+                        .with_max_coarse_size(hypre_cfg.max_coarse_size)
+                        .with_relax_order(hypre_cfg.relax_order)
+                        .with_coarse_smoother_type(hypre_cfg.coarse_smoother_type)
+                        .with_print_level(hypre_cfg.print_level)
                         .on(exec_);
 #else
                 throw std::runtime_error(
@@ -578,6 +617,12 @@ private:
                 break;
             }
         }
+        return local_solver_factory;
+        };
+
+        auto local_solver_factory = build_subsolver(
+            bddc_cfg.local_solver, bddc_cfg.local_max_iterations,
+            bddc_cfg.local_tolerance, bddc_cfg.local_amg, bddc_cfg.local_hypre);
 
         // Build coarse solver factory
         std::shared_ptr<gko::LinOpFactory> coarse_solver_factory;
@@ -743,6 +788,10 @@ private:
                                 .with_num_sweeps(hypre_cfg.num_sweeps)
                                 .with_interpolation_type(hypre_cfg.interpolation_type)
                                 .with_max_levels(hypre_cfg.max_levels)
+                                .with_max_coarse_size(hypre_cfg.max_coarse_size)
+                                .with_relax_order(hypre_cfg.relax_order)
+                                .with_coarse_smoother_type(hypre_cfg.coarse_smoother_type)
+                                .with_print_level(hypre_cfg.print_level)
                                 .on(exec_);
 #else
                         throw std::runtime_error(
@@ -774,6 +823,26 @@ private:
                 coarse_solver_factory = nested_bddc_params.on(exec_);
                 break;
             }
+            case BDDCConfig::CoarseSolver::SCHWARZ: {
+                // One-shot additive Schwarz: MUMPS on rank 0 only (where the
+                // gathered coarse problem lives), Identity on every other rank.
+                // Uses local_schwarz_type because the coarse matrix carries
+                // <LocalIndexType, LocalIndexType> (see local_bddc_type comment above).
+                std::shared_ptr<gko::LinOpFactory> schwarz_local_factory;
+                if (comm_->rank() == 0) {
+                    schwarz_local_factory =
+                        gko::experimental::solver::Mumps<ValueType, LocalIndexType>::build()
+                            .on(exec_);
+                } else {
+                    schwarz_local_factory =
+                        gko::matrix::IdentityFactory<ValueType>::create(exec_);
+                }
+                coarse_solver_factory =
+                    local_schwarz_type::build()
+                        .with_local_solver(std::move(schwarz_local_factory))
+                        .on(exec_);
+                break;
+            }
         }
 
         // Determine scaling type
@@ -797,9 +866,37 @@ private:
             .with_scaling(scaling)
             .with_repartition_coarse(bddc_cfg.repartition_coarse)
             ;
+        // Optional fill-reducing reordering of the local matrices (A_LL/A_II).
+        // BDDC permutes those blocks before handing them to the local and inner
+        // solvers, so this also changes the DOF ordering an AMG/Hypre local
+        // solver coarsens on.
+        switch (bddc_cfg.reordering) {
+            case BDDCConfig::Reordering::NONE:
+                break;
+            case BDDCConfig::Reordering::AMD:
+                bddc_params.with_reordering(
+                    gko::experimental::reorder::Amd<LocalIndexType>::build());
+                break;
+        }
+        // ROOT CAUSE NOTE (2026-07-13, see debug_bddc/): a DIRECT local solver
+        // factorizes the unconstrained SINGULAR Neumann block A_LL; with any
+        // inexact interior solve the condensed residual becomes inconsistent
+        // and the singular factorization amplifies it unboundedly (dL_hI:
+        // 119+ iters vs PETSc 30 on identical data; adding II deflation makes
+        // it diverge outright). Inexact local solvers avoid this via the LL
+        // NSPSolver deflation (hL_hI: 30 iters = PETSc parity). Until the
+        // direct Neumann solve is regularized in Ginkgo, keep the original
+        // gating and avoid direct-local + inexact-inner configurations.
         if (bddc_cfg.local_solver != BDDCConfig::LocalSolver::DIRECT &&
             bddc_cfg.local_solver != BDDCConfig::LocalSolver::DIRECT_LU) {
             bddc_params.with_constant_nullspace(bddc_cfg.constant_nullspace);
+        }
+        // Optionally override the interior (A_II) solver; otherwise Ginkgo uses
+        // local_solver for the inner solve.
+        if (bddc_cfg.override_inner_solver) {
+            bddc_params.with_inner_solver(build_subsolver(
+                bddc_cfg.inner_solver, bddc_cfg.inner_max_iterations,
+                bddc_cfg.inner_tolerance, bddc_cfg.inner_amg, bddc_cfg.inner_hypre));
         }
         return bddc_params.on(exec_);
     }
@@ -900,6 +997,7 @@ private:
 
         // Generate the solver from the matrix
         solver_ = solver_factory->generate(A_);
+        precond_.reset();  // Regenerate standalone preconditioner on next use
 
         // Add convergence logger to the solver
         solver_->add_logger(logger_);

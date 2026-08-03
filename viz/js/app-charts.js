@@ -203,8 +203,41 @@ App.prototype.updateCompareSelector = async function() {
         const group = document.createElement('details');
         group.style.cssText = 'margin-bottom: 4px;';
         const summary = document.createElement('summary');
-        summary.style.cssText = 'cursor:pointer; font-size:0.8em; font-weight:bold; color:#888; padding:2px 0;';
-        summary.textContent = `${mesh} (${meshSims.length})`;
+        summary.style.cssText = 'cursor:pointer; font-size:0.8em; font-weight:bold; color:#888; padding:2px 0; display:flex; align-items:center; gap:6px;';
+        const summaryText = document.createElement('span');
+        summaryText.textContent = `${mesh} (${meshSims.length})`;
+        summary.appendChild(summaryText);
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.type = 'button';
+        deleteBtn.textContent = 'Delete all';
+        deleteBtn.title = `Delete all local results for ${mesh}`;
+        deleteBtn.style.cssText = 'margin-left:auto; font-size:0.7em; padding:1px 6px; background:transparent; color:#888; border:1px solid #555; border-radius:3px; cursor:pointer;';
+        deleteBtn.addEventListener('click', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (!window.confirm(`Delete ALL ${meshSims.length} local result(s) for ${mesh}? This cannot be undone.`)) return;
+            try {
+                const resp = await fetch('/api/simulations/delete_by_mesh', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mesh }),
+                });
+                const result = await resp.json();
+                if (!resp.ok) {
+                    alert('Delete failed: ' + (result.error || 'unknown error'));
+                    return;
+                }
+                if (result.errors && result.errors.length) {
+                    console.warn('Partial delete failure:', result.errors);
+                }
+                await this.loadSimulationList();
+                await this.updateCompareSelector();
+            } catch (err) {
+                alert('Delete request failed: ' + err.message);
+            }
+        });
+        summary.appendChild(deleteBtn);
         group.appendChild(summary);
 
         // First level: group by physical conditions
@@ -248,53 +281,80 @@ App.prototype.updateCompareSelector = async function() {
                 condCol.appendChild(condHeader);
             }
 
-            // Second level: group by solver config
-            const configGroups = {};
+            // Second level: group by solver backend
+            const backendGroups = {};
             for (const sim of condSims) {
-                const configKey = [sim.solver || '', sim.preconditioner || '', sim.localSolver || ''].join('|');
-                if (!configGroups[configKey]) configGroups[configKey] = [];
-                configGroups[configKey].push(sim);
+                const backend = sim.solver || '';
+                if (!backendGroups[backend]) backendGroups[backend] = [];
+                backendGroups[backend].push(sim);
             }
 
-            const configColumnsDiv = document.createElement('div');
-            configColumnsDiv.style.cssText = 'display:flex; gap:12px; flex-wrap:wrap;';
+            const backendsDiv = document.createElement('div');
+            backendsDiv.style.cssText = 'display:flex; gap:16px; flex-wrap:wrap;';
 
-            for (const [configKey, configSims] of Object.entries(configGroups).sort((a, b) => a[0].localeCompare(b[0]))) {
-                const col = document.createElement('div');
-                col.style.cssText = 'min-width:80px;';
+            const backendEntries = Object.entries(backendGroups).sort((a, b) => a[0].localeCompare(b[0]));
+            for (const [backend, backendSims] of backendEntries) {
+                const backendCol = document.createElement('div');
 
-                // Column header from config
-                const parts = configKey.split('|').filter(Boolean);
-                let header = parts.length > 0 ? (parts[1] || parts[0]) : 'default';
-                if (parts[2]) header += `(${parts[2]})`;
-                const headerEl = document.createElement('div');
-                headerEl.style.cssText = 'font-size:0.7em; color:#666; font-weight:bold; margin-bottom:2px; white-space:nowrap;';
-                headerEl.textContent = header;
-                col.appendChild(headerEl);
-
-                // Sort by nRanks
-                configSims.sort((a, b) => (a.nRanks || 0) - (b.nRanks || 0));
-
-                for (const sim of configSims) {
-                    const label = document.createElement('label');
-                    label.style.cssText = 'display:block; margin:2px 0; font-size:0.75em; cursor:pointer; white-space:nowrap;';
-                    const cb = document.createElement('input');
-                    cb.type = 'checkbox';
-                    cb.value = sim.name;
-                    cb.style.marginRight = '6px';
-                    if (checked.has(sim.name)) cb.checked = true;
-                    cb.addEventListener('change', () => this.onCompareSelectionChange());
-                    label.appendChild(cb);
-
-                    const displayLabel = sim.nRanks ? `${sim.nRanks}r` : (sim.name.replace(/^.+?_sim_?/, '') || 'default');
-                    label.appendChild(document.createTextNode(displayLabel));
-                    col.appendChild(label);
+                // Backend header (only when there's more than one)
+                if (backendEntries.length > 1) {
+                    const backendHeader = document.createElement('div');
+                    backendHeader.style.cssText = 'font-size:0.7em; color:#aaa; font-weight:bold; border-bottom:1px solid #555; padding-bottom:1px; margin-bottom:3px; white-space:nowrap;';
+                    backendHeader.textContent = backend || 'default';
+                    backendCol.appendChild(backendHeader);
                 }
 
-                configColumnsDiv.appendChild(col);
+                // Third level: group by preconditioner / localSolver
+                const configGroups = {};
+                for (const sim of backendSims) {
+                    const configKey = [sim.preconditioner || '', sim.localSolver || ''].join('|');
+                    if (!configGroups[configKey]) configGroups[configKey] = [];
+                    configGroups[configKey].push(sim);
+                }
+
+                const configColumnsDiv = document.createElement('div');
+                configColumnsDiv.style.cssText = 'display:flex; gap:12px; flex-wrap:wrap;';
+
+                for (const [configKey, configSims] of Object.entries(configGroups).sort((a, b) => a[0].localeCompare(b[0]))) {
+                    const col = document.createElement('div');
+                    col.style.cssText = 'min-width:80px;';
+
+                    // Column header from config
+                    const parts = configKey.split('|').filter(Boolean);
+                    let header = parts[0] || 'default';
+                    if (parts[1]) header += `(${parts[1]})`;
+                    const headerEl = document.createElement('div');
+                    headerEl.style.cssText = 'font-size:0.7em; color:#666; font-weight:bold; margin-bottom:2px; white-space:nowrap;';
+                    headerEl.textContent = header;
+                    col.appendChild(headerEl);
+
+                    // Sort by nRanks
+                    configSims.sort((a, b) => (a.nRanks || 0) - (b.nRanks || 0));
+
+                    for (const sim of configSims) {
+                        const label = document.createElement('label');
+                        label.style.cssText = 'display:block; margin:2px 0; font-size:0.75em; cursor:pointer; white-space:nowrap;';
+                        const cb = document.createElement('input');
+                        cb.type = 'checkbox';
+                        cb.value = sim.name;
+                        cb.style.marginRight = '6px';
+                        if (checked.has(sim.name)) cb.checked = true;
+                        cb.addEventListener('change', () => this.onCompareSelectionChange());
+                        label.appendChild(cb);
+
+                        const displayLabel = sim.nRanks ? `${sim.nRanks}r` : (sim.name.replace(/^.+?_sim_?/, '') || 'default');
+                        label.appendChild(document.createTextNode(displayLabel));
+                        col.appendChild(label);
+                    }
+
+                    configColumnsDiv.appendChild(col);
+                }
+
+                backendCol.appendChild(configColumnsDiv);
+                backendsDiv.appendChild(backendCol);
             }
 
-            condCol.appendChild(configColumnsDiv);
+            condCol.appendChild(backendsDiv);
             condColumnsDiv.appendChild(condCol);
         }
 

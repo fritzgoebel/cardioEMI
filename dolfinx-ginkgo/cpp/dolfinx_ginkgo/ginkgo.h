@@ -250,11 +250,28 @@ struct BDDCConfig {
     enum class Scaling { STIFFNESS, DELUXE };
     Scaling scaling = Scaling::STIFFNESS;
 
+    // Fill-reducing reordering applied to the local matrices (A_LL and A_II)
+    // before they reach the local/inner solver. NONE leaves DOF ordering as-is.
+    // Primarily reduces fill for direct local solvers, but also changes the DOF
+    // ordering seen by an AMG/Hypre local solver (affects coarsening).
+    enum class Reordering { NONE, AMD };
+    Reordering reordering = Reordering::NONE;
+
     // Local solver configuration
     enum class LocalSolver { DIRECT, DIRECT_LU, ILU, IC, AMG, HYPRE };
     LocalSolver local_solver = LocalSolver::DIRECT;
     int local_max_iterations = 100;       ///< Max iterations for iterative local solver
     double local_tolerance = 1e-12;       ///< Tolerance for iterative local solver
+
+    // Inner (interior / static-condensation A_II) solver. When override_inner_solver
+    // is false the inner solve falls back to local_solver (Ginkgo's default), so
+    // existing configs are unchanged. When set, the inner solver is fully and
+    // independently configurable via inner_max_iterations / inner_tolerance /
+    // inner_amg / inner_hypre (declared next to their local_* counterparts).
+    LocalSolver inner_solver = LocalSolver::DIRECT;
+    bool override_inner_solver = false;
+    int inner_max_iterations = 100;       ///< Max iterations for iterative inner solver
+    double inner_tolerance = 1e-12;       ///< Tolerance for iterative inner solver
 
     // Local Hypre BoomerAMG configuration (used when local_solver = HYPRE)
     struct LocalHypreConfig {
@@ -265,8 +282,13 @@ struct BDDCConfig {
         int num_sweeps = 1;               ///< Number of smoother sweeps per level
         int interpolation_type = 0;       ///< 0=classical, 3=direct, 4=multipass, 6=ext+i, 13=FF1, 14=ext
         int max_levels = 25;              ///< Maximum number of AMG levels
+        int coarse_smoother_type = 9;     ///< Coarsest-grid solver (9=Gaussian elimination); set last so nothing re-expands over it
+        int relax_order = 1;              ///< 0=lexicographic, 1=C/F (CF-Jacobi / hybrid) ordering
+        int max_coarse_size = 64;         ///< Max size of coarsest grid; forces deeper coarsening so GE actually applies
+        int print_level = 1;              ///< Hypre BoomerAMG print level (0=silent, 1=setup, 3=setup+solve)
     };
     LocalHypreConfig local_hypre;
+    LocalHypreConfig inner_hypre;  ///< Hypre config for inner solver (inner_solver = HYPRE)
 
     // Local AMG configuration (used when local_solver = AMG)
     struct LocalAMGConfig {
@@ -292,9 +314,12 @@ struct BDDCConfig {
         int coarse_max_iterations = 100;
     };
     LocalAMGConfig local_amg;
+    LocalAMGConfig inner_amg;  ///< AMG config for inner solver (inner_solver = AMG)
 
     // Coarse solver configuration (distributed - no direct solver)
-    enum class CoarseSolver { CG, GMRES, BDDC };
+    // SCHWARZ is a one-shot additive Schwarz preconditioner used directly as
+    // the coarse solve (no outer Krylov); local subproblems use MUMPS.
+    enum class CoarseSolver { CG, GMRES, BDDC, SCHWARZ };
     CoarseSolver coarse_solver = CoarseSolver::CG;
     int coarse_max_iterations = 100;      ///< Max iterations for iterative coarse solver
     double coarse_tolerance = 1e-10;      ///< Tolerance for iterative coarse solver

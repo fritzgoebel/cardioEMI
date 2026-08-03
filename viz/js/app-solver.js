@@ -45,6 +45,8 @@ App.prototype.setupSolverSettings = function() {
             amg: { cycle: 'v', smoother: 'jacobi', maxLevels: 10 },
             bddc: {
                 localSolver: 'direct',
+                reordering: 'none',
+                innerSolver: '',
                 localMaxIterations: 100,
                 localTolerance: 1e-12,
                 coarseSolver: 'cg',
@@ -65,6 +67,27 @@ App.prototype.setupSolverSettings = function() {
                     relaxationFactor: 0.9
                 },
                 localHypre: {
+                    cycleType: 1,
+                    coarseningType: 10,
+                    strengthThreshold: 0.25,
+                    smootherType: 6,
+                    numSweeps: 1,
+                    interpolationType: 0,
+                    maxLevels: 25
+                },
+                innerMaxIterations: 100,
+                innerTolerance: 1e-12,
+                innerAmg: {
+                    coarsening: 'pgm',
+                    strengthThreshold: 0.25,
+                    cycle: 'v',
+                    smoother: 'jacobi',
+                    smoothSteps: 1,
+                    maxLevels: 10,
+                    coarseSolver: 'direct',
+                    relaxationFactor: 0.9
+                },
+                innerHypre: {
                     cycleType: 1,
                     coarseningType: 10,
                     strengthThreshold: 0.25,
@@ -234,6 +257,25 @@ App.prototype.setupSolverSettings = function() {
         bddcLocalAmgOptions.style.display = e.target.value === 'amg' ? 'block' : 'none';
         bddcLocalHypreOptions.style.display = e.target.value === 'hypre' ? 'block' : 'none';
         bddcLocalStoppingOptions.style.display = (e.target.value !== 'direct' && e.target.value !== 'direct_lu') ? 'block' : 'none';
+    });
+    document.getElementById('bddc-reordering').addEventListener('change', (e) => {
+        this.solverConfig.ginkgo.bddc.reordering = e.target.value;
+    });
+    const bddcInnerAmgOptions = document.getElementById('bddc-inner-amg-options');
+    const bddcInnerHypreOptions = document.getElementById('bddc-inner-hypre-options');
+    const bddcInnerStoppingOptions = document.getElementById('bddc-inner-stopping-options');
+    document.getElementById('bddc-inner-solver').addEventListener('change', (e) => {
+        this.solverConfig.ginkgo.bddc.innerSolver = e.target.value;
+        // '' = "Same as local": hide all inner tuning panels.
+        bddcInnerAmgOptions.style.display = e.target.value === 'amg' ? 'block' : 'none';
+        bddcInnerHypreOptions.style.display = e.target.value === 'hypre' ? 'block' : 'none';
+        bddcInnerStoppingOptions.style.display =
+            (e.target.value && e.target.value !== 'direct' && e.target.value !== 'direct_lu') ? 'block' : 'none';
+    });
+    document.getElementById('bddc-inner-amg-coarsening').addEventListener('change', (e) => {
+        this.solverConfig.ginkgo.bddc.innerAmg.coarsening = e.target.value;
+        document.getElementById('bddc-inner-amg-hmis-options').style.display =
+            e.target.value === 'hmis' ? 'block' : 'none';
     });
 
     document.getElementById('bddc-local-max-iter').addEventListener('change', (e) => {
@@ -468,6 +510,7 @@ App.prototype.loadConfigFromYaml = async function() {
         // Ginkgo BDDC options
         const bddc = gko.bddc || {};
         if (bddc.local_solver) setVal('bddc-local-solver', bddc.local_solver);
+        if (bddc.reordering) setVal('bddc-reordering', bddc.reordering);
         if (bddc.local_max_iterations) setVal('bddc-local-max-iter', bddc.local_max_iterations);
         if (bddc.local_tolerance) setVal('bddc-local-tolerance', bddc.local_tolerance);
         if (bddc.coarse_solver) setVal('bddc-coarse-solver', bddc.coarse_solver);

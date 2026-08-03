@@ -99,6 +99,7 @@ App.prototype.runSimulation = async function() {
                 },
                 bddc: {
                     localSolver: document.getElementById('bddc-local-solver').value,
+                    innerSolver: document.getElementById('bddc-inner-solver').value,
                     localMaxIterations: parseInt(document.getElementById('bddc-local-max-iter').value),
                     localTolerance: parseFloat(document.getElementById('bddc-local-tolerance').value),
                     coarseSolver: document.getElementById('bddc-coarse-solver').value,
@@ -126,6 +127,27 @@ App.prototype.runSimulation = async function() {
                         numSweeps: parseInt(document.getElementById('bddc-local-hypre-sweeps').value),
                         interpolationType: parseInt(document.getElementById('bddc-local-hypre-interpolation').value),
                         maxLevels: parseInt(document.getElementById('bddc-local-hypre-max-levels').value)
+                    },
+                    innerMaxIterations: parseInt(document.getElementById('bddc-inner-max-iter').value),
+                    innerTolerance: parseFloat(document.getElementById('bddc-inner-tolerance').value),
+                    innerAmg: {
+                        coarsening: document.getElementById('bddc-inner-amg-coarsening').value,
+                        strengthThreshold: parseFloat(document.getElementById('bddc-inner-amg-strength-threshold').value),
+                        cycle: document.getElementById('bddc-inner-amg-cycle').value,
+                        smoother: document.getElementById('bddc-inner-amg-smoother').value,
+                        smoothSteps: parseInt(document.getElementById('bddc-inner-amg-smooth-steps').value),
+                        maxLevels: parseInt(document.getElementById('bddc-inner-amg-max-levels').value),
+                        coarseSolver: document.getElementById('bddc-inner-amg-coarse-solver').value,
+                        relaxationFactor: parseFloat(document.getElementById('bddc-inner-amg-relaxation').value)
+                    },
+                    innerHypre: {
+                        cycleType: parseInt(document.getElementById('bddc-inner-hypre-cycle').value),
+                        coarseningType: parseInt(document.getElementById('bddc-inner-hypre-coarsening').value),
+                        strengthThreshold: parseFloat(document.getElementById('bddc-inner-hypre-strength').value),
+                        smootherType: parseInt(document.getElementById('bddc-inner-hypre-smoother').value),
+                        numSweeps: parseInt(document.getElementById('bddc-inner-hypre-sweeps').value),
+                        interpolationType: parseInt(document.getElementById('bddc-inner-hypre-interpolation').value),
+                        maxLevels: parseInt(document.getElementById('bddc-inner-hypre-max-levels').value)
                     }
                 }
             };
@@ -316,8 +338,10 @@ App.prototype.getConditionsSnapshot = function() {
         ? document.getElementById('ginkgo-precond').value
         : document.getElementById('petsc-pc-type').value;
     let localSolver = null;
+    let reordering = null;
     if (solverBackend === 'ginkgo' && precond === 'bddc') {
         localSolver = document.getElementById('bddc-local-solver').value;
+        reordering = document.getElementById('bddc-reordering').value;
     } else if (solverBackend === 'petsc' && precond === 'bddc') {
         localSolver = document.getElementById('petsc-bddc-local-solver').value;
     }
@@ -336,6 +360,7 @@ App.prototype.getConditionsSnapshot = function() {
         solver: solverBackend,
         preconditioner: precond,
         localSolver: localSolver,
+        reordering: reordering,
         nRanks: nRanks,
         boundingBox: { ...this.boundingBox },
         vExcited: this.vExcited,

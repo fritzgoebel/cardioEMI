@@ -45,7 +45,31 @@ App.prototype.setupKarolinaJobsPersistence = function() {
         }
     });
 
+    const clearBtn = document.getElementById('karolina-jobs-clear-btn');
+    if (clearBtn) {
+        clearBtn.addEventListener('click', () => this.clearKarolinaJobsList());
+    }
+
     this.loadKarolinaJobs();
+};
+
+App.prototype.clearKarolinaJobsList = function() {
+    const jobIds = Object.keys(this.karolinaJobs || {});
+    if (jobIds.length === 0) return;
+    const ok = window.confirm(
+        `Remove all ${jobIds.length} job(s) from the list?\n\n` +
+        'This only clears the local list — it does NOT cancel jobs on Karolina ' +
+        'or delete any data (remote dirs or downloaded results stay put).'
+    );
+    if (!ok) return;
+    for (const jobId of jobIds) {
+        this.karolinaRunner.stopPolling(jobId);
+    }
+    this.karolinaJobs = {};
+    const list = document.getElementById('karolina-jobs-list');
+    if (list) list.innerHTML = '';
+    this.saveKarolinaJobs();
+    this.renderMeshFilter();
 };
 
 App.prototype.saveKarolinaJobs = function() {

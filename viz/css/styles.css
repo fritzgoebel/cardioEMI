@@ -455,6 +455,78 @@ header p {
     background: #0f3460;
 }
 
+/* Per-interface inspector panel */
+.interface-list-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: #e94560;
+    margin-bottom: 6px;
+}
+
+.interface-list-columns {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+}
+
+.interface-list-col {
+    flex: 1;
+    min-width: 90px;
+}
+
+.interface-list-col-head {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #4a90d9;
+    border-bottom: 1px solid rgba(74, 144, 217, 0.4);
+    padding-bottom: 2px;
+    margin-bottom: 4px;
+}
+
+.interface-list-col-body {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-height: 180px;
+    overflow-y: auto;
+}
+
+.interface-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 4px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.72rem;
+    transition: background 0.2s;
+}
+
+.interface-item:hover {
+    background: rgba(255, 255, 255, 0.12);
+}
+
+.interface-item input {
+    cursor: pointer;
+}
+
+.interface-item .interface-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    flex-shrink: 0;
+}
+
+.interface-item-empty {
+    font-size: 0.72rem;
+    color: rgba(255, 255, 255, 0.4);
+    padding: 2px 4px;
+}
+
 /* Iterations Chart */
 #iterations-chart-container {
     padding: 15px;
@@ -685,6 +757,63 @@ header p {
 .mesh-status.error {
     background: #721c24;
     color: #f8d7da;
+}
+
+/* Mesh selection tabs */
+.mesh-tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 12px;
+}
+
+.mesh-tab {
+    flex: 1;
+    padding: 8px 10px;
+    background: #16213e;
+    color: #aaa;
+    border: 1px solid #4a90d9;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    transition: all 0.2s;
+}
+
+.mesh-tab:hover {
+    color: #fff;
+}
+
+.mesh-tab.active {
+    background: #0f3460;
+    color: #fff;
+    border-color: #e94560;
+}
+
+/* Weak-scaling helper text and estimate */
+.ws-help {
+    font-size: 0.8rem;
+    color: #9fb3c8;
+    margin: 0 0 12px 0;
+    line-height: 1.4;
+}
+
+.ws-estimate {
+    font-size: 0.8rem;
+    color: #9fb3c8;
+    margin-top: 8px;
+    line-height: 1.5;
+}
+
+.ws-estimate.warn {
+    color: #f0ad4e;
+}
+
+.ws-estimate .ws-ready {
+    color: #6bd48a;
+    font-weight: 600;
+}
+
+#weak-scaling-panel .param-row input[type="number"] {
+    width: 70px;
 }
 
 /* Progress bar */

@@ -448,6 +448,51 @@ def convert_remote_mesh(family, pts_file, elem_file, output_prefix, color=False)
     return process
 
 
+def generate_remote_weak_scaling_mesh(nx, ny, nz, n, L, pad, output_prefix):
+    """Generate a weak-scaling (3D-plus) mesh on Karolina inside the DOLFINx container.
+
+    Reuses the existing data/<output_prefix>.h5 if present, otherwise runs
+    geometry/generate_weak_scaling_mesh.py remotely. Returns a streaming Popen.
+    """
+    if mesh_convert_state['converting']:
+        raise RuntimeError('A conversion is already in progress')
+
+    # Ensure data directory exists
+    _run_ssh(f'mkdir -p {DATA_PATH}', timeout=10)
+
+    # lxml/h5py must be installed to a writable target (container FS is read-only);
+    # generate_weak_scaling_mesh.py imports write_xdmf_h5 from convert_pts_elem (lxml).
+    pylibs = '/home/fenics/.pylibs'
+    gen_cmd = (
+        f'if [ -f data/{output_prefix}.h5 ]; then '
+        f'echo "Reusing existing data/{output_prefix}.h5"; '
+        f'else '
+        f'pip install --target={pylibs} -q lxml h5py 2>/dev/null; '
+        f'export PYTHONPATH={pylibs}:$PYTHONPATH && '
+        f'python3 geometry/generate_weak_scaling_mesh.py '
+        f'--nx {int(nx)} --ny {int(ny)} --nz {int(nz)} '
+        f'--n {int(n)} --L {float(L)} --pad {int(pad)} '
+        f'--prefix data/{output_prefix}; '
+        f'fi'
+    )
+
+    remote_cmd = _apptainer_exec(DOLFINX_SIF, gen_cmd)
+
+    full_cmd = ['ssh', REMOTE_HOST, remote_cmd]
+    process = subprocess.Popen(
+        full_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    mesh_convert_state['converting'] = True
+    mesh_convert_state['process'] = process
+
+    return process
+
+
 def finish_conversion():
     """Clean up after conversion completes."""
     mesh_convert_state['converting'] = False
@@ -542,6 +587,9 @@ srun -n {total_ranks} --cpu-bind=cores --distribution=block:block apptainer exec
     --pwd /home/fenics \\
     {sif} \\
     bash -c 'unset CC CXX && export PYTHONPATH=/home/fenics/.pylibs:$PYTHONPATH && python3 -B -u main.py {out_name}/{config_file}' 2>&1 | tee {out_name}_slurm.log
+
+# Move BDDC interface files into the sim dir so each run keeps its own copy.
+mv IF_*.txt {out_name}/ 2>/dev/null || true
 """
     return script, out_name
 
@@ -925,15 +973,10 @@ def download_results_streaming(remote_out_name, local_dest):
     local_dest = Path(local_dest)
     local_dest.mkdir(parents=True, exist_ok=True)
 
-    # Build list of paths to include in the archive
+    # Build list of paths to include in the archive. IF_*.txt files now live
+    # inside the sim dir (moved there by the SLURM script post-run), so the
+    # single tar of remote_out_name covers everything.
     remote_dir = f'{REMOTE_PATH}/{remote_out_name}'
-    tar_paths = [remote_out_name]
-
-    # Also include IF_*.txt files if available
-    num_ranks = karolina_state.get('num_ranks')
-    if_pattern = ''
-    if num_ranks:
-        if_pattern = ' '.join(f'IF_{i}.txt' for i in range(num_ranks))
 
     # Get total uncompressed size for progress estimation
     size_cmd = f'du -sb {remote_dir} 2>/dev/null | cut -f1'
@@ -949,11 +992,8 @@ def download_results_streaming(remote_out_name, local_dest):
     yield {'type': 'progress', 'bytes_done': 0, 'bytes_total': bytes_total_estimate,
            'file': 'Creating archive...'}
 
-    # Build remote tar command: tar the sim directory + IF files, gzip, stream to stdout
+    # Build remote tar command: tar the sim directory, gzip, stream to stdout
     tar_cmd = f'cd {REMOTE_PATH} && tar czf - {remote_out_name}'
-    if if_pattern:
-        # Add IF files if they exist (ignore missing ones)
-        tar_cmd += f' {if_pattern} 2>/dev/null'
 
     # Stream tar.gz via SSH and extract locally
     archive_path = local_dest.parent / f'.{remote_out_name}.tar.gz'
@@ -1032,7 +1072,44 @@ def download_iterations(remote_out_name, local_dest):
 
 
 def list_remote_simulations():
-    """List simulation output directories on the remote machine."""
+    """List simulation output directories on the remote machine with conditions metadata.
+
+    Returns a list of dicts: {name, mesh, solver, preconditioner, localSolver, nRanks}.
+    Metadata fields are absent when conditions.json is missing or malformed.
+    """
+    # Run a Python one-liner on the remote to walk *_sim* dirs and emit a
+    # single JSON array of {name, ...conditions}. Cheaper than scp-ing each
+    # conditions.json and robust against multi-line pretty-printed JSON.
+    py = (
+        'import json,glob,os\n'
+        f'root = {REMOTE_PATH!r}\n'
+        'out = []\n'
+        "for d in sorted(glob.glob(root + '/*_sim*')):\n"
+        '    if not os.path.isdir(d): continue\n'
+        '    entry = {"name": os.path.basename(d)}\n'
+        "    cp = os.path.join(d, 'conditions.json')\n"
+        '    if os.path.exists(cp):\n'
+        '        try:\n'
+        '            with open(cp) as f: c = json.load(f)\n'
+        "            for k in ('mesh','solver','preconditioner','localSolver','nRanks'):\n"
+        '                if c.get(k) is not None: entry[k] = c.get(k)\n'
+        '        except Exception: pass\n'
+        '    out.append(entry)\n'
+        'print(json.dumps(out))\n'
+    )
+    cmd = f'python3 -c {_shell_quote(py)}'
+    try:
+        stdout, stderr, rc = _run_ssh(cmd, timeout=20)
+        if rc == 0 and stdout:
+            try:
+                return json.loads(stdout)
+            except json.JSONDecodeError:
+                # Fall through to the legacy bare-name listing below.
+                pass
+    except subprocess.TimeoutExpired:
+        pass
+
+    # Fallback: bare directory listing if the Python remote call failed.
     try:
         stdout, stderr, rc = _run_ssh(
             f'ls -d {REMOTE_PATH}/*_sim* 2>/dev/null || true',
@@ -1043,7 +1120,7 @@ def list_remote_simulations():
             for line in stdout.strip().split('\n'):
                 line = line.strip()
                 if line:
-                    dirs.append(Path(line).name)
+                    dirs.append({'name': Path(line).name})
             return dirs
     except subprocess.TimeoutExpired:
         pass

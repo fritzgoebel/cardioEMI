@@ -27,13 +27,19 @@ App.prototype.loadSimulationList = async function() {
                 const remoteResp = await fetch('/api/karolina/remote-simulations');
                 const remoteData = await remoteResp.json();
                 if (remoteData.simulations) {
-                    for (const name of remoteData.simulations) {
-                        if (!localNames.has(name)) {
-                            const option = document.createElement('option');
-                            option.value = name;
-                            option.textContent = name + ' (remote)';
-                            simSelector.appendChild(option);
-                        }
+                    for (const entry of remoteData.simulations) {
+                        // Backwards-compat: tolerate legacy bare-string entries.
+                        const sim = (typeof entry === 'string') ? { name: entry } : entry;
+                        if (!sim.name) continue;
+                        if (localNames.has(sim.name)) continue;
+                        const option = document.createElement('option');
+                        option.value = sim.name;
+                        const label = (sim.solver || sim.mesh)
+                            ? this.formatSimulationLabelInline(sim)
+                            : sim.name;
+                        option.textContent = label + ' (remote)';
+                        option.title = sim.name;
+                        simSelector.appendChild(option);
                     }
                 }
             } catch (e) {
@@ -49,6 +55,47 @@ App.prototype.loadSimulationList = async function() {
         this.updateCompareSelector();
     } catch (error) {
         console.error('Failed to load simulation list:', error);
+    }
+};
+
+App.prototype.deleteAllResults = async function() {
+    const first = window.confirm(
+        'Delete ALL simulation results?\n\n' +
+        'This wipes every local *_sim* directory, every viz/data cache, ' +
+        'AND every remote *_sim* directory on Karolina.\n\n' +
+        'This cannot be undone.'
+    );
+    if (!first) return;
+    const second = window.confirm('Really delete everything? Final confirmation.');
+    if (!second) return;
+
+    const btn = document.getElementById('delete-all-results');
+    const originalText = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Deleting...'; }
+    try {
+        const resp = await fetch('/api/simulations/delete_all', { method: 'POST' });
+        const result = await resp.json();
+        if (!resp.ok) {
+            alert('Delete failed: ' + (result.error || 'unknown error'));
+            return;
+        }
+        const summary = [
+            `Local removed: ${(result.removed_local || []).length}`,
+            `viz cache cleared: ${(result.viz_cleared || []).length}`,
+            `Remote cleared: ${result.remote_cleared ? 'yes' : 'no'}`,
+        ].join('  •  ');
+        if (result.errors && result.errors.length) {
+            console.warn('Partial delete failure:', result.errors);
+            alert(summary + '\n\nErrors:\n' + result.errors.join('\n'));
+        } else {
+            console.log('delete_all:', summary);
+        }
+        await this.loadSimulationList();
+        if (this.updateCompareSelector) await this.updateCompareSelector();
+    } catch (err) {
+        alert('Delete request failed: ' + err.message);
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = originalText; }
     }
 };
 

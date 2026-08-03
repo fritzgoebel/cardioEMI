@@ -398,6 +398,7 @@ def update_ginkgo_config():
         if bddc_config:
             bddc_dict = {
                 'local_solver': bddc_config.get('localSolver', 'direct'),
+                'reordering': bddc_config.get('reordering', 'none'),
                 'local_max_iterations': int(bddc_config.get('localMaxIterations', 100)),
                 'local_tolerance': float(bddc_config.get('localTolerance', 1e-12)),
                 'coarse_solver': bddc_config.get('coarseSolver', 'cg'),
@@ -408,6 +409,40 @@ def update_ginkgo_config():
                 'faces': bddc_config.get('faces', True),
                 'repartition_coarse': bddc_config.get('repartitionCoarse', True)
             }
+            # Inner (interior A_II) solver: only emit when explicitly chosen;
+            # omitting it makes the inner solve reuse local_solver (Ginkgo default).
+            inner_solver = bddc_config.get('innerSolver')
+            if inner_solver:
+                bddc_dict['inner_solver'] = inner_solver
+                bddc_dict['inner_max_iterations'] = int(bddc_config.get('innerMaxIterations', 100))
+                bddc_dict['inner_tolerance'] = float(bddc_config.get('innerTolerance', 1e-12))
+                inner_amg_config = bddc_config.get('innerAmg', {})
+                if inner_amg_config:
+                    bddc_dict['inner_amg'] = {
+                        'coarsening': inner_amg_config.get('coarsening', 'pgm'),
+                        'strength_threshold': float(inner_amg_config.get('strengthThreshold', 0.25)),
+                        'cycle': inner_amg_config.get('cycle', 'v'),
+                        'smoother': inner_amg_config.get('smoother', 'jacobi'),
+                        'smooth_steps': int(inner_amg_config.get('smoothSteps', 1)),
+                        'max_levels': int(inner_amg_config.get('maxLevels', 10)),
+                        'coarse_solver': inner_amg_config.get('coarseSolver', 'direct'),
+                        'relaxation_factor': float(inner_amg_config.get('relaxationFactor', 0.9))
+                    }
+                inner_hypre_config = bddc_config.get('innerHypre', {})
+                if inner_hypre_config:
+                    bddc_dict['inner_hypre'] = {
+                        'cycle_type': int(inner_hypre_config.get('cycleType', 1)),
+                        'coarsening_type': int(inner_hypre_config.get('coarseningType', 10)),
+                        'strength_threshold': float(inner_hypre_config.get('strengthThreshold', 0.25)),
+                        'smoother_type': int(inner_hypre_config.get('smootherType', 6)),
+                        'num_sweeps': int(inner_hypre_config.get('numSweeps', 1)),
+                        'interpolation_type': int(inner_hypre_config.get('interpolationType', 0)),
+                        'max_levels': int(inner_hypre_config.get('maxLevels', 25)),
+                        'coarse_smoother_type': int(inner_hypre_config.get('coarseSmootherType', 9)),
+                        'relax_order': int(inner_hypre_config.get('relaxOrder', 1)),
+                        'max_coarse_size': int(inner_hypre_config.get('maxCoarseSize', 64)),
+                        'print_level': int(inner_hypre_config.get('printLevel', 1))
+                    }
 
             # Add local AMG config if present
             local_amg_config = bddc_config.get('localAmg', {})
@@ -433,7 +468,11 @@ def update_ginkgo_config():
                     'smoother_type': int(local_hypre_config.get('smootherType', 6)),
                     'num_sweeps': int(local_hypre_config.get('numSweeps', 1)),
                     'interpolation_type': int(local_hypre_config.get('interpolationType', 0)),
-                    'max_levels': int(local_hypre_config.get('maxLevels', 25))
+                    'max_levels': int(local_hypre_config.get('maxLevels', 25)),
+                    'coarse_smoother_type': int(local_hypre_config.get('coarseSmootherType', 9)),
+                    'relax_order': int(local_hypre_config.get('relaxOrder', 1)),
+                    'max_coarse_size': int(local_hypre_config.get('maxCoarseSize', 64)),
+                    'print_level': int(local_hypre_config.get('printLevel', 1))
                 }
 
             ginkgo_dict['bddc'] = bddc_dict
@@ -707,6 +746,144 @@ def get_current_mesh():
         'metadata': metadata
     })
 
+# --------------------- Weak-scaling meshes ---------------------
+
+# Canonical name: plus_<nx>x<ny>x<nz>_n<n>_L<L>[_p<pad>]  (L: '.' -> 'p';
+# trailing _p<pad> present only when pad > 0, so legacy unpadded names still parse)
+WS_NAME_RE = re.compile(r'^plus_(\d+)x(\d+)x(\d+)_n(\d+)_L([0-9p]+?)(?:_p(\d+))?$')
+
+
+def weak_scaling_name(nx, ny, nz, n, L, pad=0):
+    Ls = ('%g' % L).replace('.', 'p')
+    name = f'plus_{nx}x{ny}x{nz}_n{n}_L{Ls}'
+    if pad:
+        name += f'_p{pad}'
+    return name
+
+
+def parse_weak_scaling_name(name):
+    m = WS_NAME_RE.match(name)
+    if not m:
+        return None
+    return {
+        'name': name,
+        'nx': int(m.group(1)), 'ny': int(m.group(2)), 'nz': int(m.group(3)),
+        'n': int(m.group(4)), 'L': float(m.group(5).replace('p', '.')),
+        'pad': int(m.group(6)) if m.group(6) else 0,
+    }
+
+
+@app.route('/api/weak-scaling/list')
+def weak_scaling_list():
+    """List already-generated weak-scaling (3D-plus) meshes."""
+    data_dir = PROJECT_ROOT / 'data'
+    viz_data_dir = Path(__file__).parent / 'data'
+
+    items = []
+    for h5_file in sorted(data_dir.glob('plus_*_n*_L*.h5')):
+        info = parse_weak_scaling_name(h5_file.stem)
+        if not info:
+            continue
+        info['converted'] = (viz_data_dir / h5_file.stem / 'mesh_metadata.json').exists()
+        info['size'] = h5_file.stat().st_size
+        items.append(info)
+
+    return jsonify({
+        'meshes': items,
+        'defaults': {'n': 16, 'L': 25.0, 'pad': 4},
+    })
+
+
+@app.route('/api/weak-scaling/generate', methods=['POST'])
+def weak_scaling_generate():
+    """Generate (or reuse) a weak-scaling mesh, then convert it for the viewer.
+
+    Streams SSE progress. On completion the frontend selects the mesh.
+    """
+    data = request.json or {}
+    try:
+        nx = int(data['nx']); ny = int(data['ny']); nz = int(data['nz'])
+        n = int(data.get('n', 16)); L = float(data.get('L', 25.0))
+        pad = int(data.get('pad', 4))
+    except (KeyError, ValueError, TypeError) as e:
+        return jsonify({'error': f'Invalid parameters: {e}'}), 400
+
+    if min(nx, ny, nz) < 1 or n < 4 or n % 4 != 0 or L <= 0 or pad < 0:
+        return jsonify({'error': 'Require nx,ny,nz >= 1, n a multiple of 4 (>=4), L > 0, pad >= 0'}), 400
+
+    name = weak_scaling_name(nx, ny, nz, n, L, pad)
+
+    def generate():
+        if mesh_state['converting']:
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Another mesh operation is in progress'})}\n\n"
+            return
+
+        mesh_state['converting'] = True
+        try:
+            import sys
+            h5_path = PROJECT_ROOT / 'data' / f'{name}.h5'
+            prefix = PROJECT_ROOT / 'data' / name
+
+            # --- 1. Generate mesh if it does not already exist ---
+            if h5_path.exists():
+                yield f"data: {json.dumps({'type': 'progress', 'percent': 55, 'message': f'Reusing existing mesh {name}'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'progress', 'percent': 5, 'message': f'Generating {name} ({nx}x{ny}x{nz} cubes)...'})}\n\n"
+                cmd = [
+                    sys.executable,
+                    str(PROJECT_ROOT / 'geometry' / 'generate_weak_scaling_mesh.py'),
+                    '--nx', str(nx), '--ny', str(ny), '--nz', str(nz),
+                    '--n', str(n), '--L', str(L), '--pad', str(pad),
+                    '--prefix', str(prefix),
+                ]
+                proc = subprocess.Popen(
+                    cmd, cwd=str(PROJECT_ROOT),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        yield f"data: {json.dumps({'type': 'progress', 'percent': 40, 'message': line})}\n\n"
+                proc.wait()
+                if proc.returncode != 0 or not h5_path.exists():
+                    yield f"data: {json.dumps({'type': 'error', 'message': f'Mesh generation failed (exit {proc.returncode})'})}\n\n"
+                    return
+
+            # --- 2. Convert for the viewer (skip if already done) ---
+            output_dir = Path(__file__).parent / 'data' / name
+            if (output_dir / 'mesh_metadata.json').exists():
+                yield f"data: {json.dumps({'type': 'progress', 'percent': 90, 'message': 'Visualization already converted'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'progress', 'percent': 70, 'message': 'Converting for visualization...'})}\n\n"
+                sys.path.insert(0, str(Path(__file__).parent / 'scripts'))
+                from convert_hdf5 import convert_mesh
+                convert_mesh(h5_path, output_dir)
+
+            # --- 3. Ensure a matching config exists ---
+            cfg = find_config_for_mesh(name)
+            if not cfg:
+                base = 'input_plus_weak_scaling.yml'
+                base = base if (PROJECT_ROOT / base).exists() else None
+                cfg = create_config_for_mesh(name, base_config=base)
+
+            yield f"data: {json.dumps({'type': 'progress', 'percent': 100, 'message': 'Ready!'})}\n\n"
+            yield f"data: {json.dumps({'type': 'complete', 'success': True, 'name': name, 'configFile': cfg})}\n\n"
+
+        except Exception as e:
+            import traceback
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e), 'traceback': traceback.format_exc()})}\n\n"
+        finally:
+            mesh_state['converting'] = False
+
+    return Response(
+        generate(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+        },
+    )
+
 # --------------------- Simulation API ---------------------
 
 @app.route('/api/simulation/run')
@@ -722,10 +899,12 @@ def run_simulation():
 
     # Check config file for solver backend to determine Docker image
     config_path = PROJECT_ROOT / config_file
+    sim_out_name = None
     try:
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f) or {}
         solver_backend = config.get('solver_backend', 'petsc').lower()
+        sim_out_name = (config.get('out_name') or '').strip().lstrip('_') or None
     except:
         solver_backend = 'petsc'
 
@@ -745,9 +924,13 @@ def run_simulation():
 
         simulation_state['running'] = True
 
-        # Clean up old interface files to prevent stale data from previous runs
+        # Clean up stray IF files at the project root (older runs left them there).
+        # Per-sim IF files now live inside each simulation's output dir.
         for old_if in PROJECT_ROOT.glob('IF_*.txt'):
-            old_if.unlink()
+            try:
+                old_if.unlink()
+            except OSError:
+                pass
 
         docker_cmd = [
             'docker', 'run', '--rm', '-t',
@@ -805,6 +988,18 @@ def run_simulation():
             process.wait()
 
             success = process.returncode == 0
+
+            # Move any IF_*.txt files produced by the BDDC solver into the
+            # simulation output dir so each run keeps its own partition data.
+            if sim_out_name:
+                target_dir = PROJECT_ROOT / sim_out_name
+                if target_dir.is_dir():
+                    for if_file in PROJECT_ROOT.glob('IF_*.txt'):
+                        try:
+                            if_file.replace(target_dir / if_file.name)
+                        except OSError as exc:
+                            print(f"Warning: could not move {if_file} into {target_dir}: {exc}")
+
             yield f"data: {json.dumps({'type': 'complete', 'success': success, 'returncode': process.returncode})}\n\n"
 
         except Exception as e:
@@ -934,6 +1129,92 @@ def list_simulations_with_iterations():
                 })
     return jsonify({
         'simulations': sorted(simulations, key=lambda x: x['name'])
+    })
+
+
+@app.route('/api/simulations/delete_by_mesh', methods=['POST'])
+def delete_simulations_by_mesh():
+    """Delete every local *_sim* output for the given mesh, plus its viz/data caches."""
+    import shutil
+    data = request.json or {}
+    mesh = (data.get('mesh') or '').strip()
+    if not mesh or not re.fullmatch(r'[A-Za-z0-9_.\-]+', mesh):
+        return jsonify({'error': 'invalid or missing mesh name'}), 400
+
+    viz_data_root = Path(__file__).parent / 'data'
+    removed = []
+    errors = []
+    for item in PROJECT_ROOT.iterdir():
+        if not item.is_dir():
+            continue
+        if not item.name.startswith(f'{mesh}_sim'):
+            continue
+        try:
+            shutil.rmtree(item)
+            removed.append(item.name)
+        except OSError as exc:
+            errors.append(f'{item.name}: {exc}')
+        viz_cache = viz_data_root / item.name
+        if viz_cache.exists():
+            try:
+                shutil.rmtree(viz_cache)
+            except OSError as exc:
+                errors.append(f'viz/data/{item.name}: {exc}')
+
+    return jsonify({'removed': removed, 'errors': errors})
+
+
+@app.route('/api/simulations/delete_all', methods=['POST'])
+def delete_all_simulations():
+    """Wipe every local sim dir, the viz/data cache, and every remote sim dir."""
+    import shutil
+    removed_local = []
+    errors = []
+
+    # 1. Local sim dirs
+    for item in PROJECT_ROOT.iterdir():
+        if item.is_dir() and '_sim' in item.name:
+            try:
+                shutil.rmtree(item)
+                removed_local.append(item.name)
+            except OSError as exc:
+                errors.append(f'local {item.name}: {exc}')
+
+    # 2. viz/data/* (regenerable cache)
+    viz_data_root = Path(__file__).parent / 'data'
+    viz_cleared = []
+    if viz_data_root.exists():
+        for child in viz_data_root.iterdir():
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+                viz_cleared.append(child.name)
+            except OSError as exc:
+                errors.append(f'viz/data/{child.name}: {exc}')
+
+    # 3. Remote sim dirs (best-effort, only if Karolina backend is available)
+    remote_cleared = False
+    try:
+        from karolina import _run_ssh, REMOTE_PATH
+        # Glob is built server-side; no user input flows into the SSH command.
+        _, ssh_err, rc = _run_ssh(
+            f'rm -rf -- {REMOTE_PATH}/*_sim*',
+            timeout=60,
+        )
+        if rc == 0:
+            remote_cleared = True
+        else:
+            errors.append(f'remote rm: {ssh_err}')
+    except Exception as exc:
+        errors.append(f'remote rm: {exc}')
+
+    return jsonify({
+        'removed_local': removed_local,
+        'viz_cleared': viz_cleared,
+        'remote_cleared': remote_cleared,
+        'errors': errors,
     })
 
 # --------------------- Viz Generation API ---------------------
@@ -1656,48 +1937,81 @@ def slice_cross_section():
 
 @app.route('/api/interfaces')
 def get_interfaces():
-    """Load BDDC interface data from IF_*.txt files and map to mesh vertices."""
+    """Load BDDC interface data from IF_*.txt files and map to mesh vertices.
+
+    Optional ?sim=<name> query parameter selects a specific simulation directory.
+    When provided, IF_*.txt and matrix_to_vertex.pickle are read from there. When
+    absent, falls back to the most recently modified _sim directory (and project
+    root for stray IF files from older runs).
+    """
     import pickle
 
-    interfaces = {}
+    sim_name = request.args.get('sim') or None
+    if sim_name and not re.fullmatch(r'[A-Za-z0-9_.\-]+', sim_name):
+        return jsonify({'error': 'invalid sim name'}), 400
 
-    # Find all IF_*.txt files in project root
-    for if_file in PROJECT_ROOT.glob('IF_*.txt'):
-        try:
-            rank = int(if_file.stem.split('_')[1])
-            with open(if_file, 'r') as f:
-                content = f.read().strip()
-                if content:
-                    # Each line is one interface (space-separated DOF indices)
-                    rank_interfaces = []
-                    for line in content.split('\n'):
-                        line = line.strip()
-                        if line:
-                            indices = [int(x) for x in line.split()]
-                            if indices:
-                                rank_interfaces.append(indices)
-                    interfaces[rank] = rank_interfaces
-        except (ValueError, IOError) as e:
-            print(f"Warning: Could not parse {if_file}: {e}")
+    # Resolve where to look for IF_*.txt files
+    if sim_name:
+        sim_dir = PROJECT_ROOT / sim_name
+        if_search_paths = [sim_dir]
+    else:
+        # Backwards-compat: fall back to project root (older runs left files there)
+        # plus the most recent sim dir.
+        if_search_paths = [PROJECT_ROOT]
+        sim_dir = None
+        recent = sorted(
+            [d for d in PROJECT_ROOT.glob('*_sim*') if d.is_dir()],
+            key=lambda d: d.stat().st_mtime,
+            reverse=True,
+        )
+        if recent:
+            sim_dir = recent[0]
+            if_search_paths.insert(0, sim_dir)
+
+    interfaces = {}
+    for base in if_search_paths:
+        if not base.exists():
             continue
+        for if_file in base.glob('IF_*.txt'):
+            try:
+                rank = int(if_file.stem.split('_')[1])
+                if rank in interfaces:
+                    continue  # already loaded from a higher-priority path
+                with open(if_file, 'r') as f:
+                    content = f.read().strip()
+                    if content:
+                        rank_interfaces = []
+                        for line in content.split('\n'):
+                            line = line.strip()
+                            if line:
+                                indices = [int(x) for x in line.split()]
+                                if indices:
+                                    rank_interfaces.append(indices)
+                        interfaces[rank] = rank_interfaces
+            except (ValueError, IOError) as e:
+                print(f"Warning: Could not parse {if_file}: {e}")
+                continue
+        if interfaces:
+            break  # stop at first path with IF files
 
     if not interfaces:
         return jsonify({'interfaces': {}, 'numRanks': 0, 'message': 'No interface files found'})
 
     num_ranks = max(interfaces.keys()) + 1
 
-    # Load matrix-to-vertex mapping from the most recent simulation
-    # The mapping depends on MPI rank count (rank-major DOF ordering), so it must
-    # come from the same simulation run that produced the IF_*.txt files.
-    # Use the most recently modified *_sim directory to match the current IF files.
+    # Load matrix-to-vertex mapping from the selected (or most recent) sim dir.
     matrix_to_vertex = None
-    sim_dirs = sorted(
-        [d for d in PROJECT_ROOT.glob('*_sim*') if d.is_dir() and (d / 'matrix_to_vertex.pickle').exists()],
-        key=lambda d: (d / 'matrix_to_vertex.pickle').stat().st_mtime,
-        reverse=True
-    )
-    if sim_dirs:
-        mapping_file = sim_dirs[0] / 'matrix_to_vertex.pickle'
+    if sim_dir is None:
+        # Fallback discovery (e.g. when ?sim not given and we found IF at root)
+        sim_dirs = sorted(
+            [d for d in PROJECT_ROOT.glob('*_sim*') if d.is_dir() and (d / 'matrix_to_vertex.pickle').exists()],
+            key=lambda d: (d / 'matrix_to_vertex.pickle').stat().st_mtime,
+            reverse=True
+        )
+        if sim_dirs:
+            sim_dir = sim_dirs[0]
+    if sim_dir and (sim_dir / 'matrix_to_vertex.pickle').exists():
+        mapping_file = sim_dir / 'matrix_to_vertex.pickle'
         try:
             with open(mapping_file, 'rb') as f:
                 matrix_to_vertex = pickle.load(f)
@@ -1707,73 +2021,87 @@ def get_interfaces():
 
     # Convert interface DOF indices to mesh vertex indices
     interface_vertices = {}
+    interface_info = {}  # rank -> [{'ranks': [...], 'type': ...}, ...]
     all_interface_vertices = set()
 
-    # Track DOF classifications for BDDC interface types:
-    # - vertex: single-DOF interfaces (size 1)
-    # - face: DOFs shared between exactly 2 partitions
-    # - edge: DOFs in interfaces of size > 1 shared between 3+ partitions
-    dof_to_ranks = {}  # DOF -> set of ranks that have this DOF
-    dofs_in_size1_interfaces = set()  # DOFs that appear in any size-1 interface
+    # Track BDDC interface classification keyed on the global MATRIX DOF (not the
+    # mesh vertex): in EMI a single mesh vertex can host several matrix DOFs
+    # (different function spaces), so keying on the vertex merges distinct primal
+    # DOFs and mis-classifies them. IF_*.txt stores global matrix indices, so the
+    # same index across ranks is the same DOF.
+    # - face:   DOF shared by exactly 2 subdomains
+    # - vertex: DOF shared by 3+ subdomains AND appearing as a size-1 (corner) interface
+    # - edge:   DOF shared by 3+ subdomains only inside multi-DOF interfaces
+    dof_to_ranks = {}  # matrix DOF -> set of ranks that have this DOF
+    dofs_in_size1_interfaces = set()  # matrix DOFs that appear in any size-1 interface
+    dof_types_by_vertex = {}  # mesh vertex -> 'vertex'|'edge'|'face' (for point styling)
 
     if matrix_to_vertex:
-        # First pass: collect DOF sharing info and identify size-1 interfaces
+        # First pass: per-DOF sharing info + size-1 membership (over all DOFs,
+        # whether or not they have a vertex mapping).
         for rank, rank_interfaces in interfaces.items():
             for interface in rank_interfaces:
-                interface_size = len(interface)
+                size1 = (len(interface) == 1)
                 for dof in interface:
-                    if dof in matrix_to_vertex:
-                        vertex = matrix_to_vertex[dof]
-                        if vertex not in dof_to_ranks:
-                            dof_to_ranks[vertex] = set()
-                        dof_to_ranks[vertex].add(rank)
-                        if interface_size == 1:
-                            dofs_in_size1_interfaces.add(vertex)
+                    dof_to_ranks.setdefault(dof, set()).add(rank)
+                    if size1:
+                        dofs_in_size1_interfaces.add(dof)
 
-        # Classify each DOF based on number of sharing partitions:
-        # - face: shared by exactly 2 partitions (regardless of interface size)
-        # - vertex: shared by 3+ partitions AND appears in a size-1 interface
-        # - edge: shared by 3+ partitions AND only in multi-DOF interfaces
-        dof_types = {}  # vertex_index -> 'vertex' | 'edge' | 'face'
-        for vertex, ranks in dof_to_ranks.items():
-            num_ranks = len(ranks)
-            if num_ranks == 2:
-                dof_types[vertex] = 'face'
-            elif vertex in dofs_in_size1_interfaces:
-                dof_types[vertex] = 'vertex'
-            else:
-                dof_types[vertex] = 'edge'
+        # Classify each matrix DOF.
+        def _classify(dof):
+            if len(dof_to_ranks[dof]) == 2:
+                return 'face'
+            return 'vertex' if dof in dofs_in_size1_interfaces else 'edge'
+        dof_types = {dof: _classify(dof) for dof in dof_to_ranks}
 
-        # Second pass: build interface_vertices structure
+        # Second pass: build interface_vertices (DOF->vertex, for 3D rendering)
+        # and per-interface metadata. interface_info[rank][i] = {'ranks', 'type'}
+        # aligned 1:1 with interface_vertices[rank][i]; the sharing rank-set and
+        # type are the mode over the line's matrix DOFs (a clean BDDC equivalence
+        # class is uniform; the mode tolerates stray DOFs).
+        from collections import Counter
         for rank, rank_interfaces in interfaces.items():
             rank_vertex_interfaces = []
+            rank_interface_info = []
             for interface in rank_interfaces:
-                vertex_indices = []
-                for dof in interface:
-                    if dof in matrix_to_vertex:
-                        vertex_indices.append(matrix_to_vertex[dof])
-                if vertex_indices:
-                    rank_vertex_interfaces.append(vertex_indices)
-                    all_interface_vertices.update(vertex_indices)
+                vertex_indices = [matrix_to_vertex[d] for d in interface if d in matrix_to_vertex]
+                if not vertex_indices:
+                    continue
+                rank_vertex_interfaces.append(vertex_indices)
+                all_interface_vertices.update(vertex_indices)
+                shared_ranks = sorted(
+                    Counter(frozenset(dof_to_ranks[d]) for d in interface).most_common(1)[0][0])
+                itype = Counter(dof_types[d] for d in interface).most_common(1)[0][0]
+                rank_interface_info.append({'ranks': shared_ranks, 'type': itype})
             interface_vertices[rank] = rank_vertex_interfaces
+            interface_info[rank] = rank_interface_info
 
-        # Count DOFs by type
+        # Project per-DOF types onto mesh vertices for the viewer's point styling
+        # (a vertex is drawn as a corner if ANY of its DOFs is a vertex DOF):
+        # precedence vertex > edge > face.
+        _prec = {'vertex': 3, 'edge': 2, 'face': 1}
+        for dof, t in dof_types.items():
+            if dof in matrix_to_vertex:
+                v = matrix_to_vertex[dof]
+                if v not in dof_types_by_vertex or _prec[t] > _prec[dof_types_by_vertex[v]]:
+                    dof_types_by_vertex[v] = t
+
         type_counts = {'vertex': 0, 'edge': 0, 'face': 0}
-        for dof_type in dof_types.values():
-            type_counts[dof_type] += 1
-        print(f"Interface DOF types: {type_counts['vertex']} vertices, {type_counts['edge']} edges, {type_counts['face']} faces")
+        for t in dof_types.values():
+            type_counts[t] += 1
+        print(f"Interface DOF types (per matrix DOF): {type_counts['vertex']} vertices, {type_counts['edge']} edges, {type_counts['face']} faces")
     else:
         # No mapping available - return empty
         print("Warning: No matrix_to_vertex.pickle found - interface visualization won't work")
-        dof_types = {}
 
     return jsonify({
         'interfaces': interface_vertices,  # Now contains mesh vertex indices
+        'interfaceInfo': interface_info,   # per-interface {ranks, type}, aligned with interfaces
         'numRanks': num_ranks,
         'allInterfaceVertices': sorted(list(all_interface_vertices)),
         'totalInterfaces': sum(len(v) for v in interface_vertices.values()),
         'hasMappingFile': matrix_to_vertex is not None,
-        'dofTypes': dof_types  # vertex_index -> 'vertex' | 'edge' | 'face'
+        'dofTypes': dof_types_by_vertex  # vertex_index -> 'vertex' | 'edge' | 'face'
     })
 
 # --------------------- Video Export API ---------------------
@@ -2007,7 +2335,7 @@ try:
         download_results_streaming, download_iterations,
         list_remote_simulations,
         list_remote_meshes, fetch_mesh_metadata,
-        convert_remote_mesh, finish_conversion,
+        convert_remote_mesh, generate_remote_weak_scaling_mesh, finish_conversion,
         download_mesh_data,
         generate_remote_video, check_video_job, download_video,
         generate_remote_viz, check_viz_job, download_viz_data_streaming
@@ -2021,7 +2349,7 @@ except ImportError:
         download_results_streaming, download_iterations,
         list_remote_simulations,
         list_remote_meshes, fetch_mesh_metadata,
-        convert_remote_mesh, finish_conversion,
+        convert_remote_mesh, generate_remote_weak_scaling_mesh, finish_conversion,
         download_mesh_data,
         generate_remote_video, check_video_job, download_video,
         generate_remote_viz, check_viz_job, download_viz_data_streaming
@@ -2304,6 +2632,58 @@ def karolina_download_mesh():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/karolina/weak-scaling/generate', methods=['POST'])
+def karolina_weak_scaling_generate():
+    """Generate (or reuse) a weak-scaling mesh on Karolina (SSE stream).
+
+    The mesh is created in Karolina's data/ directory, so it subsequently
+    appears in the remote mesh list and can be run there.
+    """
+    data = request.json or {}
+    try:
+        nx = int(data['nx']); ny = int(data['ny']); nz = int(data['nz'])
+        n = int(data.get('n', 16)); L = float(data.get('L', 25.0))
+        pad = int(data.get('pad', 4))
+    except (KeyError, ValueError, TypeError) as e:
+        return jsonify({'error': f'Invalid parameters: {e}'}), 400
+
+    if min(nx, ny, nz) < 1 or n < 4 or n % 4 != 0 or L <= 0 or pad < 0:
+        return jsonify({'error': 'Require nx,ny,nz >= 1, n a multiple of 4 (>=4), L > 0, pad >= 0'}), 400
+
+    name = weak_scaling_name(nx, ny, nz, n, L, pad)
+
+    def generate():
+        try:
+            yield f"data: {json.dumps({'type': 'output', 'text': f'Generating {name} on Karolina ({nx}x{ny}x{nz} cubes, pad {pad})...\\n'})}\n\n"
+
+            process = generate_remote_weak_scaling_mesh(nx, ny, nz, n, L, pad, name)
+
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    yield f"data: {json.dumps({'type': 'output', 'text': line})}\n\n"
+
+            process.wait()
+            finish_conversion()
+
+            if process.returncode == 0:
+                yield f"data: {json.dumps({'type': 'complete', 'success': True, 'name': name})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'error', 'message': f'Generation failed with exit code {process.returncode}'})}\n\n"
+
+        except Exception as e:
+            finish_conversion()
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return Response(
+        generate(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no'
+        }
+    )
 
 # --------------------- Remote Video API ---------------------
 

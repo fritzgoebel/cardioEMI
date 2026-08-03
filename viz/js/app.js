@@ -89,6 +89,7 @@ class App {
         try {
             // Setup mesh selector first (before loading mesh)
             await this.setupMeshSelector();
+            this.setupWeakScaling();
 
             // Load mesh data using current mesh
             const meshData = await this.meshLoader.load();

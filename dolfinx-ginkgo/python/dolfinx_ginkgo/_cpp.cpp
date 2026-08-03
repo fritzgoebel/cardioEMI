@@ -177,6 +177,11 @@ NB_MODULE(_cpp, m) {
         .value("DELUXE", BDDCConfig::Scaling::DELUXE)
         .export_values();
 
+    nb::enum_<BDDCConfig::Reordering>(bddc_config, "Reordering", "Fill-reducing reordering of local matrices")
+        .value("NONE", BDDCConfig::Reordering::NONE)
+        .value("AMD", BDDCConfig::Reordering::AMD)
+        .export_values();
+
     nb::enum_<BDDCConfig::LocalSolver>(bddc_config, "LocalSolver", "Local subdomain solver")
         .value("DIRECT", BDDCConfig::LocalSolver::DIRECT)
         .value("DIRECT_LU", BDDCConfig::LocalSolver::DIRECT_LU)
@@ -190,6 +195,7 @@ NB_MODULE(_cpp, m) {
         .value("CG", BDDCConfig::CoarseSolver::CG)
         .value("GMRES", BDDCConfig::CoarseSolver::GMRES)
         .value("BDDC", BDDCConfig::CoarseSolver::BDDC)
+        .value("SCHWARZ", BDDCConfig::CoarseSolver::SCHWARZ)
         .export_values();
 
     // Local AMG configuration (nested in BDDCConfig)
@@ -244,7 +250,11 @@ NB_MODULE(_cpp, m) {
         .def_rw("smoother_type", &BDDCConfig::LocalHypreConfig::smoother_type)
         .def_rw("num_sweeps", &BDDCConfig::LocalHypreConfig::num_sweeps)
         .def_rw("interpolation_type", &BDDCConfig::LocalHypreConfig::interpolation_type)
-        .def_rw("max_levels", &BDDCConfig::LocalHypreConfig::max_levels);
+        .def_rw("max_levels", &BDDCConfig::LocalHypreConfig::max_levels)
+        .def_rw("coarse_smoother_type", &BDDCConfig::LocalHypreConfig::coarse_smoother_type)
+        .def_rw("relax_order", &BDDCConfig::LocalHypreConfig::relax_order)
+        .def_rw("max_coarse_size", &BDDCConfig::LocalHypreConfig::max_coarse_size)
+        .def_rw("print_level", &BDDCConfig::LocalHypreConfig::print_level);
 
     bddc_config
         .def(nb::init<>())
@@ -252,11 +262,18 @@ NB_MODULE(_cpp, m) {
         .def_rw("edges", &BDDCConfig::edges)
         .def_rw("faces", &BDDCConfig::faces)
         .def_rw("scaling", &BDDCConfig::scaling)
+        .def_rw("reordering", &BDDCConfig::reordering)
         .def_rw("local_solver", &BDDCConfig::local_solver)
+        .def_rw("inner_solver", &BDDCConfig::inner_solver)
+        .def_rw("override_inner_solver", &BDDCConfig::override_inner_solver)
+        .def_rw("inner_max_iterations", &BDDCConfig::inner_max_iterations)
+        .def_rw("inner_tolerance", &BDDCConfig::inner_tolerance)
         .def_rw("local_max_iterations", &BDDCConfig::local_max_iterations)
         .def_rw("local_tolerance", &BDDCConfig::local_tolerance)
         .def_rw("local_amg", &BDDCConfig::local_amg)
+        .def_rw("inner_amg", &BDDCConfig::inner_amg)
         .def_rw("local_hypre", &BDDCConfig::local_hypre)
+        .def_rw("inner_hypre", &BDDCConfig::inner_hypre)
         .def_rw("coarse_solver", &BDDCConfig::coarse_solver)
         .def_rw("coarse_max_iterations", &BDDCConfig::coarse_max_iterations)
         .def_rw("coarse_tolerance", &BDDCConfig::coarse_tolerance)
@@ -501,6 +518,91 @@ NB_MODULE(_cpp, m) {
           nb::arg("local_values"), nb::arg("global_size"),
           "Create Ginkgo distributed vector from local numpy array");
 
+    m.def("hypre_apply_local",
+          [](std::shared_ptr<gko::Executor> exec,
+             nb::ndarray<std::int32_t, nb::ndim<1>, nb::c_contig> rows,
+             nb::ndarray<std::int32_t, nb::ndim<1>, nb::c_contig> cols,
+             nb::ndarray<double, nb::ndim<1>, nb::c_contig> vals,
+             std::int64_t n,
+             nb::ndarray<double, nb::ndim<1>, nb::c_contig> b, int cycle_type,
+             int coarsening_type, double strength_threshold, int smoother_type,
+             int num_sweeps, int interpolation_type, int max_levels,
+             int coarse_smoother_type, int relax_order, int max_coarse_size,
+             int print_level) {
+#if GKO_HAVE_HYPRE
+              // Debugging aid: apply the same HypreBoomerAmg wrapper that
+              // BDDC uses for local/inner solves to an arbitrary local matrix.
+              using csr = gko::matrix::Csr<double, std::int32_t>;
+              gko::matrix_data<double, std::int32_t> data(
+                  gko::dim<2>{static_cast<gko::size_type>(n),
+                              static_cast<gko::size_type>(n)});
+              for (size_t i = 0; i < rows.size(); ++i) {
+                  data.nonzeros.emplace_back(rows(i), cols(i), vals(i));
+              }
+              data.sum_duplicates();
+              auto A = gko::share(csr::create(exec));
+              A->read(data);
+              auto solver =
+                  gko::experimental::solver::HypreBoomerAmg<double>::build()
+                      .with_cycle_type(cycle_type)
+                      .with_coarsening_type(coarsening_type)
+                      .with_strength_threshold(strength_threshold)
+                      .with_smoother_type(smoother_type)
+                      .with_num_sweeps(num_sweeps)
+                      .with_interpolation_type(interpolation_type)
+                      .with_max_levels(max_levels)
+                      .with_max_coarse_size(max_coarse_size)
+                      .with_relax_order(relax_order)
+                      .with_coarse_smoother_type(coarse_smoother_type)
+                      .with_print_level(print_level)
+                      .on(exec)
+                      ->generate(A);
+              auto b_vec = gko::matrix::Dense<double>::create(
+                  exec, gko::dim<2>{static_cast<gko::size_type>(n), 1});
+              std::copy_n(b.data(), n, b_vec->get_values());
+              auto x_vec = gko::matrix::Dense<double>::create(
+                  exec, gko::dim<2>{static_cast<gko::size_type>(n), 1});
+              x_vec->fill(0.0);
+              solver->apply(b_vec, x_vec);
+              double* out = new double[n];
+              std::copy_n(x_vec->get_const_values(), n, out);
+              nb::capsule owner(out, [](void* p) noexcept {
+                  delete[] static_cast<double*>(p);
+              });
+              return nb::ndarray<nb::numpy, double, nb::ndim<1>>(
+                  out, {static_cast<size_t>(n)}, owner);
+#else
+              throw std::runtime_error("Ginkgo built without Hypre support");
+#endif
+          },
+          nb::arg("exec"), nb::arg("rows"), nb::arg("cols"), nb::arg("vals"),
+          nb::arg("n"), nb::arg("b"), nb::arg("cycle_type") = 1,
+          nb::arg("coarsening_type") = 10,
+          nb::arg("strength_threshold") = 0.7, nb::arg("smoother_type") = 6,
+          nb::arg("num_sweeps") = 1, nb::arg("interpolation_type") = 0,
+          nb::arg("max_levels") = 25, nb::arg("coarse_smoother_type") = 9,
+          nb::arg("relax_order") = 1, nb::arg("max_coarse_size") = 64,
+          nb::arg("print_level") = 0,
+          "Apply one BoomerAMG solve (BDDC's hypre wrapper) to a local "
+          "matrix given as COO arrays; returns x");
+
+    m.def("get_local_values",
+          [](std::shared_ptr<GkoDistVector> vec) {
+              auto host_local = gko::matrix::Dense<double>::create(
+                  vec->get_executor()->get_master());
+              host_local->copy_from(vec->get_local_vector());
+              const auto n = static_cast<size_t>(host_local->get_size()[0]);
+              double* data = new double[n];
+              std::copy_n(host_local->get_const_values(), n, data);
+              nb::capsule owner(data, [](void* p) noexcept {
+                  delete[] static_cast<double*>(p);
+              });
+              return nb::ndarray<nb::numpy, double, nb::ndim<1>>(data, {n},
+                                                                 owner);
+          },
+          nb::arg("vec"),
+          "Copy the local part of a distributed vector to a numpy array");
+
     // =========================================================================
     // Distributed Solver
     // =========================================================================
@@ -533,6 +635,14 @@ NB_MODULE(_cpp, m) {
              },
              nb::arg("b"), nb::arg("x"),
              "Solve Ax = b")
+        .def("apply_preconditioner",
+             [](Solver& solver,
+                std::shared_ptr<gko_dist::Vector<double>> b,
+                std::shared_ptr<gko_dist::Vector<double>> x) {
+                 solver.apply_preconditioner(*b, *x);
+             },
+             nb::arg("b"), nb::arg("x"),
+             "Apply the preconditioner alone: x = M * b")
         .def("iterations", &Solver::iterations,
              "Get iteration count from last solve")
         .def("residual_norm", &Solver::residual_norm,

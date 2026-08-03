@@ -185,6 +185,42 @@ class KarolinaRunner {
         return { success: true };
     }
 
+    async generateWeakScaling(params, onOutput) {
+        const response = await fetch(`${this.apiBase}/weak-scaling/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params)
+        });
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let name = null;
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const text = decoder.decode(value);
+            for (const line of text.split('\n')) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(line.substring(6));
+                        if (data.type === 'output' && onOutput) {
+                            onOutput(data.text);
+                        } else if (data.type === 'complete') {
+                            name = data.name;
+                        } else if (data.type === 'error') {
+                            throw new Error(data.message);
+                        }
+                    } catch (e) {
+                        if (e.message && !e.message.includes('Unexpected end of JSON')) throw e;
+                    }
+                }
+            }
+        }
+        return { success: true, name };
+    }
+
     async fetchMeshMetadata(meshName) {
         const response = await fetch(`${this.apiBase}/meshes/metadata/${encodeURIComponent(meshName)}`);
         const data = await response.json();

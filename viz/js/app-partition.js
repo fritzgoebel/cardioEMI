@@ -18,6 +18,90 @@ App.prototype.onRankSelectionChange = function() {
     });
 
     this.viewer.setVisibleRanks(this.visibleRanks);
+    this.refreshInterfaceView();
+};
+
+// Decide whether the per-interface inspector panel is shown (exactly one
+// subdomain selected + interfaces on), (re)build it when the selected rank
+// changes, then refresh the 3D highlight.
+App.prototype.refreshInterfaceView = function() {
+    const panel = document.getElementById('interface-list-panel');
+    const selected = [...this.visibleRanks];
+
+    if (!this.interfaceData || !this.showInterfaces || selected.length !== 1) {
+        if (panel) panel.style.display = 'none';
+        this._panelRank = null;
+        this.updateInterfaceHighlight();
+        return;
+    }
+
+    const rank = selected[0];
+    if (this._panelRank !== rank) {
+        this.buildInterfacePanel(rank);
+        this._panelRank = rank;
+    }
+    if (panel) panel.style.display = 'block';
+    this.updateInterfaceHighlight();
+};
+
+// Build the three-column (Vertices / Edges / Faces) list of this rank's
+// interfaces, one toggle row per interface, labeled by the ranks sharing it.
+App.prototype.buildInterfacePanel = function(rank) {
+    const cols = {
+        vertex: document.getElementById('interface-col-vertex'),
+        edge: document.getElementById('interface-col-edge'),
+        face: document.getElementById('interface-col-face'),
+    };
+    Object.values(cols).forEach(c => { if (c) c.innerHTML = ''; });
+    document.getElementById('interface-list-rank').textContent = rank;
+
+    // All interfaces start enabled when the panel rank changes.
+    this.enabledInterfaces = new Set();
+    const info = (this.interfaceInfo && this.interfaceInfo[rank]) || [];
+    const counts = { vertex: 0, edge: 0, face: 0 };
+
+    info.forEach((iface, idx) => {
+        this.enabledInterfaces.add(idx);
+        const type = iface.type || 'face';
+        const col = cols[type];
+        if (!col) return;
+        counts[type]++;
+        const color = this.viewer.interfaceToColor(idx);
+        const rgb = `rgb(${Math.round(color.r*255)}, ${Math.round(color.g*255)}, ${Math.round(color.b*255)})`;
+        const label = (iface.ranks && iface.ranks.length)
+            ? `{${iface.ranks.join(',')}}` : '{?}';
+        const item = document.createElement('label');
+        item.className = 'interface-item';
+        item.title = `${type} shared by ranks ${label}`;
+        item.innerHTML = `
+            <input type="checkbox" data-idx="${idx}" checked>
+            <span class="interface-swatch" style="background-color: ${rgb}"></span>
+            <span>${label}</span>
+        `;
+        item.querySelector('input').addEventListener('change', (e) => {
+            const i = parseInt(e.target.dataset.idx);
+            if (e.target.checked) this.enabledInterfaces.add(i);
+            else this.enabledInterfaces.delete(i);
+            this.updateInterfaceHighlight();
+        });
+        col.appendChild(item);
+    });
+
+    for (const [type, col] of Object.entries(cols)) {
+        if (col && counts[type] === 0) {
+            col.innerHTML = '<span class="interface-item-empty">none</span>';
+        }
+    }
+};
+
+// Toggle every interface row in the panel on/off.
+App.prototype.setAllInterfaces = function(enable) {
+    const boxes = document.querySelectorAll('#interface-list-columns input[type="checkbox"]');
+    this.enabledInterfaces = new Set();
+    boxes.forEach(b => {
+        b.checked = enable;
+        if (enable) this.enabledInterfaces.add(parseInt(b.dataset.idx));
+    });
     this.updateInterfaceHighlight();
 };
 
@@ -28,6 +112,31 @@ App.prototype.updateInterfaceHighlight = function() {
     }
 
     const interfaceMap = new Map();
+    const selected = [...this.visibleRanks];
+
+    // Single-subdomain mode: highlight only the interfaces enabled in the panel
+    // (still respecting the column-level Vertices/Edges/Faces master toggles).
+    // Each interface keeps its own colour index so it matches its panel swatch.
+    if (selected.length === 1 && this.interfaceInfo && this._panelRank === selected[0]) {
+        const rank = selected[0];
+        const rankInterfaces = this.interfaceData[rank] || [];
+        const info = this.interfaceInfo[rank] || [];
+        rankInterfaces.forEach((interfaceList, idx) => {
+            if (!this.enabledInterfaces || !this.enabledInterfaces.has(idx)) return;
+            const type = (info[idx] && info[idx].type) || 'face';
+            if (type === 'vertex' && !this.showInterfaceVertices) return;
+            if (type === 'edge' && !this.showInterfaceEdges) return;
+            if (type === 'face' && !this.showInterfaceFaces) return;
+            for (const dof of interfaceList) {
+                if (!interfaceMap.has(dof)) interfaceMap.set(dof, idx);
+            }
+        });
+        this.viewer.setHighlightedInterfaceDofs(interfaceMap);
+        return;
+    }
+
+    // Multi-subdomain (or no panel) mode: aggregate all interfaces of the
+    // visible ranks, filtered by DOF type.
     let globalInterfaceIdx = 0;
     let skippedByType = { vertex: 0, edge: 0, face: 0 };
 
@@ -66,13 +175,23 @@ App.prototype.updateInterfaceHighlight = function() {
 
 App.prototype.loadInterfaceData = async function() {
     try {
-        const response = await fetch('/api/interfaces');
+        const simName = this.resultsVizDir || this.selectedSimulation;
+        const url = simName
+            ? `/api/interfaces?sim=${encodeURIComponent(simName)}`
+            : '/api/interfaces';
+        const response = await fetch(url);
         const data = await response.json();
 
         if (data.interfaces && Object.keys(data.interfaces).length > 0) {
             this.interfaceData = {};
             for (const [rank, interfaces] of Object.entries(data.interfaces)) {
                 this.interfaceData[parseInt(rank)] = interfaces;
+            }
+            this.interfaceInfo = {};
+            if (data.interfaceInfo) {
+                for (const [rank, info] of Object.entries(data.interfaceInfo)) {
+                    this.interfaceInfo[parseInt(rank)] = info;
+                }
             }
             if (data.dofTypes) {
                 this.interfaceDofTypes = {};
@@ -93,6 +212,7 @@ App.prototype.loadInterfaceData = async function() {
         console.warn('Could not load interface data:', error);
     }
     this.interfaceData = null;
+    this.interfaceInfo = null;
     this.interfaceDofTypes = null;
     this.viewer.setInterfaceDofTypes(null);
     return false;
@@ -123,7 +243,7 @@ App.prototype.onPartitionToggle = function(showPartition) {
         }
 
         if (this.showInterfaces) {
-            this.updateInterfaceHighlight();
+            this.refreshInterfaceView();
         }
     } else if (this.resultsVizDir) {
         this.viewer.restoreFullMesh();
@@ -147,6 +267,8 @@ App.prototype.onPartitionToggle = function(showPartition) {
         document.getElementById('show-ecs').checked = false;
         document.getElementById('show-interfaces').checked = false;
         document.getElementById('interface-type-controls').style.display = 'none';
+        document.getElementById('interface-list-panel').style.display = 'none';
+        this._panelRank = null;
         document.getElementById('explosion-slider').value = 0;
         document.getElementById('explosion-value').textContent = '0';
         this.showInterfaces = false;
@@ -210,10 +332,13 @@ App.prototype.hidePartitionOption = function() {
     document.getElementById('show-ecs').checked = false;
     document.getElementById('show-interfaces').checked = false;
     document.getElementById('interface-type-controls').style.display = 'none';
+    document.getElementById('interface-list-panel').style.display = 'none';
     document.getElementById('explosion-slider').value = 0;
     document.getElementById('explosion-value').textContent = '0';
     this.showInterfaces = false;
     this.interfaceData = null;
+    this.interfaceInfo = null;
     this.interfaceDofTypes = null;
+    this._panelRank = null;
     this.viewer.setInterfaceDofTypes(null);
 };

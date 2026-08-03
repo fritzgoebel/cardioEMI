@@ -187,6 +187,28 @@
                             Faces
                         </label>
                     </div>
+                    <!-- Per-interface inspector (shown when exactly one subdomain is selected) -->
+                    <div id="interface-list-panel" style="display: none; margin-left: 20px; margin-top: 8px;">
+                        <div class="interface-list-title">
+                            Interfaces of subdomain <span id="interface-list-rank">–</span>
+                            <button id="interface-list-all" class="btn-small">All</button>
+                            <button id="interface-list-none" class="btn-small">None</button>
+                        </div>
+                        <div id="interface-list-columns" class="interface-list-columns">
+                            <div class="interface-list-col" data-type="vertex">
+                                <div class="interface-list-col-head">Vertices</div>
+                                <div class="interface-list-col-body" id="interface-col-vertex"></div>
+                            </div>
+                            <div class="interface-list-col" data-type="edge">
+                                <div class="interface-list-col-head">Edges</div>
+                                <div class="interface-list-col-body" id="interface-col-edge"></div>
+                            </div>
+                            <div class="interface-list-col" data-type="face">
+                                <div class="interface-list-col-head">Faces</div>
+                                <div class="interface-list-col-body" id="interface-col-face"></div>
+                            </div>
+                        </div>
+                    </div>
                     <label class="slider-label">
                         Explosion:
                         <input type="range" id="explosion-slider" class="slider" min="0" max="2" step="0.05" value="0" style="width: 120px;">
@@ -246,25 +268,77 @@
                 <!-- Mesh Selection -->
                 <section class="section">
                     <h2>Mesh Selection</h2>
-                    <div class="param-row">
-                        <label>Mesh file:</label>
-                        <select id="mesh-selector" class="mesh-dropdown">
-                            <option value="">Loading...</option>
-                        </select>
-                        <button id="refresh-mesh-list" class="btn-small" style="display:none;" title="Refresh mesh list">↻</button>
+
+                    <div class="mesh-tabs">
+                        <button id="tab-standard" class="mesh-tab active" type="button">Standard</button>
+                        <button id="tab-weak-scaling" class="mesh-tab" type="button">Weak scaling</button>
                     </div>
-                    <div id="mesh-status" class="mesh-status"></div>
-                    <button id="convert-mesh" class="btn btn-secondary" style="display:none; width: 100%; margin-top: 8px;">
-                        Convert Mesh
-                    </button>
-                    <div id="conversion-progress" class="progress-bar" style="display:none; margin-top: 8px;">
-                        <div class="progress-fill"></div>
-                        <span class="progress-text">0%</span>
+
+                    <!-- Standard mesh selection -->
+                    <div id="standard-mesh-panel">
+                        <div class="param-row">
+                            <label>Mesh file:</label>
+                            <select id="mesh-selector" class="mesh-dropdown">
+                                <option value="">Loading...</option>
+                            </select>
+                            <button id="refresh-mesh-list" class="btn-small" style="display:none;" title="Refresh mesh list">↻</button>
+                        </div>
+                        <div id="mesh-status" class="mesh-status"></div>
+                        <button id="convert-mesh" class="btn btn-secondary" style="display:none; width: 100%; margin-top: 8px;">
+                            Convert Mesh
+                        </button>
+                        <div id="conversion-progress" class="progress-bar" style="display:none; margin-top: 8px;">
+                            <div class="progress-fill"></div>
+                            <span class="progress-text">0%</span>
+                        </div>
+                        <!-- Remote mesh conversion controls (Karolina mode) -->
+                        <div id="remote-convert-area" style="display:none; margin-top: 8px;"></div>
+                        <div id="remote-mesh-convert-status" class="mesh-status" style="display:none; margin-top:8px;"></div>
+                        <pre id="remote-mesh-convert-output" class="output-console" style="display:none; max-height:150px; margin-top:8px;"></pre>
                     </div>
-                    <!-- Remote mesh conversion controls (Karolina mode) -->
-                    <div id="remote-convert-area" style="display:none; margin-top: 8px;"></div>
-                    <div id="remote-mesh-convert-status" class="mesh-status" style="display:none; margin-top:8px;"></div>
-                    <pre id="remote-mesh-convert-output" class="output-console" style="display:none; max-height:150px; margin-top:8px;"></pre>
+
+                    <!-- Weak-scaling mesh generation -->
+                    <div id="weak-scaling-panel" style="display:none;">
+                        <p class="ws-help">Repeatable cubes, one 3D-plus cell each (ECS and ICS volumes are exactly equal). Existing configurations are reused; new ones are generated on demand.</p>
+                        <div class="param-row">
+                            <label>Cubes X × Y × Z:</label>
+                            <input type="number" id="ws-nx" min="1" step="1" value="4">
+                            <span class="unit">×</span>
+                            <input type="number" id="ws-ny" min="1" step="1" value="4">
+                            <span class="unit">×</span>
+                            <input type="number" id="ws-nz" min="1" step="1" value="4">
+                        </div>
+                        <div class="param-row">
+                            <label>Resolution n:</label>
+                            <input type="number" id="ws-n" min="4" step="4" value="16">
+                            <span class="unit">voxels / cube edge (mult. of 4)</span>
+                        </div>
+                        <div class="param-row">
+                            <label>Cube size L:</label>
+                            <input type="number" id="ws-L" min="0" step="1" value="25">
+                            <span class="unit">µm</span>
+                        </div>
+                        <div class="param-row">
+                            <label>ECS padding:</label>
+                            <input type="number" id="ws-pad" min="0" step="1" value="4">
+                            <span class="unit">voxels around block</span>
+                        </div>
+                        <div class="param-row">
+                            <label>Existing:</label>
+                            <select id="ws-existing" class="mesh-dropdown">
+                                <option value="">— none generated yet —</option>
+                            </select>
+                        </div>
+                        <div id="ws-estimate" class="ws-estimate"></div>
+                        <div id="ws-status" class="mesh-status"></div>
+                        <button id="ws-generate" class="btn btn-secondary" style="width: 100%; margin-top: 8px;">
+                            Generate / Load
+                        </button>
+                        <div id="ws-progress" class="progress-bar" style="display:none; margin-top: 8px;">
+                            <div class="progress-fill"></div>
+                            <span class="progress-text">0%</span>
+                        </div>
+                    </div>
                 </section>
 
                 <!-- Simulation Parameters -->
@@ -688,6 +762,146 @@
                                     <option value="hypre">Hypre BoomerAMG</option>
                                 </select>
                             </div>
+                            <div class="param-row">
+                                <label>Local Reordering:</label>
+                                <select id="bddc-reordering" class="mesh-dropdown">
+                                    <option value="none">None</option>
+                                    <option value="amd">AMD (fill-reducing)</option>
+                                </select>
+                            </div>
+                            <div class="param-row">
+                                <label>Inner Solver:</label>
+                                <select id="bddc-inner-solver" class="mesh-dropdown">
+                                    <option value="">Same as local</option>
+                                    <option value="direct">Direct (Cholesky)</option>
+                                    <option value="direct_lu">Direct (LU)</option>
+                                    <option value="ilu">ILU</option>
+                                    <option value="ic">IC</option>
+                                    <option value="amg">AMG</option>
+                                    <option value="hypre">Hypre BoomerAMG</option>
+                                </select>
+                            </div>
+                            <!-- Inner solver stopping criteria (shown for iterative inner solvers) -->
+                            <div id="bddc-inner-stopping-options" style="display: none; margin-left: 10px; border-left: 2px solid #444; padding-left: 10px;">
+                                <div class="param-row">
+                                    <label>Inner Max Iter:</label>
+                                    <input type="number" id="bddc-inner-max-iter" value="100" min="1" max="10000" step="10">
+                                </div>
+                                <div class="param-row">
+                                    <label>Inner Tolerance:</label>
+                                    <input type="text" id="bddc-inner-tolerance" value="1e-12" style="width: 80px;">
+                                </div>
+                            </div>
+                            <!-- Inner AMG Options (shown when AMG is selected as inner solver) -->
+                            <div id="bddc-inner-amg-options" style="display: none; margin-left: 10px; border-left: 2px solid #444; padding-left: 10px;">
+                                <div class="param-row">
+                                    <label>Coarsening:</label>
+                                    <select id="bddc-inner-amg-coarsening" class="mesh-dropdown">
+                                        <option value="pgm">PGM</option>
+                                        <option value="hmis">HMIS</option>
+                                    </select>
+                                </div>
+                                <div id="bddc-inner-amg-hmis-options" style="display: none;">
+                                    <div class="param-row">
+                                        <label>Strength threshold:</label>
+                                        <input type="number" id="bddc-inner-amg-strength-threshold" value="0.25" min="0.0" max="1.0" step="0.05">
+                                    </div>
+                                </div>
+                                <div class="param-row">
+                                    <label>Cycle:</label>
+                                    <select id="bddc-inner-amg-cycle" class="mesh-dropdown">
+                                        <option value="v">V-cycle</option>
+                                        <option value="w">W-cycle</option>
+                                        <option value="f">F-cycle</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Smoother:</label>
+                                    <select id="bddc-inner-amg-smoother" class="mesh-dropdown">
+                                        <option value="jacobi">Jacobi</option>
+                                        <option value="gauss_seidel">Gauss-Seidel</option>
+                                        <option value="ilu">ILU</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Smooth steps:</label>
+                                    <input type="number" id="bddc-inner-amg-smooth-steps" value="1" min="1" max="5" step="1">
+                                </div>
+                                <div class="param-row">
+                                    <label>Max levels:</label>
+                                    <input type="number" id="bddc-inner-amg-max-levels" value="10" min="2" max="20" step="1">
+                                </div>
+                                <div class="param-row">
+                                    <label>Coarsest Solver:</label>
+                                    <select id="bddc-inner-amg-coarse-solver" class="mesh-dropdown">
+                                        <option value="direct">Direct</option>
+                                        <option value="cg">CG</option>
+                                        <option value="gmres">GMRES</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Relaxation:</label>
+                                    <input type="number" id="bddc-inner-amg-relaxation" value="0.9" min="0.1" max="1.0" step="0.05">
+                                </div>
+                            </div>
+                            <!-- Inner Hypre BoomerAMG Options (shown when hypre is selected as inner solver) -->
+                            <div id="bddc-inner-hypre-options" style="display: none; margin-left: 10px; border-left: 2px solid #444; padding-left: 10px;">
+                                <div class="param-row">
+                                    <label>Cycle:</label>
+                                    <select id="bddc-inner-hypre-cycle" class="mesh-dropdown">
+                                        <option value="1">V-cycle</option>
+                                        <option value="2">W-cycle</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Coarsening:</label>
+                                    <select id="bddc-inner-hypre-coarsening" class="mesh-dropdown">
+                                        <option value="0">CLJP</option>
+                                        <option value="3">Ruge-Stueben</option>
+                                        <option value="6">Falgout</option>
+                                        <option value="8">PMIS</option>
+                                        <option value="10" selected>HMIS</option>
+                                        <option value="21">CGC</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Strength threshold:</label>
+                                    <input type="number" id="bddc-inner-hypre-strength" value="0.25" min="0.0" max="1.0" step="0.05">
+                                </div>
+                                <div class="param-row">
+                                    <label>Smoother:</label>
+                                    <select id="bddc-inner-hypre-smoother" class="mesh-dropdown">
+                                        <option value="0">Jacobi</option>
+                                        <option value="3">Hybrid forward GS</option>
+                                        <option value="4">Hybrid backward GS</option>
+                                        <option value="6" selected>Hybrid symmetric GS</option>
+                                        <option value="8">Hybrid symmetric l1-GS</option>
+                                        <option value="13">Forward l1-GS</option>
+                                        <option value="14">Backward l1-GS</option>
+                                        <option value="16">Chebyshev</option>
+                                        <option value="18">l1-Jacobi</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Num sweeps:</label>
+                                    <input type="number" id="bddc-inner-hypre-sweeps" value="1" min="1" max="10" step="1">
+                                </div>
+                                <div class="param-row">
+                                    <label>Interpolation:</label>
+                                    <select id="bddc-inner-hypre-interpolation" class="mesh-dropdown">
+                                        <option value="0" selected>Classical modified</option>
+                                        <option value="3">Direct</option>
+                                        <option value="4">Multipass</option>
+                                        <option value="6">Extended+i</option>
+                                        <option value="13">FF1</option>
+                                        <option value="14">Extended</option>
+                                    </select>
+                                </div>
+                                <div class="param-row">
+                                    <label>Max levels:</label>
+                                    <input type="number" id="bddc-inner-hypre-max-levels" value="25" min="2" max="50" step="1">
+                                </div>
+                            </div>
                             <!-- Local solver stopping criteria (shown for iterative solvers: ILU, IC, AMG) -->
                             <div id="bddc-local-stopping-options" style="display: none;">
                                 <div class="param-row">
@@ -815,6 +1029,7 @@
                                     <option value="cg">CG</option>
                                     <option value="gmres">GMRES</option>
                                     <option value="bddc">BDDC (nested)</option>
+                                    <option value="schwarz">Schwarz (MUMPS)</option>
                                 </select>
                             </div>
                             <div class="param-row">
@@ -901,6 +1116,7 @@
                             <button type="button" id="karolina-jobs-mesh-filter-btn" class="btn" style="font-size:0.8em; padding:2px 8px; background:#2a2a2a; color:#eee; border:1px solid #555;">All</button>
                             <div id="karolina-jobs-mesh-filter-panel" style="display:none; position:absolute; top:100%; left:0; z-index:10; min-width:180px; max-height:240px; overflow-y:auto; background:#1a1a1a; border:1px solid #555; border-radius:4px; padding:6px; margin-top:2px;"></div>
                         </div>
+                        <button type="button" id="karolina-jobs-clear-btn" class="btn" style="margin-left:8px; font-size:0.8em; padding:2px 8px; background:transparent; color:#888; border:1px solid #555;" title="Remove all jobs from this list (does not delete data)">Clear list</button>
                     </div>
                     <div id="karolina-jobs-list">
                         <!-- Dynamic job entries rendered here -->
@@ -938,6 +1154,9 @@
                     </button>
                     <button id="download-karolina-results" class="btn btn-secondary" style="display:none; width: 100%; margin-top: 6px;">
                         Download from Karolina
+                    </button>
+                    <button id="delete-all-results" class="btn" style="width: 100%; margin-top: 6px; background:transparent; color:#a23030; border:1px solid #a23030;">
+                        Delete all results (local + remote + viz cache)
                     </button>
                     <div id="results-download-progress" style="display:none; margin-top:8px;">
                         <div style="background:#333; border-radius:4px; overflow:hidden; height:18px; position:relative;">
@@ -993,6 +1212,7 @@
     <script src="js/karolina-runner.js"></script>
     <script src="js/app.js"></script>
     <script src="js/app-mesh.js"></script>
+    <script src="js/app-weakscaling.js"></script>
     <script src="js/app-ui.js"></script>
     <script src="js/app-scar.js"></script>
     <script src="js/app-solver.js"></script>

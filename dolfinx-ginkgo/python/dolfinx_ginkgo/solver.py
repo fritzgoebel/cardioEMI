@@ -50,11 +50,20 @@ class GinkgoSolver:
         - edges: bool, use edge constraints (default: True)
         - faces: bool, use face constraints (default: True)
         - scaling: "stiffness" or "deluxe" (default: "stiffness")
+        - reordering: "none" or "amd" (default: "none"). Fill-reducing reorder of
+          the local matrices (A_LL/A_II) before the local/inner solve; also changes
+          the DOF ordering an AMG/Hypre local solver coarsens on.
         - local_solver: "direct", "direct_lu", "ilu", "ic", or "amg" (default: "direct")
+        - inner_solver: interior (A_II) solver, same options as local_solver.
+          Omit to reuse local_solver for the inner solve (default). When set, the
+          inner solver is independently tunable via inner_max_iterations,
+          inner_tolerance, inner_amg, and inner_hypre (same schema as local_*).
         - local_max_iterations: int (default: 100)
         - local_tolerance: float (default: 1e-12)
         - local_amg: dict with local AMG config (max_levels, smoother, coarse_solver, etc.)
-        - coarse_solver: "cg", "gmres", or "bddc" (default: "cg")
+        - coarse_solver: "cg", "gmres", "bddc", or "schwarz" (default: "cg").
+          "schwarz" applies an additive Schwarz preconditioner directly as the
+          coarse solve (no outer Krylov); local subproblems use MUMPS.
         - coarse_max_iterations: int (default: 100)
         - coarse_tolerance: float (default: 1e-10)
         - coarse_bddc_local_solver: "direct", "direct_lu", "ilu", "ic", or "amg" (default: "direct")
@@ -451,6 +460,13 @@ class GinkgoSolver:
                 raise ValueError(f"Unknown BDDC scaling: {cfg['scaling']}. Available: stiffness, deluxe")
             bddc.scaling = getattr(_cpp.BDDCConfig.Scaling, scaling_map[scaling])
 
+        if "reordering" in cfg:
+            reorder_map = {"none": "NONE", "amd": "AMD"}
+            reordering = str(cfg["reordering"]).lower()
+            if reordering not in reorder_map:
+                raise ValueError(f"Unknown BDDC reordering: {cfg['reordering']}. Available: none, amd")
+            bddc.reordering = getattr(_cpp.BDDCConfig.Reordering, reorder_map[reordering])
+
         if "local_solver" in cfg:
             solver_map = {"direct": "DIRECT", "direct_lu": "DIRECT_LU", "ilu": "ILU", "ic": "IC", "amg": "AMG", "hypre": "HYPRE"}
             local_solver = cfg["local_solver"].lower()
@@ -459,6 +475,23 @@ class GinkgoSolver:
                                f"Available: direct, direct_lu, ilu, ic, amg, hypre")
             bddc.local_solver = getattr(_cpp.BDDCConfig.LocalSolver, solver_map[local_solver])
 
+        # Inner (interior A_II) solver. When omitted, the inner solve falls back
+        # to local_solver (Ginkgo default).
+        if cfg.get("inner_solver") is not None:
+            solver_map = {"direct": "DIRECT", "direct_lu": "DIRECT_LU", "ilu": "ILU", "ic": "IC", "amg": "AMG", "hypre": "HYPRE"}
+            inner_solver = str(cfg["inner_solver"]).lower()
+            if inner_solver not in solver_map:
+                raise ValueError(f"Unknown inner solver: {cfg['inner_solver']}. "
+                               f"Available: direct, direct_lu, ilu, ic, amg, hypre")
+            bddc.inner_solver = getattr(_cpp.BDDCConfig.LocalSolver, solver_map[inner_solver])
+            bddc.override_inner_solver = True
+
+        if "inner_max_iterations" in cfg:
+            bddc.inner_max_iterations = cfg["inner_max_iterations"]
+
+        if "inner_tolerance" in cfg:
+            bddc.inner_tolerance = cfg["inner_tolerance"]
+
         if "local_max_iterations" in cfg:
             bddc.local_max_iterations = cfg["local_max_iterations"]
 
@@ -466,11 +499,11 @@ class GinkgoSolver:
             bddc.local_tolerance = cfg["local_tolerance"]
 
         if "coarse_solver" in cfg:
-            coarse_map = {"cg": "CG", "gmres": "GMRES", "bddc": "BDDC"}
+            coarse_map = {"cg": "CG", "gmres": "GMRES", "bddc": "BDDC", "schwarz": "SCHWARZ"}
             coarse = cfg["coarse_solver"].lower()
             if coarse not in coarse_map:
                 raise ValueError(f"Unknown coarse solver: {cfg['coarse_solver']}. "
-                               f"Available: cg, gmres, bddc")
+                               f"Available: cg, gmres, bddc, schwarz")
             bddc.coarse_solver = getattr(_cpp.BDDCConfig.CoarseSolver, coarse_map[coarse])
 
         if "coarse_max_iterations" in cfg:
@@ -499,10 +532,14 @@ class GinkgoSolver:
         # Configure local AMG if specified
         if "local_amg" in cfg:
             self._configure_local_amg(bddc.local_amg, cfg["local_amg"], _cpp)
+        if "inner_amg" in cfg:
+            self._configure_local_amg(bddc.inner_amg, cfg["inner_amg"], _cpp)
 
         # Configure local Hypre BoomerAMG if specified
         if "local_hypre" in cfg:
             self._configure_local_hypre(bddc.local_hypre, cfg["local_hypre"])
+        if "inner_hypre" in cfg:
+            self._configure_local_hypre(bddc.inner_hypre, cfg["inner_hypre"])
 
     def _configure_local_amg(self, local_amg, cfg: dict, _cpp) -> None:
         """Apply local AMG configuration for BDDC."""
@@ -572,6 +609,14 @@ class GinkgoSolver:
             local_hypre.interpolation_type = int(cfg["interpolation_type"])
         if "max_levels" in cfg:
             local_hypre.max_levels = int(cfg["max_levels"])
+        if "coarse_smoother_type" in cfg:
+            local_hypre.coarse_smoother_type = int(cfg["coarse_smoother_type"])
+        if "relax_order" in cfg:
+            local_hypre.relax_order = int(cfg["relax_order"])
+        if "max_coarse_size" in cfg:
+            local_hypre.max_coarse_size = int(cfg["max_coarse_size"])
+        if "print_level" in cfg:
+            local_hypre.print_level = int(cfg["print_level"])
 
     def solve(self, b: Any, x: Any) -> int:
         """
@@ -606,6 +651,72 @@ class GinkgoSolver:
         _cpp.copy_to_petsc(x_gko, x)
 
         return iters
+
+    def solve_local(self, b_local, x_local, global_size: int):
+        """
+        Solve Ax = b using local numpy arrays (owned entries per rank).
+
+        Returns (iterations, x_local_result).
+        """
+        import numpy as np
+        _cpp = self._cpp
+        b_local = np.ascontiguousarray(b_local, dtype=np.float64)
+        x_local = np.ascontiguousarray(x_local, dtype=np.float64)
+        b_gko = _cpp.create_distributed_vector_from_local(
+            self._exec, self._gko_comm, b_local, global_size)
+        x_gko = _cpp.create_distributed_vector_from_local(
+            self._exec, self._gko_comm, x_local, global_size)
+        iters = self._solver.solve(b_gko, x_gko)
+        return iters, _cpp.get_local_values(x_gko)
+
+    def apply_preconditioner_local(self, b_local, global_size: int):
+        """
+        Apply the preconditioner alone (x = M * b) using local numpy arrays.
+
+        Debugging aid for inspecting preconditioner properties (symmetry,
+        spectrum). Collective: every rank passes its owned part of b and
+        receives its owned part of x.
+
+        Parameters
+        ----------
+        b_local : ndarray[float64]
+            This rank's owned entries of the input vector.
+        global_size : int
+            Global vector length.
+
+        Returns
+        -------
+        ndarray[float64]
+            This rank's owned entries of M * b.
+        """
+        import numpy as np
+        _cpp = self._cpp
+        b_local = np.ascontiguousarray(b_local, dtype=np.float64)
+        b_gko = _cpp.create_distributed_vector_from_local(
+            self._exec, self._gko_comm, b_local, global_size)
+        x_gko = _cpp.create_distributed_vector_from_local(
+            self._exec, self._gko_comm, np.zeros_like(b_local), global_size)
+        self._solver.apply_preconditioner(b_gko, x_gko)
+        return _cpp.get_local_values(x_gko)
+
+    def apply_operator_local(self, x_local, global_size: int):
+        """
+        Apply the system operator (y = A * x) using local numpy arrays.
+
+        Collective; requires an operator set via set_operator_*_from_local_coo.
+        """
+        import numpy as np
+        _cpp = self._cpp
+        x_local = np.ascontiguousarray(x_local, dtype=np.float64)
+        x_gko = _cpp.create_distributed_vector_from_local(
+            self._exec, self._gko_comm, x_local, global_size)
+        y_gko = _cpp.create_distributed_vector_from_local(
+            self._exec, self._gko_comm, np.zeros_like(x_local), global_size)
+        if self._is_dd_matrix:
+            _cpp.apply_dd(self._A_gko, x_gko, y_gko)
+        else:
+            _cpp.apply_distributed(self._A_gko, x_gko, y_gko)
+        return _cpp.get_local_values(y_gko)
 
     def update_operator_from_petsc(self, A: Any) -> None:
         """

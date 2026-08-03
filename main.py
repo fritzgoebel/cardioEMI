@@ -451,6 +451,24 @@ if use_native_assembly:
     coo_row_indices, coo_col_indices, coo_values, coo_global_size, coo_row_ranges, matrix_to_vertex_local, contributed_vertices_local = coo_data
     assemble_time += time.perf_counter() - t1
 
+    # Debug: dump each rank's un-accumulated local COO (the exact DdMatrix
+    # input) and exit. Set CARDIOEMI_DUMP_COO=<dir> to activate. If
+    # CARDIOEMI_DUMP_RHS is also set, continue to the first timestep so the
+    # assembled RHS can be dumped too (exit happens there).
+    _dump_dir = os.environ.get("CARDIOEMI_DUMP_COO")
+    if _dump_dir:
+        Path(_dump_dir).mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            Path(_dump_dir) / f"coo_rank{comm.rank:03d}.npz",
+            rows=coo_row_indices, cols=coo_col_indices, vals=coo_values,
+            global_size=np.int64(coo_global_size),
+            row_ranges=np.asarray(coo_row_ranges, dtype=np.int64))
+        comm.Barrier()
+        if comm.rank == 0:
+            print(f"Dumped per-rank COO to {_dump_dir}.")
+        if not os.environ.get("CARDIOEMI_DUMP_RHS"):
+            sys.exit(0)
+
     if comm.rank == 0:
         print(f"Assembling matrix (native): {time.perf_counter() - t1:.2f} seconds")
         print(f"  Global size: {coo_global_size}, Local nnz: {len(coo_values)}")
@@ -502,7 +520,10 @@ if not Dirichletbc:
             A.setOption(PETSc.Mat.Option.SYMMETRY_ETERNAL, True)
         # Set the nullspace
         A.setNullSpace(nullspace)
-        if params["ksp_type"] == "cg":
+        # attach_near_nullspace: false lets experiments disable PCBDDC's
+        # approximate-solver nullspace correction (it needs the NearNullSpace)
+        # while keeping the KSP nullspace projection.
+        if params["ksp_type"] == "cg" and params.get("petsc_bddc", {}).get("attach_near_nullspace", True):
             A.setNearNullSpace(nullspace)
 
 #---------------------------------#
@@ -543,8 +564,11 @@ if use_ginkgo:
         coarse_nullspace = bool(all_have_nullspace)
         bddc_config = {
             "local_solver": bddc_cfg.get("local_solver", "direct"),
+            "inner_solver": bddc_cfg.get("inner_solver", None),
             "local_max_iterations": int(bddc_cfg.get("local_max_iterations", 100)),
             "local_tolerance": float(bddc_cfg.get("local_tolerance", 1e-12)),
+            "inner_max_iterations": int(bddc_cfg.get("inner_max_iterations", 100)),
+            "inner_tolerance": float(bddc_cfg.get("inner_tolerance", 1e-12)),
             "coarse_solver": bddc_cfg.get("coarse_solver", "cg"),
             "coarse_max_iterations": int(bddc_cfg.get("coarse_max_iterations", 100)),
             "coarse_bddc_local_solver": bddc_cfg.get("coarse_bddc_local_solver", "direct"),
@@ -552,7 +576,7 @@ if use_ginkgo:
             "edges": bddc_cfg.get("edges", True),
             "faces": bddc_cfg.get("faces", True),
             "repartition_coarse": bddc_cfg.get("repartition_coarse", False),
-            "constant_nullspace": local_nullspace,
+            "constant_nullspace": bool(bddc_cfg.get("constant_nullspace", local_nullspace)),
             "coarse_constant_nullspace": False,
         }
         if comm.rank == 0:
@@ -581,6 +605,40 @@ if use_ginkgo:
                 "num_sweeps": int(local_hypre_cfg.get("num_sweeps", 1)),
                 "interpolation_type": int(local_hypre_cfg.get("interpolation_type", 0)),
                 "max_levels": int(local_hypre_cfg.get("max_levels", 25)),
+                "coarse_smoother_type": int(local_hypre_cfg.get("coarse_smoother_type", 9)),
+                "relax_order": int(local_hypre_cfg.get("relax_order", 1)),
+                "max_coarse_size": int(local_hypre_cfg.get("max_coarse_size", 64)),
+                "print_level": int(local_hypre_cfg.get("print_level", 1)),
+            }
+        # Independent inner-solver AMG / Hypre tuning (used when inner_solver is
+        # amg / hypre). Passed straight through; solver.py applies the same
+        # parsing as the local_* equivalents.
+        inner_amg_cfg = bddc_cfg.get("inner_amg", {})
+        if inner_amg_cfg:
+            bddc_config["inner_amg"] = {
+                "smoother": inner_amg_cfg.get("smoother", "jacobi"),
+                "smooth_steps": int(inner_amg_cfg.get("smooth_steps", 1)),
+                "max_levels": int(inner_amg_cfg.get("max_levels", 10)),
+                "coarse_solver": inner_amg_cfg.get("coarse_solver", "direct"),
+                "relaxation_factor": float(inner_amg_cfg.get("relaxation_factor", 0.9)),
+                "cycle": inner_amg_cfg.get("cycle", "v"),
+                "coarsening": inner_amg_cfg.get("coarsening", "pgm"),
+                "strength_threshold": float(inner_amg_cfg.get("strength_threshold", 0.25)),
+            }
+        inner_hypre_cfg = bddc_cfg.get("inner_hypre", {})
+        if inner_hypre_cfg:
+            bddc_config["inner_hypre"] = {
+                "cycle_type": int(inner_hypre_cfg.get("cycle_type", 1)),
+                "coarsening_type": int(inner_hypre_cfg.get("coarsening_type", 10)),
+                "strength_threshold": float(inner_hypre_cfg.get("strength_threshold", 0.25)),
+                "smoother_type": int(inner_hypre_cfg.get("smoother_type", 6)),
+                "num_sweeps": int(inner_hypre_cfg.get("num_sweeps", 1)),
+                "interpolation_type": int(inner_hypre_cfg.get("interpolation_type", 0)),
+                "max_levels": int(inner_hypre_cfg.get("max_levels", 25)),
+                "coarse_smoother_type": int(inner_hypre_cfg.get("coarse_smoother_type", 9)),
+                "relax_order": int(inner_hypre_cfg.get("relax_order", 1)),
+                "max_coarse_size": int(inner_hypre_cfg.get("max_coarse_size", 64)),
+                "print_level": int(inner_hypre_cfg.get("print_level", 1)),
             }
 
     # Create Ginkgo solver (without matrix - set operator separately)
@@ -679,10 +737,18 @@ else:
         local_solver = bddc_cfg.get("local_solver", "mumps")
         local_approximate = local_solver != "mumps"
 
+        # HYPRE BoomerAMG hierarchy print level for the local solves (setup info:
+        # #levels, grid/operator complexity, per-level row counts). Default 1 so
+        # the hierarchy can be compared against Ginkgo's HYPRE_BoomerAMGSetPrintLevel.
+        # Set petsc_bddc.hypre_print_statistics: 0 to silence.
+        hypre_print = int(bddc_cfg.get("hypre_print_statistics", 1))
+
         for side in ("dirichlet", "neumann"):
             if local_approximate:
                 opts.setValue(f'pc_bddc_{side}_pc_type', local_solver)
                 opts.setValue(f'pc_bddc_{side}_approximate', True)
+                if local_solver == "hypre" and hypre_print:
+                    opts.setValue(f'pc_bddc_{side}_pc_hypre_boomeramg_print_statistics', hypre_print)
                 # Optional: extra options under the same prefix from YAML
                 for opt_key, opt_val in bddc_cfg.get(f"{side}_options", {}).items():
                     opts.setValue(f'pc_bddc_{side}_{opt_key}', opt_val)
@@ -725,6 +791,14 @@ else:
 # intial time
 t = 0.0
 
+# Output directory. Solution files are written here only when save_output is
+# set, but the small iterations/residuals pickles are written unconditionally at
+# the end, so out_name and its directory must always be available.
+out_name = params.get("out_name", "").strip().lstrip("_")
+if out_name and comm.rank == 0:
+    Path(out_name).mkdir(parents=True, exist_ok=True)
+comm.Barrier()
+
 # Create output files
 if params["save_output"]:
 
@@ -735,8 +809,6 @@ if params["save_output"]:
     # rename vij functions for output
     for (i, j), vij in vij_dict.items():
         vij.name = f"v_{i}_{j}"
-
-    out_name = params.get("out_name", "").strip().lstrip("_")
 
     # potentials xdmf
     out_sol = dfx.io.XDMFFile(comm, out_name + "/solution.xdmf", "w")
@@ -1037,7 +1109,19 @@ for time_step in range(params["time_steps"]):
     if not Dirichletbc:
         # if the timestep is not zero, b changes anyway and the nullspace must be removed
         nullspace.remove(b)
-    
+
+    # Debug: dump the first-timestep RHS exactly as handed to the solver and
+    # exit. Set CARDIOEMI_DUMP_RHS=<dir> to activate.
+    _dump_rhs_dir = os.environ.get("CARDIOEMI_DUMP_RHS")
+    if _dump_rhs_dir and time_step == 0:
+        Path(_dump_rhs_dir).mkdir(parents=True, exist_ok=True)
+        np.save(Path(_dump_rhs_dir) / f"rhs_rank{comm.rank:03d}.npy",
+                b.getArray().copy())
+        comm.Barrier()
+        if comm.rank == 0:
+            print(f"Dumped per-rank RHS to {_dump_rhs_dir}, exiting.")
+        sys.exit(0)
+
     assemble_time += time.perf_counter() - t1 # Add time lapsed to total assembly time
     
     # Solve the system
@@ -1157,11 +1241,12 @@ if comm.rank == 0:
     print("Average iterations =", sum(ksp_iterations)/len(ksp_iterations))
 
     # Save iterations and residuals to file for visualization (always, they're small)
-    with open(out_name + "/iterations.pickle", "wb") as f:
-        pickle.dump(ksp_iterations, f)
-    with open(out_name + "/residuals.pickle", "wb") as f:
-        pickle.dump({'abs': residual_abs, 'rel': residual_rel,
-                     'iter_history': iter_history}, f)
+    if out_name:
+        with open(out_name + "/iterations.pickle", "wb") as f:
+            pickle.dump(ksp_iterations, f)
+        with open(out_name + "/residuals.pickle", "wb") as f:
+            pickle.dump({'abs': residual_abs, 'rel': residual_rel,
+                         'iter_history': iter_history}, f)
     
     if isinstance(params["ionic_model"], dict):
         print("Ionic models:")
