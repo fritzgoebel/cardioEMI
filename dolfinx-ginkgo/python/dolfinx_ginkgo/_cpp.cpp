@@ -196,6 +196,7 @@ NB_MODULE(_cpp, m) {
         .value("GMRES", BDDCConfig::CoarseSolver::GMRES)
         .value("BDDC", BDDCConfig::CoarseSolver::BDDC)
         .value("SCHWARZ", BDDCConfig::CoarseSolver::SCHWARZ)
+        .value("MUMPS", BDDCConfig::CoarseSolver::MUMPS)
         .export_values();
 
     // Local AMG configuration (nested in BDDCConfig)
@@ -279,6 +280,9 @@ NB_MODULE(_cpp, m) {
         .def_rw("coarse_tolerance", &BDDCConfig::coarse_tolerance)
         .def_rw("coarse_bddc_local_solver", &BDDCConfig::coarse_bddc_local_solver)
         .def_rw("repartition_coarse", &BDDCConfig::repartition_coarse)
+        .def_rw("distributed_coarse", &BDDCConfig::distributed_coarse)
+        .def_rw("write_interfaces", &BDDCConfig::write_interfaces)
+        .def_rw("unanimous_connectivity", &BDDCConfig::unanimous_connectivity)
         .def_rw("constant_nullspace", &BDDCConfig::constant_nullspace)
         .def_rw("coarse_constant_nullspace", &BDDCConfig::coarse_constant_nullspace);
 
@@ -472,15 +476,19 @@ NB_MODULE(_cpp, m) {
           nb::arg("row_ranges"),
           "Update Ginkgo DdMatrix values from local COO data");
 
-    m.def("set_dd_matrix_constant_null_space",
-          [](std::shared_ptr<gko_dist::DdMatrix<double, std::int32_t, std::int64_t>> dd_mat,
-             nb::ndarray<std::int64_t, nb::ndim<1>, nb::c_contig> row_ranges) {
-              std::vector<std::int64_t> ranges(row_ranges.data(),
-                                                row_ranges.data() + row_ranges.size());
-              set_dd_matrix_constant_null_space(dd_mat, ranges);
+    m.def("set_constant_null_space",
+          [](std::shared_ptr<GkoDistMatrix> mat) {
+              set_constant_null_space(mat);
           },
-          nb::arg("dd_mat"), nb::arg("row_ranges"),
-          "Set constant nullspace on DdMatrix for pure Neumann problems");
+          nb::arg("mat"),
+          "Set constant nullspace on a distributed matrix (pure Neumann problems)");
+
+    m.def("set_constant_null_space",
+          [](std::shared_ptr<GkoDdMatrix> dd_mat) {
+              set_constant_null_space(dd_mat);
+          },
+          nb::arg("mat"),
+          "Set constant nullspace on a DdMatrix (pure Neumann problems)");
 
     // =========================================================================
     // Apply (SpMV) Functions

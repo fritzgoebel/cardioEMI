@@ -1,13 +1,13 @@
-// app-karolina-jobs.js - Persistent Karolina jobs list, mesh filter, and removal
+// app-cluster-jobs.js - Persistent remote-cluster jobs list, mesh filter, and removal
 //
-// Owns localStorage persistence for `app.karolinaJobs` and `app.meshFilter`,
+// Owns localStorage persistence for `app.clusterJobs` and `app.meshFilter`,
 // the "Show meshes" multi-select filter UI, and the per-entry remove flow
 // (with optional remote+local data deletion).
 
-const KAROLINA_TERMINAL_STATES = ['COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY'];
+const CLUSTER_TERMINAL_STATES = ['COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY'];
 
 // Format a job/simulation as three concise lines for compact display.
-// Accepts either a Karolina job dict (mesh_name, num_ranks, solver_backend, ...)
+// Accepts either a cluster job dict (mesh_name, num_ranks, solver_backend, ...)
 // or a conditions-derived dict (mesh, nRanks, solver, ...).
 App.prototype.formatSimulationLabel = function(info) {
     const mesh = info.mesh_name || info.mesh || '';
@@ -30,84 +30,104 @@ App.prototype.formatSimulationLabelInline = function(info) {
     return solverPart && solverPart !== '?' ? `${line1} — ${solverPart}` : line1;
 };
 
-App.prototype.setupKarolinaJobsPersistence = function() {
+App.prototype.setupClusterJobsPersistence = function() {
     this.meshFilter = null;  // null = show all; otherwise array of visible mesh names
 
-    const filterBtn = document.getElementById('karolina-jobs-mesh-filter-btn');
-    const filterPanel = document.getElementById('karolina-jobs-mesh-filter-panel');
+    const filterBtn = document.getElementById('cluster-jobs-mesh-filter-btn');
+    const filterPanel = document.getElementById('cluster-jobs-mesh-filter-panel');
     filterBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         filterPanel.style.display = filterPanel.style.display === 'none' ? 'block' : 'none';
     });
     document.addEventListener('click', (e) => {
-        if (!document.getElementById('karolina-jobs-mesh-filter').contains(e.target)) {
+        if (!document.getElementById('cluster-jobs-mesh-filter').contains(e.target)) {
             filterPanel.style.display = 'none';
         }
     });
 
-    const clearBtn = document.getElementById('karolina-jobs-clear-btn');
+    const clearBtn = document.getElementById('cluster-jobs-clear-btn');
     if (clearBtn) {
-        clearBtn.addEventListener('click', () => this.clearKarolinaJobsList());
+        clearBtn.addEventListener('click', () => this.clearClusterJobsList());
     }
 
-    this.loadKarolinaJobs();
+    this.loadClusterJobs();
 };
 
-App.prototype.clearKarolinaJobsList = function() {
-    const jobIds = Object.keys(this.karolinaJobs || {});
+App.prototype.clearClusterJobsList = function() {
+    const jobIds = Object.keys(this.clusterJobs || {});
     if (jobIds.length === 0) return;
     const ok = window.confirm(
         `Remove all ${jobIds.length} job(s) from the list?\n\n` +
-        'This only clears the local list — it does NOT cancel jobs on Karolina ' +
-        'or delete any data (remote dirs or downloaded results stay put).'
+        'This does NOT cancel jobs on the cluster and keeps every run with results. ' +
+        'Runs of finished jobs that produced no results (failed) are deleted - ' +
+        'the job list was what kept them around.'
     );
     if (!ok) return;
+    const finished = [];
     for (const jobId of jobIds) {
-        this.karolinaRunner.stopPolling(jobId);
+        const job = this.clusterJobs[jobId];
+        this.getRunner(job?.cluster || 'karolina').stopPolling(jobId);
+        if (job?.out_name && CLUSTER_TERMINAL_STATES.includes(job.status)) finished.push(job.out_name);
     }
-    this.karolinaJobs = {};
-    const list = document.getElementById('karolina-jobs-list');
+    this.clusterJobs = {};
+    const list = document.getElementById('cluster-jobs-list');
     if (list) list.innerHTML = '';
-    this.saveKarolinaJobs();
+    this.saveClusterJobs();
     this.renderMeshFilter();
+    this.deleteRunsIfEmpty(finished);
 };
 
-App.prototype.saveKarolinaJobs = function() {
+App.prototype.saveClusterJobs = function() {
     try {
         const stripped = {};
-        for (const [jobId, job] of Object.entries(this.karolinaJobs)) {
+        for (const [jobId, job] of Object.entries(this.clusterJobs)) {
             const copy = { ...job };
             delete copy._iterationsDownloaded;
+            delete copy._logFetched;
             stripped[jobId] = copy;
         }
-        localStorage.setItem('karolinaJobs', JSON.stringify(stripped));
+        localStorage.setItem('clusterJobs', JSON.stringify(stripped));
     } catch (e) {
-        console.warn('Failed to save Karolina jobs:', e);
+        console.warn('Failed to save cluster jobs:', e);
     }
 };
 
 App.prototype.saveMeshFilter = function() {
     try {
-        localStorage.setItem('karolinaJobsMeshFilter',
+        localStorage.setItem('clusterJobsMeshFilter',
             this.meshFilter === null ? 'null' : JSON.stringify(this.meshFilter));
     } catch (e) {
         console.warn('Failed to save mesh filter:', e);
     }
 };
 
-App.prototype.loadKarolinaJobs = function() {
+App.prototype.loadClusterJobs = function() {
     let jobs = {};
     try {
-        const raw = localStorage.getItem('karolinaJobs');
+        // Migration: jobs were stored under 'karolinaJobs' before multi-cluster
+        // support; tag those with their (only possible) cluster.
+        let raw = localStorage.getItem('clusterJobs');
+        if (!raw) {
+            raw = localStorage.getItem('karolinaJobs');
+            if (raw) {
+                jobs = JSON.parse(raw) || {};
+                for (const job of Object.values(jobs)) job.cluster = job.cluster || 'karolina';
+                localStorage.setItem('clusterJobs', JSON.stringify(jobs));
+                localStorage.removeItem('karolinaJobs');
+                raw = null;
+            }
+        }
         if (raw) jobs = JSON.parse(raw) || {};
+        for (const job of Object.values(jobs)) job.cluster = job.cluster || 'karolina';
     } catch (e) {
-        console.warn('Failed to load persisted Karolina jobs:', e);
+        console.warn('Failed to load persisted cluster jobs:', e);
         jobs = {};
     }
 
     let filter = null;
     try {
-        const rawFilter = localStorage.getItem('karolinaJobsMeshFilter');
+        const rawFilter = localStorage.getItem('clusterJobsMeshFilter')
+            ?? localStorage.getItem('karolinaJobsMeshFilter');
         if (rawFilter !== null && rawFilter !== 'null') {
             filter = JSON.parse(rawFilter);
             if (!Array.isArray(filter)) filter = null;
@@ -117,26 +137,25 @@ App.prototype.loadKarolinaJobs = function() {
     }
     this.meshFilter = filter;
 
-    this.karolinaJobs = jobs;
+    this.clusterJobs = jobs;
 
     if (Object.keys(jobs).length === 0) {
         this.renderMeshFilter();
         return;
     }
 
-    if (this.runTarget === 'karolina') {
-        document.getElementById('karolina-job-section').style.display = 'block';
+    if (this.isRemote()) {
+        document.getElementById('cluster-job-section').style.display = 'block';
     }
 
     for (const jobId of Object.keys(jobs)) {
         const job = jobs[jobId];
         this.renderJobEntry(job);
-        this._applyStatusToDom(jobId, { status: job.status });
-        if (!KAROLINA_TERMINAL_STATES.includes(job.status)) {
-            this.karolinaRunner.startPolling(jobId, (data) => {
+        this._applyStatusToDom(jobId, { status: job.status, log: job.log });
+        if (!CLUSTER_TERMINAL_STATES.includes(job.status)) {
+            this.getRunner(job.cluster || 'karolina').startPolling(jobId, (data) => {
                 this.updateJobStatus(jobId, data);
-                if (data.out_name) this.karolinaJobs[jobId].out_name = data.out_name;
-            });
+            }, job.out_name);
         }
     }
 
@@ -146,7 +165,7 @@ App.prototype.loadKarolinaJobs = function() {
 
 App.prototype.getDistinctMeshNames = function() {
     const names = new Set();
-    for (const job of Object.values(this.karolinaJobs)) {
+    for (const job of Object.values(this.clusterJobs)) {
         if (job.mesh_name) names.add(job.mesh_name);
     }
     return Array.from(names).sort();
@@ -159,8 +178,8 @@ App.prototype.isMeshVisible = function(meshName) {
 };
 
 App.prototype.renderMeshFilter = function() {
-    const btn = document.getElementById('karolina-jobs-mesh-filter-btn');
-    const panel = document.getElementById('karolina-jobs-mesh-filter-panel');
+    const btn = document.getElementById('cluster-jobs-mesh-filter-btn');
+    const panel = document.getElementById('cluster-jobs-mesh-filter-panel');
     const meshes = this.getDistinctMeshNames();
 
     if (meshes.length === 0) {
@@ -224,8 +243,8 @@ App.prototype.renderMeshFilter = function() {
 };
 
 App.prototype.applyMeshFilter = function() {
-    for (const [jobId, job] of Object.entries(this.karolinaJobs)) {
-        const entry = document.getElementById(`karolina-job-${jobId}`);
+    for (const [jobId, job] of Object.entries(this.clusterJobs)) {
+        const entry = document.getElementById(`cluster-job-${jobId}`);
         if (!entry) continue;
         entry.style.display = this.isMeshVisible(job.mesh_name) ? '' : 'none';
     }
@@ -247,8 +266,9 @@ App.prototype.ensureMeshInFilter = function(meshName) {
 // effects (no auto-download, no save). Used to restore last-known status on
 // page load before live polling overwrites it.
 App.prototype._applyStatusToDom = function(jobId, data) {
-    const entry = document.getElementById(`karolina-job-${jobId}`);
+    const entry = document.getElementById(`cluster-job-${jobId}`);
     if (!entry || !data.status) return;
+    if (data.log) entry.querySelector('.job-log').textContent = data.log;
     const statusEl = entry.querySelector('.job-status');
     const cancelBtn = entry.querySelector('.btn-cancel');
     const downloadBtn = entry.querySelector('.btn-download');
@@ -262,25 +282,25 @@ App.prototype._applyStatusToDom = function(jobId, data) {
         statusEl.style.color = '#4ade80';
         cancelBtn.style.display = 'none';
         downloadBtn.style.display = 'inline-block';
-    } else if (KAROLINA_TERMINAL_STATES.includes(s) && s !== 'COMPLETED') {
+    } else if (CLUSTER_TERMINAL_STATES.includes(s) && s !== 'COMPLETED') {
         statusEl.style.color = '#e94560';
         cancelBtn.style.display = 'none';
     }
 };
 
 // Wrap renderJobEntry so this module owns the ✕ button + remove popover. The
-// base renderJobEntry (in app-karolina.js) stays focused on Cancel/Download/Log
+// base renderJobEntry (in app-cluster.js) stays focused on Cancel/Download/Log
 // — anything tied to *removal* lives here.
 const _baseRenderJobEntry = App.prototype.renderJobEntry;
 App.prototype.renderJobEntry = function(jobInfo) {
-    const existed = !!document.getElementById(`karolina-job-${jobInfo.job_id}`);
+    const existed = !!document.getElementById(`cluster-job-${jobInfo.job_id}`);
     _baseRenderJobEntry.call(this, jobInfo);
     if (existed) return;
     this._injectRemoveControls(jobInfo.job_id);
 };
 
 App.prototype._injectRemoveControls = function(jobId) {
-    const entry = document.getElementById(`karolina-job-${jobId}`);
+    const entry = document.getElementById(`cluster-job-${jobId}`);
     if (!entry) return;
 
     const header = entry.querySelector('.job-entry-header');
@@ -297,8 +317,8 @@ App.prototype._injectRemoveControls = function(jobId) {
     popover.style.cssText = 'display:none; margin-top:6px; padding:6px; background:#222; border:1px solid #555; border-radius:4px;';
     popover.innerHTML = `
         <div style="font-size:0.8em; color:#ccc; margin-bottom:4px;">Remove this job?</div>
-        <button class="btn btn-remove-list" style="font-size:0.75em; padding:2px 8px; background:#555; color:#eee;">From list only</button>
-        <button class="btn btn-remove-data" style="font-size:0.75em; padding:2px 8px; background:#a23030; color:#fff;">+ Delete data</button>
+        <button class="btn btn-remove-list" style="font-size:0.75em; padding:2px 8px; background:#555; color:#eee;" title="Keeps the run if it has results; a finished run without results (failed) is deleted">From list only</button>
+        <button class="btn btn-remove-data" style="font-size:0.75em; padding:2px 8px; background:#a23030; color:#fff;" title="Delete the run everywhere (local, viz cache, every cluster copy)">+ Delete data</button>
         <button class="btn btn-remove-cancel" style="font-size:0.75em; padding:2px 8px; background:transparent; color:#888;">Cancel</button>
     `;
     const logEl = entry.querySelector('.job-log');
@@ -321,38 +341,39 @@ App.prototype._injectRemoveControls = function(jobId) {
 };
 
 App.prototype.removeJob = async function(jobId, deleteData) {
-    const job = this.karolinaJobs[jobId];
+    const job = this.clusterJobs[jobId];
     if (!job) return;
 
     if (deleteData) {
         const ok = window.confirm(
-            `Delete remote dir and local download for job ${jobId}? This cannot be undone.`
+            `Delete the run of job ${jobId} everywhere (local folder, viz cache, every cluster copy)? ` +
+            'A still running job is cancelled first. This cannot be undone.'
         );
         if (!ok) return;
-        try {
-            const resp = await fetch('/api/karolina/delete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ job_id: jobId, out_name: job.out_name })
-            });
-            const result = await resp.json();
-            if (!resp.ok) {
-                alert('Delete failed: ' + (result.error || 'unknown error'));
-                return;
+        if (!CLUSTER_TERMINAL_STATES.includes(job.status)) {
+            try {
+                await this.getRunner(job.cluster || 'karolina').cancel(jobId);
+                // The cached listing still marks the run active, which the
+                // delete would skip - re-list first.
+                await this.loadRunIndex({ refresh: true });
+            } catch (e) {
+                console.warn(`Cancelling job ${jobId} failed:`, e);
             }
-            if (result.errors && result.errors.length) {
-                console.warn('Partial delete failure:', result.errors);
-            }
-        } catch (e) {
-            alert('Delete request failed: ' + e.message);
-            return;
         }
     }
 
-    this.karolinaRunner.stopPolling(jobId);
-    delete this.karolinaJobs[jobId];
-    const entry = document.getElementById(`karolina-job-${jobId}`);
+    this.getRunner(job.cluster || 'karolina').stopPolling(jobId);
+    delete this.clusterJobs[jobId];
+    const entry = document.getElementById(`cluster-job-${jobId}`);
     if (entry) entry.remove();
-    this.saveKarolinaJobs();
+    this.saveClusterJobs();
     this.renderMeshFilter();
+
+    if (!job.out_name) return;
+    if (deleteData) {
+        await this._deleteRuns({ names: [job.out_name] });
+    } else if (CLUSTER_TERMINAL_STATES.includes(job.status)) {
+        // The job list was what kept a failed run around; it goes with it.
+        await this.deleteRunsIfEmpty([job.out_name]);
+    }
 };

@@ -261,7 +261,8 @@ def read_input_file(input_yml_file):
             input_parameters['petsc_bddc'] = {}
 
         ######### Partitioning #########
-        # partition_mode: "default" or "component" (tag-based METIS partitioning)
+        # partition_mode: "default", "component" (tag-based METIS partitioning),
+        # or "cube" (weak-scaling cell/cube-ECS subdomains)
         if 'partition_mode' in config:
             input_parameters['partition_mode'] = config['partition_mode']
 
@@ -269,10 +270,33 @@ def read_input_file(input_yml_file):
         if 'original_mesh_file' in config:
             input_parameters['original_mesh_file'] = config['original_mesh_file']
 
+        # component_granularity: for partition_mode "component" - "component"
+        # (default) keeps each ECS+cell tag pair on one rank; "tag" gives every
+        # individual tag its own rank (e.g. to match a BDDC convergence theory
+        # stated per volume tag rather than per ECS+cell pair)
+        if 'component_granularity' in config:
+            input_parameters['component_granularity'] = config['component_granularity']
+
+        # cube_partition: cube-lattice geometry (nx, ny, nz, n, L, pad) for
+        # partition_mode "cube". Optional - normally parsed from the mesh filename.
+        if 'cube_partition' in config:
+            input_parameters['cube_partition'] = config['cube_partition']
+
         ######### Diagnostics #########
         # Opt-in: capture per-iteration true ||b - A*x|| (and implicit norm) for both backends.
         if 'track_iter_residuals' in config:
             input_parameters['track_iter_residuals'] = bool(config['track_iter_residuals'])
+
+        ######### Benchmark mode #########
+        # random_rhs: skip the physics on the right-hand side. The system matrix
+        # is assembled once as usual, but every timestep solves against a fresh
+        # random vector instead of the ionic-model RHS (solver/weak-scaling
+        # benchmarks). Optional random_rhs_seed makes runs reproducible.
+        if 'random_rhs' in config:
+            input_parameters['random_rhs'] = bool(config['random_rhs'])
+
+        if 'random_rhs_seed' in config:
+            input_parameters['random_rhs_seed'] = int(config['random_rhs_seed'])
 
         # sanuty checks
         parse_nonneg_int(input_parameters['P'])

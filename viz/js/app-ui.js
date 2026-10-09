@@ -1,47 +1,85 @@
 // app-ui.js - Sliders, controls, buttons, checkboxes, colormap
 
+const STIMULUS_SNAP_KEY = 'stimulusSnap';
+const BOX_KEYS = ['xMin', 'xMax', 'yMin', 'yMax', 'zMin', 'zMax'];
+
+// Stimulus box sliders. Called again whenever the shown mesh changes: the
+// slider ranges follow that mesh; the listeners are attached only once.
 App.prototype.setupSliders = function() {
-    const axes = ['x', 'y', 'z'];
+    if (!this.stimulusSnap) {
+        let saved = {};
+        try { saved = JSON.parse(localStorage.getItem(STIMULUS_SNAP_KEY)) || {}; } catch (e) { /* ignore */ }
+        this.stimulusSnap = Object.fromEntries(BOX_KEYS.map(k => [k, !!saved[k]]));
+    }
 
-    axes.forEach(axis => {
-        const minSlider = document.getElementById(`${axis}-min`);
-        const maxSlider = document.getElementById(`${axis}-max`);
-        const minVal = document.getElementById(`${axis}-min-val`);
-        const maxVal = document.getElementById(`${axis}-max-val`);
-
+    ['x', 'y', 'z'].forEach(axis => {
         const bounds = this.meshBounds[axis];
         const range = bounds[1] - bounds[0];
+        for (const end of ['min', 'max']) {
+            const key = `${axis}${end === 'min' ? 'Min' : 'Max'}`;
+            const slider = document.getElementById(`${axis}-${end}`);
+            slider.min = bounds[0];
+            slider.max = bounds[1];
+            slider.step = range / 200;
+            slider.value = this.boundingBox[key];
+            document.getElementById(`${axis}-${end}-val`).textContent = parseFloat(slider.value).toFixed(1);
 
-        // Configure sliders with mesh bounds
-        minSlider.min = bounds[0];
-        minSlider.max = bounds[1];
-        minSlider.step = range / 200;
-        minSlider.value = this.boundingBox[`${axis}Min`];
-
-        maxSlider.min = bounds[0];
-        maxSlider.max = bounds[1];
-        maxSlider.step = range / 200;
-        maxSlider.value = this.boundingBox[`${axis}Max`];
-
-        // Update display
-        minVal.textContent = parseFloat(minSlider.value).toFixed(1);
-        maxVal.textContent = parseFloat(maxSlider.value).toFixed(1);
-
-        // Event listeners
-        minSlider.addEventListener('input', () => {
-            const val = parseFloat(minSlider.value);
-            this.boundingBox[`${axis}Min`] = val;
-            minVal.textContent = val.toFixed(1);
-            this.onBoundingBoxChange();
-        });
-
-        maxSlider.addEventListener('input', () => {
-            const val = parseFloat(maxSlider.value);
-            this.boundingBox[`${axis}Max`] = val;
-            maxVal.textContent = val.toFixed(1);
-            this.onBoundingBoxChange();
-        });
+            if (this._slidersWired) continue;
+            slider.addEventListener('input', () => {
+                const val = parseFloat(slider.value);
+                this.boundingBox[key] = val;
+                document.getElementById(`${axis}-${end}-val`).textContent = val.toFixed(1);
+                this.onBoundingBoxChange();
+            });
+            const snap = document.getElementById(`${axis}-${end}-snap`);
+            snap.checked = this.stimulusSnap[key];
+            snap.addEventListener('change', () => {
+                this.stimulusSnap[key] = snap.checked;
+                try { localStorage.setItem(STIMULUS_SNAP_KEY, JSON.stringify(this.stimulusSnap)); } catch (e) { /* ignore */ }
+                this.applyStimulusSnaps();
+                this.onBoundingBoxChange();
+            });
+        }
     });
+    this._slidersWired = true;
+    this.applyStimulusSnaps();
+};
+
+// Ticked ends ("min"/"max") follow the mesh's own bounds: pin them to the
+// shown mesh and lock their sliders, so this.boundingBox is always the box in
+// effect on the shown mesh. Other meshes get theirs from stimulusBoxFor.
+App.prototype.applyStimulusSnaps = function() {
+    if (!this.meshBounds || !this.stimulusSnap) return;
+    for (const key of BOX_KEYS) {
+        const axis = key[0];
+        const end = key.endsWith('Min') ? 'min' : 'max';
+        const slider = document.getElementById(`${axis}-${end}`);
+        const snapped = this.stimulusSnap[key];
+        slider.disabled = snapped;
+        if (snapped) {
+            this.boundingBox[key] = this.meshBounds[axis][end === 'min' ? 0 : 1];
+            slider.value = this.boundingBox[key];
+            document.getElementById(`${axis}-${end}-val`).textContent = this.boundingBox[key].toFixed(1);
+        }
+    }
+};
+
+// The stimulus box for a mesh with the given bounds: ticked ends at that
+// mesh's bounds, the others at their absolute slider position clipped to it.
+// -> {box, empty}; empty when the box misses the mesh on some axis.
+App.prototype.stimulusBoxFor = function(bounds) {
+    const box = {};
+    let empty = false;
+    for (const axis of ['x', 'y', 'z']) {
+        const [lo, hi] = bounds[axis];
+        const clip = (v) => Math.min(hi, Math.max(lo, v));
+        const mn = this.stimulusSnap && this.stimulusSnap[`${axis}Min`] ? lo : this.boundingBox[`${axis}Min`];
+        const mx = this.stimulusSnap && this.stimulusSnap[`${axis}Max`] ? hi : this.boundingBox[`${axis}Max`];
+        if (mx < lo || mn > hi || mn > mx) empty = true;
+        box[`${axis}Min`] = clip(mn);
+        box[`${axis}Max`] = clip(mx);
+    }
+    return { box, empty };
 };
 
 App.prototype.setupSimulationParams = function() {
@@ -69,10 +107,26 @@ App.prototype.setupSimulationParams = function() {
 
     // Partition mode
     const partitionModeSelect = document.getElementById('partition-mode');
+    const granularityRow = document.getElementById('component-granularity-row');
+    const granularitySelect = document.getElementById('component-granularity');
+    const syncGranularityVisibility = () => {
+        if (granularityRow) {
+            granularityRow.style.display = partitionModeSelect.value === 'component' ? 'flex' : 'none';
+        }
+    };
     if (partitionModeSelect) {
         this.partitionMode = partitionModeSelect.value;
+        syncGranularityVisibility();
         partitionModeSelect.addEventListener('change', (e) => {
             this.partitionMode = e.target.value;
+            syncGranularityVisibility();
+        });
+    }
+    if (granularitySelect) {
+        this.componentGranularity = granularitySelect.value;
+        granularitySelect.addEventListener('change', (e) => {
+            this.componentGranularity = e.target.value;
+            this.updateMatchButtonLabels();
         });
     }
 };
@@ -97,6 +151,24 @@ App.prototype.setupMpiRanks = function() {
     input.addEventListener('change', () => {
         this.simulationRunner.setMpiRanks(parseInt(input.value));
     });
+
+    const matchBtn = document.getElementById('match-ranks-to-tags');
+    if (matchBtn) {
+        matchBtn.addEventListener('click', () => {
+            const target = this.getPartitionTargetCount();
+            if (!target) return;
+            input.value = target;
+            this.simulationRunner.setMpiRanks(target);
+
+            // This rank count only makes sense with component ('Tag based')
+            // partitioning - switch to it so the two stay consistent.
+            const partitionModeSelect = document.getElementById('partition-mode');
+            if (partitionModeSelect && partitionModeSelect.value !== 'component') {
+                partitionModeSelect.value = 'component';
+                partitionModeSelect.dispatchEvent(new Event('change'));
+            }
+        });
+    }
 };
 
 App.prototype.setupVoltageControls = function() {
@@ -470,14 +542,13 @@ App.prototype.setupResultsControls = function() {
     const loadBtn = document.getElementById('load-results');
     const timeSlider = document.getElementById('result-time');
     const timeVal = document.getElementById('result-time-val');
-    const simSelector = document.getElementById('simulation-selector');
 
-    this.loadSimulationList();
+    this.setupRunBrowser();
 
     loadBtn.addEventListener('click', () => this.loadResults());
 
-    const dlBtn = document.getElementById('download-karolina-results');
-    dlBtn.addEventListener('click', () => this.downloadKarolinaSimulation());
+    const dlBtn = document.getElementById('download-cluster-results');
+    dlBtn.addEventListener('click', () => this.downloadClusterSimulation());
 
     const deleteAllBtn = document.getElementById('delete-all-results');
     if (deleteAllBtn) {
@@ -494,36 +565,33 @@ App.prototype.setupResultsControls = function() {
             this.setResidualHistoryForStep(idx);
         }
     });
-
-    simSelector.addEventListener('change', () => {
-        this.selectedSimulation = simSelector.value;
-    });
 };
 
 App.prototype.onBoundingBoxChange = function() {
     this.updateVinitExpression();
     this.updateBoundingBoxVisualization();
     this.saveMeshConfig();
+    if (this.renderBatchRows) this.renderBatchRows();  // rows show each mesh's box
 };
 
 App.prototype.updateVinitExpression = function() {
     // Expression is generated on demand when running simulation
 };
 
-App.prototype.generateVinitExpression = function() {
-    const cf = this.conversionFactor;
-
+// box/cf default to the shown mesh; batch submission passes another mesh's
+// rescaled box and conversion factor.
+App.prototype.generateVinitExpression = function(box = this.boundingBox, cf = this.conversionFactor) {
     const fmt = (v) => {
         const scaled = v * cf;
         return scaled.toPrecision(6).replace(/\.?0+$/, '');
     };
 
-    const xMin = fmt(this.boundingBox.xMin);
-    const xMax = fmt(this.boundingBox.xMax);
-    const yMin = fmt(this.boundingBox.yMin);
-    const yMax = fmt(this.boundingBox.yMax);
-    const zMin = fmt(this.boundingBox.zMin);
-    const zMax = fmt(this.boundingBox.zMax);
+    const xMin = fmt(box.xMin);
+    const xMax = fmt(box.xMax);
+    const yMin = fmt(box.yMin);
+    const yMax = fmt(box.yMax);
+    const zMin = fmt(box.zMin);
+    const zMax = fmt(box.zMax);
 
     const inside = `((x[0] >= ${xMin}) * (x[0] <= ${xMax}) * (x[1] >= ${yMin}) * (x[1] <= ${yMax}) * (x[2] >= ${zMin}) * (x[2] <= ${zMax}))`;
 
@@ -546,4 +614,62 @@ App.prototype.updateBoundingBoxVisualization = function() {
     if (this.viewer) {
         this.viewer.updateBoundingBox(this.boundingBox);
     }
+};
+
+// Drag the bar between viewer and control panel to resize the panel; the
+// width persists per browser, and a double-click restores the default.
+const PANEL_WIDTH_KEY = 'panelWidth';
+const PANEL_DEFAULT_WIDTH = 400;
+const PANEL_MIN_WIDTH = 300;
+
+App.prototype.setupPanelResizer = function() {
+    const handle = document.getElementById('panel-resizer');
+    const main = document.querySelector('.main-content');
+    if (!handle || !main) return;
+
+    const clamp = (w) => {
+        const max = Math.max(PANEL_MIN_WIDTH, main.clientWidth * 0.7);
+        return Math.round(Math.min(max, Math.max(PANEL_MIN_WIDTH, w)));
+    };
+    let frame = null;
+    const apply = (w) => {
+        main.style.setProperty('--panel-width', `${w}px`);
+        // The canvas only follows on resize events; coalesce to one per frame.
+        if (frame) return;
+        frame = requestAnimationFrame(() => {
+            frame = null;
+            if (this.viewer) this.viewer.onResize();
+        });
+    };
+    const save = (w) => {
+        try { localStorage.setItem(PANEL_WIDTH_KEY, String(w)); } catch (e) { /* non-fatal */ }
+    };
+
+    let saved = null;
+    try { saved = parseInt(localStorage.getItem(PANEL_WIDTH_KEY), 10); } catch (e) { /* ignore */ }
+    if (saved) apply(clamp(saved));
+
+    handle.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        handle.setPointerCapture(e.pointerId);
+        handle.classList.add('dragging');
+        document.body.classList.add('panel-resizing');
+        const right = main.getBoundingClientRect().right;
+        const move = (ev) => apply(clamp(right - ev.clientX - 4));
+        const up = () => {
+            handle.removeEventListener('pointermove', move);
+            handle.removeEventListener('pointerup', up);
+            handle.removeEventListener('pointercancel', up);
+            handle.classList.remove('dragging');
+            document.body.classList.remove('panel-resizing');
+            save(parseInt(getComputedStyle(main).getPropertyValue('--panel-width'), 10) || PANEL_DEFAULT_WIDTH);
+        };
+        handle.addEventListener('pointermove', move);
+        handle.addEventListener('pointerup', up);
+        handle.addEventListener('pointercancel', up);
+    });
+    handle.addEventListener('dblclick', () => {
+        apply(PANEL_DEFAULT_WIDTH);
+        save(PANEL_DEFAULT_WIDTH);
+    });
 };

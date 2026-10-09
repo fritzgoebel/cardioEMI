@@ -7,8 +7,9 @@ class App {
         this.viewer = null;
         this.configManager = new ConfigManager();
         this.simulationRunner = new SimulationRunner();
-        this.karolinaRunner = new KarolinaRunner();
-        this.runTarget = sessionStorage.getItem('runTarget') || 'local'; // 'local' or 'karolina'
+        this.runTarget = sessionStorage.getItem('runTarget') || 'local'; // 'local' or a cluster id
+        this.clusters = [];           // registry entries from /api/clusters
+        this.clusterRunners = {};     // clusterId -> ClusterRunner
 
         // Bounding box state (in micrometers - raw mesh coordinates)
         this.boundingBox = {
@@ -26,7 +27,7 @@ class App {
         this.dt = 0.001;
         this.timeSteps = 1000;
         this.bcType = 'one_corner';  // Boundary condition type
-        this.partitionMode = 'default';  // Partition mode: 'default' or 'component'
+        this.partitionMode = 'default';  // Partition mode: 'default', 'component' or 'cube'
 
         // Voltage parameters
         this.vExcited = 0;    // mV for excited region
@@ -47,6 +48,14 @@ class App {
         this.iterationsChart = null;
         this.iterationsData = [];
         this.currentTimeIndex = 0;
+
+        // Run comparison
+        this.compareDatasets = [];
+        this.compareSimMeta = {};   // simName -> {solver, preconditioner, localSolver, nRanks}
+        this.compareLabels = {};    // simName -> legend label
+        this.runNames = {};         // simName -> {label, collection} typed by the user
+        this.categoryNames = {};    // '<kind>:<key>' -> heading name typed by the user
+        this.loadedSimName = null;  // the run whose results are loaded
 
         // Residual chart
         this.residualChart = null;
@@ -87,6 +96,9 @@ class App {
         container.appendChild(loadingDiv);
 
         try {
+            // Restore the panel width before the viewer measures its container
+            this.setupPanelResizer();
+
             // Setup mesh selector first (before loading mesh)
             await this.setupMeshSelector();
             this.setupWeakScaling();
@@ -107,7 +119,7 @@ class App {
             this.setupSliders();
             this.setupSimulationParams();
             this.setupRunTarget();
-            this.setupKarolinaOptions();
+            this.setupClusterOptions();
             this.setupSolverSettings();
             this.setupMpiRanks();
             this.setupVoltageControls();
@@ -117,9 +129,12 @@ class App {
             this.setupScarControls();
             this.setupResultsControls();
             this.setupVideoExport();
+            this.setupChartPanels();
             this.setupIterationsChart();
+            this.setupScalingChart();
             this.setupResidualChart();
             this.setupResidualHistoryChart();
+            this.setupResidualModeToggles();
             this.setupVoltagePlot();
 
             // Setup vertex picking

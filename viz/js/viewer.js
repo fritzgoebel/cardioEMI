@@ -701,6 +701,7 @@ class Viewer {
         this.cutRanksData = cutRanksData;
         this.rankCentroids = rankCentroids;
         this.globalCentroid = globalCentroid;
+        this._explosionCentroids = null;  // nested-rank grouping, rebuilt on demand
 
         // Lazily create originalVertices copy now that explosion is possible
         if (ranksData && !this.originalVertices && this._pendingVerticesForExplosion) {
@@ -717,7 +718,89 @@ class Viewer {
         }
     }
 
+    // Group ranks where one encloses the other (a cell and the ECS around it,
+    // e.g. cube or per-tag partitioning) so the explosion moves them as one
+    // instead of letting the cell drift through its ECS. A rank joins the rank
+    // it shares the most membrane facets with if that is at least half of its
+    // own facets - an enclosed cell shares ~all of its membrane with its ECS,
+    // while ordinary neighbouring ranks only share a thin interface. Shared
+    // facets are adjacent duplicates in the expanded data (one copy per
+    // contributing rank, see generate_viz_from_output.py).
+    // Returns {groups: rank -> group root, centroids: rank -> offset centroid}.
+    computeExplosionGroups() {
+        const n = this.numRanks || this.rankCentroids.length;
+        const parent = Array.from({ length: n }, (_, i) => i);
+        const find = (x) => {
+            while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+            return x;
+        };
+
+        const ranks = this.ranksData;
+        const dof = this.dofIndices;
+        const total = new Float64Array(n);
+        const nf = ranks.length / 3;
+        if (dof && dof.length === ranks.length) {
+            const shared = new Map();  // r * n + s -> facets of r also owned by s
+            const sameFacet = (a, b) => dof[3 * a] === dof[3 * b]
+                && dof[3 * a + 1] === dof[3 * b + 1] && dof[3 * a + 2] === dof[3 * b + 2];
+            let i = 0;
+            while (i < nf) {
+                let j = i + 1;
+                while (j < nf && sameFacet(i, j)) j++;
+                for (let a = i; a < j; a++) {
+                    const ra = ranks[3 * a];
+                    total[ra]++;
+                    for (let b = i; b < j; b++) {
+                        const rb = ranks[3 * b];
+                        if (rb !== ra) shared.set(ra * n + rb, (shared.get(ra * n + rb) || 0) + 1);
+                    }
+                }
+                i = j;
+            }
+            const best = new Map();  // r -> [s, count]
+            for (const [key, count] of shared) {
+                const r = Math.floor(key / n);
+                if (!best.has(r) || count > best.get(r)[1]) best.set(r, [key % n, count]);
+            }
+            for (const [r, [s, count]] of best) {
+                if (count >= 0.5 * total[r]) parent[find(r)] = find(s);
+            }
+        } else {
+            for (let f = 0; f < nf; f++) total[ranks[3 * f]]++;
+        }
+
+        // Group centroid: facet-weighted mean of the members' centroids.
+        const sums = new Map();  // root -> [x, y, z, w]
+        for (let r = 0; r < n; r++) {
+            if (!total[r] || !this.rankCentroids[r]) continue;
+            const root = find(r);
+            const acc = sums.get(root) || [0, 0, 0, 0];
+            const c = this.rankCentroids[r];
+            acc[0] += c[0] * total[r]; acc[1] += c[1] * total[r]; acc[2] += c[2] * total[r];
+            acc[3] += total[r];
+            sums.set(root, acc);
+        }
+        const groups = new Int32Array(n);
+        const centroids = [];
+        for (let r = 0; r < n; r++) {
+            groups[r] = find(r);
+            const acc = sums.get(groups[r]);
+            centroids.push(acc ? [acc[0] / acc[3], acc[1] / acc[3], acc[2] / acc[3]] : this.rankCentroids[r]);
+        }
+        return { groups, centroids };
+    }
+
+    explosionCentroids() {
+        if (!this._explosionCentroids) {
+            const { groups, centroids } = this.computeExplosionGroups();
+            this.explosionGroups = groups;
+            this._explosionCentroids = centroids;
+        }
+        return this._explosionCentroids;
+    }
+
     // Apply explosion effect - moves each rank's vertices away from center
+    // (nested ranks move together, see computeExplosionGroups)
     setExplosionFactor(factor) {
         this.explosionFactor = factor;
 
@@ -726,6 +809,7 @@ class Viewer {
         }
 
         const gc = this.globalCentroid;
+        const centroids = this.explosionCentroids();
 
         // Update membrane mesh vertices
         if (this.meshObject && this.originalVertices) {
@@ -733,7 +817,7 @@ class Viewer {
 
             for (let i = 0; i < this.ranksData.length; i++) {
                 const rank = this.ranksData[i];
-                const centroid = this.rankCentroids[rank];
+                const centroid = centroids[rank];
 
                 // Direction from global centroid to rank centroid
                 const dx = centroid[0] - gc[0];
@@ -756,7 +840,7 @@ class Viewer {
 
             for (let i = 0; i < this.ecsRanksData.length; i++) {
                 const rank = this.ecsRanksData[i];
-                const centroid = this.rankCentroids[rank];
+                const centroid = centroids[rank];
 
                 const dx = centroid[0] - gc[0];
                 const dy = centroid[1] - gc[1];
@@ -777,7 +861,7 @@ class Viewer {
 
             for (let i = 0; i < this.cutRanksData.length; i++) {
                 const rank = this.cutRanksData[i];
-                const centroid = this.rankCentroids[rank];
+                const centroid = centroids[rank];
 
                 const dx = centroid[0] - gc[0];
                 const dy = centroid[1] - gc[1];
@@ -1504,6 +1588,13 @@ class Viewer {
         this._extraLUT = null;
     }
 
+    hideBoundsOutline() {
+        if (this._boundsOutline) {
+            this.scene.remove(this._boundsOutline);
+            this._boundsOutline = null;
+        }
+    }
+
     showBoundsOutline(bounds) {
         // Remove old outline if any
         if (this._boundsOutline) {
@@ -1796,6 +1887,7 @@ class Viewer {
     // Store DOF index mapping for interface highlighting
     setDofIndices(dofIndices) {
         this.dofIndices = dofIndices;
+        this._explosionCentroids = null;  // facet sharing defines the explosion groups
     }
 
     // Store ECS DOF index mapping for interface highlighting on ECS mesh

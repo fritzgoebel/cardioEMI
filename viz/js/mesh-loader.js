@@ -18,7 +18,12 @@ class MeshLoader {
     }
 
     async load(statusCallback) {
-        const meshPath = this.getMeshPath();
+        return this.loadFrom(this.getMeshPath(), statusCallback);
+    }
+
+    // Load viewer data from an explicit folder (e.g. a remote mesh's preview
+    // in data/_preview/<mesh>) without changing currentMesh.
+    async loadFrom(meshPath, statusCallback) {
         const report = statusCallback || (() => {});
         console.log(`Loading mesh data from ${meshPath}...`);
 

@@ -5,6 +5,8 @@ App.prototype.setupMeshSelector = async function() {
     const convertBtn = document.getElementById('convert-mesh');
     const refreshBtn = document.getElementById('refresh-mesh-list');
 
+    this.setupMeshBatch();
+
     // Initial mesh list load (always local to get current mesh for viewer)
     const savedTarget = this.runTarget;
     this.runTarget = 'local';
@@ -23,7 +25,7 @@ App.prototype.setupMeshSelector = async function() {
         await this.convertMesh(meshName);
     });
 
-    // Handle refresh button (visible in Karolina mode)
+    // Handle refresh button (visible in remote mode)
     refreshBtn.addEventListener('click', () => {
         this.refreshMeshList();
     });
@@ -50,14 +52,19 @@ App.prototype.refreshMeshList = async function() {
         return;
     }
 
-    if (this.runTarget === 'karolina') {
-        // Karolina mode: fetch remote meshes and populate dropdown
+    // Cluster targets pick meshes from the batch checklist (app-mesh-batch.js);
+    // the dropdown stays as the hidden holder of the focused mesh.
+    selector.style.display = this.isRemote() ? 'none' : '';
+    document.getElementById('mesh-batch').style.display = this.isRemote() ? 'block' : 'none';
+
+    if (this.isRemote()) {
+        // Remote mode: fetch remote meshes and populate dropdown
         selector.innerHTML = '<option value="">Loading remote meshes...</option>';
         remoteConvertArea.innerHTML = '';
         remoteConvertArea.style.display = 'none';
 
         try {
-            const families = await this.karolinaRunner.listRemoteMeshes();
+            const families = await this.clusterRunner.listRemoteMeshes();
             const localNames = new Set(localMeshes.map(m => m.name));
 
             selector.innerHTML = '';
@@ -111,8 +118,11 @@ App.prototype.refreshMeshList = async function() {
             }
 
             if (!hasOptions) {
-                selector.innerHTML = '<option value="">No converted meshes on Karolina</option>';
+                selector.innerHTML = '<option value="">No converted meshes on the cluster</option>';
             }
+            this.setBatchMeshes([...selector.options]
+                .filter(o => o.value)
+                .map(o => ({ name: o.value, label: (o.textContent.match(/\(([^)]*)\)$/) || [])[1] || '' })));
 
             // Show unconverted meshes as dropdown with convert button
             if (unconverted.length > 0) {
@@ -148,6 +158,7 @@ App.prototype.refreshMeshList = async function() {
             }
         } catch (e) {
             selector.innerHTML = '<option value="">Failed to load remote meshes</option>';
+            this.setBatchMeshes([]);
             console.error('Failed to load remote meshes:', e);
         }
     } else {
@@ -180,18 +191,22 @@ App.prototype.refreshMeshList = async function() {
     const selected = selector.value;
     if (selected && this.runTarget === 'local') {
         this.updateMeshStatus(selected, localMeshes);
+        const selectedInfo = localMeshes.find(m => m.name === selected);
+        this.updateMeshTagInfo(selectedInfo?.numTags, selectedInfo?.numComponents, selectedInfo?.numOriginalTags);
     }
 };
 
 App.prototype.onMeshSelected = async function(meshName) {
-    if (this.runTarget === 'karolina') {
-        await this.onKarolinaMeshSelected(meshName);
+    if (this.isRemote()) {
+        await this.onRemoteMeshSelected(meshName);
     } else {
         const response = await fetch('/api/meshes');
         const data = await response.json();
         const meshInfo = data.meshes.find(m => m.name === meshName);
 
         if (!meshInfo) return;
+
+        this.updateMeshTagInfo(meshInfo.numTags, meshInfo.numComponents, meshInfo.numOriginalTags);
 
         if (meshInfo.converted) {
             await this.selectMesh(meshName);
@@ -201,7 +216,51 @@ App.prototype.onMeshSelected = async function(meshName) {
     }
 };
 
-App.prototype.onKarolinaMeshSelected = async function(meshName) {
+// Number of volume tags / mesh-partitioning units for the selected mesh.
+// numOriginalTags/numComponents come from the original uncolored mesh (only
+// known for a `_colored` mesh) - see get_mesh_tag_counts server-side:
+//   numOriginalTags -> target rank count for component_granularity "tag"
+//   numComponents   -> target rank count for component_granularity "component" (default)
+App.prototype.updateMeshTagInfo = function(numTags, numComponents, numOriginalTags) {
+    this.currentMeshNumComponents = numComponents || null;
+    this.currentMeshNumOriginalTags = numOriginalTags || null;
+
+    const infoEl = document.getElementById('mesh-tags-info');
+    if (numTags == null) {
+        infoEl.style.display = 'none';
+    } else {
+        infoEl.style.display = 'block';
+        infoEl.className = 'mesh-status';
+        infoEl.textContent = numOriginalTags
+            ? `Tags: ${numOriginalTags} (${numComponents} ECS+cell pairs)`
+            : `Tags: ${numTags}`;
+    }
+
+    const canMatch = !!(numComponents || numOriginalTags);
+    const matchBtn = document.getElementById('match-ranks-to-tags');
+    if (matchBtn) matchBtn.style.display = canMatch ? 'inline-block' : 'none';
+
+    this.updateMatchButtonLabels();
+};
+
+// Rank target for the current mesh + component_granularity choice - or null
+// if 'Tag based' partitioning isn't applicable to the selected mesh.
+App.prototype.getPartitionTargetCount = function() {
+    return this.componentGranularity === 'tag'
+        ? this.currentMeshNumOriginalTags
+        : this.currentMeshNumComponents;
+};
+
+// Keep the "= N" match-button labels showing the count they'll actually set,
+// since that depends on both the selected mesh and component_granularity.
+App.prototype.updateMatchButtonLabels = function() {
+    const target = this.getPartitionTargetCount();
+    const label = target ? `= ${target}` : '= components';
+    const el = document.getElementById('match-ranks-to-tags');
+    if (el) el.textContent = label;
+};
+
+App.prototype.onRemoteMeshSelected = async function(meshName) {
     const statusEl = document.getElementById('mesh-status');
     const convertBtn = document.getElementById('convert-mesh');
 
@@ -211,17 +270,22 @@ App.prototype.onKarolinaMeshSelected = async function(meshName) {
     // Step 1: Check if mesh data exists locally
     let localInfo = this.meshesInfo?.find(m => m.name === meshName);
 
+    if (localInfo) {
+        this.updateMeshTagInfo(localInfo.numTags, localInfo.numComponents, localInfo.numOriginalTags);
+    }
+
     if (!localInfo) {
-        // Mesh not local — fetch metadata (bounds) from Karolina instead of downloading
+        // Mesh not local — fetch metadata (bounds) from the cluster instead of downloading
         statusEl.className = 'mesh-status pending';
-        statusEl.textContent = `Fetching bounds for ${meshName} from Karolina...`;
+        statusEl.textContent = `Fetching bounds for ${meshName} from ${this.clusterLabel()}...`;
 
         try {
-            const metadata = await this.karolinaRunner.fetchMeshMetadata(meshName);
+            const metadata = await this.clusterRunner.fetchMeshMetadata(meshName);
             this.applyRemoteMeshMetadata(meshName, metadata);
-            statusEl.className = 'mesh-status converted';
-            statusEl.textContent = `Remote mesh: ${meshName} (${metadata.vertex_count.toLocaleString()} vertices) — bounds loaded`;
+            statusEl.className = 'mesh-status pending';
+            statusEl.textContent = `Remote mesh: ${meshName} — building membrane preview on ${this.clusterLabel()}…`;
             statusEl.style.display = 'block';
+            await this.loadRemoteMeshPreview(meshName);
             return;
         } catch (e) {
             statusEl.className = 'mesh-status error';
@@ -249,11 +313,40 @@ App.prototype.onKarolinaMeshSelected = async function(meshName) {
     await this.selectMesh(meshName);
 };
 
+// Show a remote-only mesh's membranes instead of just its bounding box. The
+// preview is built next to the mesh, coarsened to a triangle budget if needed,
+// and cached on both sides (see /api/cluster/<id>/meshes/preview).
+App.prototype.loadRemoteMeshPreview = async function(meshName) {
+    const statusEl = document.getElementById('mesh-status');
+    const seq = this._meshPreviewSeq = (this._meshPreviewSeq || 0) + 1;
+    try {
+        const res = await this.clusterRunner.fetchMeshPreview(meshName);
+        const meshData = await this.meshLoader.loadFrom(res.path);
+        // The user may have picked another mesh meanwhile.
+        if (seq !== this._meshPreviewSeq || this.meshLoader.currentMesh !== meshName) return;
+        await this.viewer.reloadMesh(meshData);
+        this.viewer.hideBoundsOutline();
+        this.updateBoundingBoxVisualization();
+        const p = res.metadata.preview || {};
+        const res_note = p.cluster_size
+            ? `coarsened to ${res.metadata.facet_count.toLocaleString()} of ${p.full_facets.toLocaleString()} triangles (${p.cluster_size.toFixed(1)} µm grid)`
+            : `${res.metadata.facet_count.toLocaleString()} triangles, full resolution`;
+        statusEl.className = 'mesh-status converted';
+        statusEl.textContent = `Remote mesh: ${meshName} — membrane preview, ${res_note}`;
+    } catch (e) {
+        if (seq !== this._meshPreviewSeq) return;
+        statusEl.className = 'mesh-status error';
+        statusEl.textContent = `Remote mesh: ${meshName} — bounds only (preview failed: ${e.message})`;
+    }
+    statusEl.style.display = 'block';
+};
+
 App.prototype.applyRemoteMeshMetadata = function(meshName, metadata) {
     // Store bounds and conversion factor from remote metadata
     this.meshBounds = metadata.bounds;
     this.conversionFactor = metadata.mesh_conversion_factor;
     this.remoteMeshName = meshName;
+    this.updateMeshTagInfo(metadata.num_tags, metadata.num_components, metadata.num_original_tags);
 
     // Track this as the current mesh (used by conditions snapshot, v_init, etc.)
     this.meshLoader.setMesh(meshName);
@@ -395,13 +488,13 @@ App.prototype.convertRemoteMeshAndRefresh = async function(family, mesh, color) 
     const outputPrefix = color ? mesh.name + '_colored' : mesh.name;
 
     statusEl.className = 'mesh-status pending';
-    statusEl.textContent = `Converting ${outputPrefix} on Karolina...`;
+    statusEl.textContent = `Converting ${outputPrefix} on ${this.clusterLabel()}...`;
     statusEl.style.display = 'block';
     outputEl.style.display = 'block';
     outputEl.textContent = '';
 
     try {
-        await this.karolinaRunner.convertRemoteMesh(
+        await this.clusterRunner.convertRemoteMesh(
             family, mesh.pts, mesh.elem, outputPrefix, color,
             (text) => {
                 outputEl.textContent += text;

@@ -464,28 +464,25 @@ create_dd_matrix_from_local_coo(
     return dd_mat;
 }
 
-/// Set a constant nullspace on a DdMatrix (for pure Neumann problems)
+/// Set the constant nullspace on an operator (for pure Neumann problems)
 ///
-/// Must be called after read_distributed. Creates a constant vector
-/// as the nullspace, which enables proper handling of singular systems.
+/// Works for any Ginkgo operator deriving from gko::EnableNullspaceRemoval,
+/// i.e. the regular distributed Matrix as well as the DdMatrix. Ginkgo builds
+/// the all-ones vector matching the operator's row distribution and normalizes
+/// it. The nullspace is metadata, in the same sense as PETSc's
+/// MatSetNullSpace: the operator's apply is unchanged, and it is the solver
+/// (Ginkgo's CG) that projects the nullspace out of the initial residual, the
+/// search directions and the final solution, so a singular (pure Neumann)
+/// system is solved for the minimum-norm solution.
 ///
-/// @param dd_mat The DdMatrix to set the nullspace on
-/// @param row_ranges Partition ranges used to create the distributed vector
-template<typename ValueType = double,
-         typename LocalIndexType = std::int32_t,
-         typename GlobalIndexType = std::int64_t>
-void set_dd_matrix_constant_null_space(
-    std::shared_ptr<gko_dist::DdMatrix<ValueType, LocalIndexType, GlobalIndexType>> dd_mat,
-    const std::vector<GlobalIndexType>& row_ranges)
+/// Must be called after the matrix data has been read (read_distributed), so
+/// that the operator's size and partition are known.
+///
+/// @param mat The operator to attach the constant nullspace to
+template<typename MatrixType>
+void set_constant_null_space(std::shared_ptr<MatrixType> mat)
 {
-    auto exec = dd_mat->get_executor();
-    auto gko_comm = std::make_shared<gko::experimental::mpi::communicator>(
-        dd_mat->get_communicator());
-
-    auto partition = create_partition_from_ranges<LocalIndexType, GlobalIndexType>(
-        exec->get_master(), row_ranges);
-
-    dd_mat->set_constant_null_space(partition);
+    mat->set_constant_nullspace();
 }
 
 /// Update values of an existing Ginkgo DdMatrix from local COO data

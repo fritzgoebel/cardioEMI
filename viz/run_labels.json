@@ -1,0 +1,194 @@
+{
+  "categories": {
+    "conditions:{\"boundingBox\": {\"xMax\": 133.997875976562, \"xMin\": -70.8393249511719, \"yMax\": 98.1378631591797, \"yMin\": -18.8621387481689, \"zMax\": 117.580278949738, \"zMin\": -19.7297172546387}, \"mesh\": \"rizzo36_colored\", \"scarEnabled\": false, \"vExcited\": 0, \"vResting\": -80}": "rizzo",
+    "conditions:{\"boundingBox\": {\"xMax\": 155.421193847656, \"xMin\": -83.9787979125977, \"yMax\": 116.077715749741, \"yMin\": -19, \"zMax\": 218.300109863281, \"zMin\": -20}, \"mesh\": \"kermit36_colored\", \"scarEnabled\": false, \"vExcited\": 0, \"vResting\": -80}": "kermit",
+    "conditions:{\"boundingBox\": {\"xMax\": 156.795173339844, \"xMin\": -81.8848266601563, \"yMax\": 118.100463867187, \"yMin\": -19, \"zMax\": 117.619809379578, \"zMin\": -19.8126602172852}, \"mesh\": \"robin36_colored\", \"scarEnabled\": false, \"vExcited\": 0, \"vResting\": -80}": "robin",
+    "conditions:{\"boundingBox\": {\"xMax\": 172.388803003, \"xMin\": -83.636196997, \"yMax\": 218.4694767155, \"yMin\": -19.6917481433, \"zMax\": 267.122181955, \"zMin\": -19.8780445734}, \"mesh\": \"gonzo37_colored\", \"scarEnabled\": false, \"vExcited\": 0, \"vResting\": -80}": "gonzo",
+    "conditions:{\"boundingBox\": {\"xMax\": 96.4641674804688, \"xMin\": -83.636395415, \"yMax\": 67.8818588256836, \"yMin\": -19.1181411743164, \"zMax\": 118.382690429688, \"zMin\": -19.6173095703125}, \"mesh\": \"pepe36_colored\", \"scarEnabled\": false, \"vExcited\": 0, \"vResting\": -80}": "pepe",
+    "conditions:{\"boundingBox\": {\"xMax\": 96.4641674804688, \"xMin\": -83.636395415, \"yMax\": 67.8818588256836, \"yMin\": -19.1181411743164, \"zMax\": 118.382690429688, \"zMin\": -19.6173095703125}, \"mesh\": \"pepe36_colored_sim_20260827_081259\", \"scarEnabled\": false, \"vExcited\": 0, \"vResting\": -80}": "pepe"
+  },
+  "folders": [
+    "Ginkgo, theory, direct, VEF",
+    "Optimality, Random RHS, VE, Ginkgo",
+    "Optimality, Random RHS, VEF, Ginkgo",
+    "PETSc, theory, direct, VEF (gonzo OOM)",
+    "Weak Scaling, Random RHS, VE, Ginkgo",
+    "Weak Scaling, Random RHS, VE, PETSc (OOM for 512 and 1024)",
+    "Weak Scaling, Random RHS, VEF, Ginkgo",
+    "Weak Scaling, Random RHS, VEF, PETSc (OOM for 512 and 1024)",
+    "batch 2026-10-08"
+  ],
+  "runs": {
+    "cell_16x16x16_n6_L30_p2_a4_s23t12_d96_r26_g55_sim_20261008_090358_8192r": {
+      "folder": "batch 2026-10-08"
+    },
+    "cell_16x16x8_n6_L30_p2_a4_s23t12_d96_r26_g55_sim_20261008_090358_4096r": {
+      "folder": "batch 2026-10-08"
+    },
+    "cell_16x8x8_n6_L30_p2_a4_s23t12_d96_r26_g55_sim_20261008_090358_2048r": {
+      "folder": "batch 2026-10-08"
+    },
+    "cell_2x2x2_n6_L30_p2_a4_s23t12_d96_r26_g55_sim_20261008_090358_16r": {
+      "folder": "batch 2026-10-08"
+    },
+    "cell_4x2x2_n6_L30_p2_a4_s23t12_d96_r26_g55_sim_20261008_090358_32r": {
+      "folder": "batch 2026-10-08"
+    },
+    "cell_4x4x2_n6_L30_p2_a4_s23t12_d96_r26_g55_sim_20261008_090358_64r": {
+      "folder": "batch 2026-10-08"
+    },
+    "cell_4x4x4_n6_L30_p2_a4_s23t12_d96_r26_g55_sim_20261008_090358_128r": {
+      "folder": "batch 2026-10-08"
+    },
+    "cell_8x4x4_n6_L30_p2_a4_s23t12_d96_r26_g55_sim_20261008_090358_256r": {
+      "folder": "batch 2026-10-08"
+    },
+    "cell_8x8x4_n6_L30_p2_a4_s23t12_d96_r26_g55_sim_20261008_090358_512r": {
+      "folder": "batch 2026-10-08"
+    },
+    "cell_8x8x8_n6_L30_p2_a4_s23t12_d96_r26_g55_sim_20261008_090358_1024r": {
+      "folder": "batch 2026-10-08"
+    },
+    "gonzo37_colored_sim_20260827_084611": {
+      "folder": "Ginkgo, theory, direct, VEF"
+    },
+    "kermit36_colored_sim_20260827_084419": {
+      "folder": "Ginkgo, theory, direct, VEF"
+    },
+    "kermit36_colored_sim_20260827_084505": {
+      "folder": "PETSc, theory, direct, VEF (gonzo OOM)"
+    },
+    "pepe36_colored_sim_20260827_081259": {
+      "folder": "Ginkgo, theory, direct, VEF"
+    },
+    "pepe36_colored_sim_20260827_082323": {
+      "folder": "PETSc, theory, direct, VEF (gonzo OOM)"
+    },
+    "plus_2x1x1_n16_L8_sim_20260821_080552": {
+      "folder": "Weak Scaling, Random RHS, VEF, Ginkgo"
+    },
+    "plus_2x1x1_n16_L8_sim_20260821_081553": {
+      "folder": "Weak Scaling, Random RHS, VE, Ginkgo"
+    },
+    "plus_2x1x1_n16_L8_sim_20260821_084550": {
+      "folder": "Weak Scaling, Random RHS, VEF, PETSc (OOM for 512 and 1024)"
+    },
+    "plus_2x1x1_n16_L8_sim_20260821_092044": {
+      "folder": "Weak Scaling, Random RHS, VE, PETSc (OOM for 512 and 1024)"
+    },
+    "plus_2x2x1_n16_L8_sim_20260820_075114": {
+      "folder": "Weak Scaling, Random RHS, VEF, Ginkgo"
+    },
+    "plus_2x2x1_n16_L8_sim_20260821_081637": {
+      "folder": "Weak Scaling, Random RHS, VE, Ginkgo"
+    },
+    "plus_2x2x1_n16_L8_sim_20260821_084635": {
+      "folder": "Weak Scaling, Random RHS, VEF, PETSc (OOM for 512 and 1024)"
+    },
+    "plus_2x2x1_n16_L8_sim_20260821_091946": {
+      "folder": "Weak Scaling, Random RHS, VE, PETSc (OOM for 512 and 1024)"
+    },
+    "plus_2x2x2_n16_L8_sim_20260820_075206": {
+      "folder": "Weak Scaling, Random RHS, VEF, Ginkgo"
+    },
+    "plus_2x2x2_n16_L8_sim_20260821_081714": {
+      "folder": "Weak Scaling, Random RHS, VE, Ginkgo"
+    },
+    "plus_2x2x2_n16_L8_sim_20260821_084714": {
+      "folder": "Weak Scaling, Random RHS, VEF, PETSc (OOM for 512 and 1024)"
+    },
+    "plus_2x2x2_n16_L8_sim_20260821_091915": {
+      "folder": "Weak Scaling, Random RHS, VE, PETSc (OOM for 512 and 1024)"
+    },
+    "plus_4x2x2_n16_L8_sim_20260820_075315": {
+      "folder": "Weak Scaling, Random RHS, VEF, Ginkgo"
+    },
+    "plus_4x2x2_n16_L8_sim_20260821_081749": {
+      "folder": "Weak Scaling, Random RHS, VE, Ginkgo"
+    },
+    "plus_4x2x2_n16_L8_sim_20260821_084756": {
+      "folder": "Weak Scaling, Random RHS, VEF, PETSc (OOM for 512 and 1024)"
+    },
+    "plus_4x2x2_n16_L8_sim_20260821_091823": {
+      "folder": "Weak Scaling, Random RHS, VE, PETSc (OOM for 512 and 1024)"
+    },
+    "plus_4x4x2_n16_L8_sim_20260820_075429": {
+      "folder": "Weak Scaling, Random RHS, VEF, Ginkgo"
+    },
+    "plus_4x4x2_n16_L8_sim_20260821_081821": {
+      "folder": "Weak Scaling, Random RHS, VE, Ginkgo"
+    },
+    "plus_4x4x2_n16_L8_sim_20260821_084855": {
+      "folder": "Weak Scaling, Random RHS, VEF, PETSc (OOM for 512 and 1024)"
+    },
+    "plus_4x4x2_n16_L8_sim_20260821_091727": {
+      "folder": "Weak Scaling, Random RHS, VE, PETSc (OOM for 512 and 1024)"
+    },
+    "plus_4x4x4_n16_L8_sim_20260820_075530": {
+      "folder": "Weak Scaling, Random RHS, VEF, Ginkgo"
+    },
+    "plus_4x4x4_n16_L8_sim_20260821_081945": {
+      "folder": "Weak Scaling, Random RHS, VE, Ginkgo"
+    },
+    "plus_4x4x4_n16_L8_sim_20260821_082555": {
+      "folder": "Optimality, Random RHS, VEF, Ginkgo"
+    },
+    "plus_4x4x4_n16_L8_sim_20260821_083032": {
+      "folder": "Optimality, Random RHS, VE, Ginkgo"
+    },
+    "plus_4x4x4_n16_L8_sim_20260821_084940": {
+      "folder": "Weak Scaling, Random RHS, VEF, PETSc (OOM for 512 and 1024)"
+    },
+    "plus_4x4x4_n16_L8_sim_20260821_091651": {
+      "folder": "Weak Scaling, Random RHS, VE, PETSc (OOM for 512 and 1024)"
+    },
+    "plus_4x4x4_n32_L8_sim_20260821_082642": {
+      "folder": "Optimality, Random RHS, VEF, Ginkgo"
+    },
+    "plus_4x4x4_n32_L8_sim_20260821_083118": {
+      "folder": "Optimality, Random RHS, VE, Ginkgo"
+    },
+    "plus_4x4x4_n8_L8_sim_20260821_082401": {
+      "folder": "Optimality, Random RHS, VEF, Ginkgo"
+    },
+    "plus_4x4x4_n8_L8_sim_20260821_082955": {
+      "folder": "Optimality, Random RHS, VE, Ginkgo"
+    },
+    "plus_8x4x4_n16_L8_sim_20260820_090920": {
+      "folder": "Weak Scaling, Random RHS, VEF, Ginkgo"
+    },
+    "plus_8x4x4_n16_L8_sim_20260821_082049": {
+      "folder": "Weak Scaling, Random RHS, VE, Ginkgo"
+    },
+    "plus_8x4x4_n16_L8_sim_20260821_085028": {
+      "folder": "Weak Scaling, Random RHS, VEF, PETSc (OOM for 512 and 1024)"
+    },
+    "plus_8x4x4_n16_L8_sim_20260821_091405": {
+      "folder": "Weak Scaling, Random RHS, VE, PETSc (OOM for 512 and 1024)"
+    },
+    "plus_8x8x4_n16_L8_sim_20260820_091002": {
+      "folder": "Weak Scaling, Random RHS, VEF, Ginkgo"
+    },
+    "plus_8x8x4_n16_L8_sim_20260821_082128": {
+      "folder": "Weak Scaling, Random RHS, VE, Ginkgo"
+    },
+    "plus_8x8x8_n16_L8_sim_20260820_091044": {
+      "folder": "Weak Scaling, Random RHS, VEF, Ginkgo"
+    },
+    "plus_8x8x8_n16_L8_sim_20260821_082204": {
+      "folder": "Weak Scaling, Random RHS, VE, Ginkgo"
+    },
+    "rizzo36_colored_sim_20260827_084016": {
+      "folder": "Ginkgo, theory, direct, VEF"
+    },
+    "rizzo36_colored_sim_20260827_084141": {
+      "folder": "PETSc, theory, direct, VEF (gonzo OOM)"
+    },
+    "robin36_colored_sim_20260827_084224": {
+      "folder": "Ginkgo, theory, direct, VEF"
+    },
+    "robin36_colored_sim_20260827_084316": {
+      "folder": "PETSc, theory, direct, VEF (gonzo OOM)"
+    }
+  }
+}

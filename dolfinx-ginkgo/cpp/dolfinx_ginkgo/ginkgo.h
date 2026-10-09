@@ -319,7 +319,7 @@ struct BDDCConfig {
     // Coarse solver configuration (distributed - no direct solver)
     // SCHWARZ is a one-shot additive Schwarz preconditioner used directly as
     // the coarse solve (no outer Krylov); local subproblems use MUMPS.
-    enum class CoarseSolver { CG, GMRES, BDDC, SCHWARZ };
+    enum class CoarseSolver { CG, GMRES, BDDC, SCHWARZ, MUMPS };
     CoarseSolver coarse_solver = CoarseSolver::CG;
     int coarse_max_iterations = 100;      ///< Max iterations for iterative coarse solver
     double coarse_tolerance = 1e-10;      ///< Tolerance for iterative coarse solver
@@ -329,6 +329,10 @@ struct BDDCConfig {
 
     // Advanced options
     bool repartition_coarse = true;       ///< Repartition coarse problem for load balance
+    bool distributed_coarse = false;      ///< Repartitioned coarse problem: false = rank 0 only, true = automatically chosen number of ranks
+    bool write_interfaces = true;         ///< Write IF_<rank>.txt (first/finest level only)
+    bool unanimous_connectivity = true;   ///< Require all ranks sharing an interface to agree
+                                          ///< on its connectivity when forming primal constraints
     bool constant_nullspace = false;      ///< Handle constant nullspace (pure Neumann BC) - per rank
     bool coarse_constant_nullspace = false; ///< Constant nullspace for coarse BDDC level
 };
@@ -358,7 +362,7 @@ struct SolverConfig {
     BDDCConfig bddc;
 
     // Nullspace handling
-    bool pure_neumann = false;            ///< Set constant nullspace on DdMatrix (pure Neumann BC)
+    bool pure_neumann = false;            ///< Set constant nullspace on the operator (pure Neumann BC)
 
     // Diagnostics: capture per-iteration true ||b - A*x|| (and implicit norm)
     // via gko::log::Record. Opt-in because Record clones b, x, r per iteration.

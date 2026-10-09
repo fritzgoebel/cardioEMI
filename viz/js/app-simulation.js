@@ -1,4 +1,4 @@
-// app-simulation.js - Simulation execution (local + Karolina), conditions snapshot
+// app-simulation.js - Simulation execution (local + remote cluster), conditions snapshot
 
 App.prototype.runSimulation = async function() {
     const statusEl = document.getElementById('simulation-status');
@@ -22,6 +22,9 @@ App.prototype.runSimulation = async function() {
         const trackIterResEl = document.getElementById('track-iter-residuals');
         const trackIterRes = !!(trackIterResEl && trackIterResEl.checked);
 
+        const randomRhsEl = document.getElementById('random-rhs');
+        const randomRhs = !!(randomRhsEl && randomRhsEl.checked);
+
         const configUpdates = {
             v_init: vinitValue,
             dt: this.dt,
@@ -34,7 +37,9 @@ App.prototype.runSimulation = async function() {
             ksp_atol: atol,
             bc_type: this.bcType,
             partition_mode: this.partitionMode,
-            track_iter_residuals: trackIterRes
+            component_granularity: this.componentGranularity,
+            track_iter_residuals: trackIterRes,
+            random_rhs: randomRhs
         };
 
         this.solverConfig.backend = solverBackend;
@@ -108,7 +113,9 @@ App.prototype.runSimulation = async function() {
                     vertices: document.getElementById('bddc-vertices').checked,
                     edges: document.getElementById('bddc-edges').checked,
                     faces: document.getElementById('bddc-faces').checked,
-                    repartitionCoarse: document.getElementById('bddc-repartition-coarse').checked,
+                    distributedCoarse: document.getElementById('bddc-coarse-placement').value === 'distributed',
+                    unanimousConnectivity: document.getElementById('bddc-unanimous-connectivity').checked,
+                    writeInterfaces: document.getElementById('bddc-write-interfaces').checked,
                     localAmg: {
                         coarsening: document.getElementById('bddc-local-amg-coarsening').value,
                         strengthThreshold: parseFloat(document.getElementById('bddc-local-amg-strength-threshold').value),
@@ -160,7 +167,7 @@ App.prototype.runSimulation = async function() {
     }
 
     // Save conditions for local runs
-    if (this.runTarget !== 'karolina') {
+    if (!this.isRemote()) {
         try {
             const meshName = this.meshLoader.currentMesh || 'unknown';
             const outName = meshName + '_sim';
@@ -174,8 +181,8 @@ App.prototype.runSimulation = async function() {
         }
     }
 
-    if (this.runTarget === 'karolina') {
-        await this.runSimulationKarolina(statusEl, outputEl, runBtn);
+    if (this.isRemote()) {
+        await this.runSimulationRemote(statusEl, outputEl, runBtn);
     } else {
         await this.runSimulationLocal(statusEl, outputEl, runBtn);
     }
@@ -250,61 +257,61 @@ App.prototype.runSimulationLocal = async function(statusEl, outputEl, runBtn) {
     }
 };
 
-App.prototype.runSimulationKarolina = async function(statusEl, outputEl, runBtn) {
+App.prototype.runSimulationRemote = async function(statusEl, outputEl, runBtn) {
     outputEl.style.display = 'none';
-    const jobSection = document.getElementById('karolina-job-section');
+    const jobSection = document.getElementById('cluster-job-section');
 
     try {
+        // One job per (checked mesh, rank count); the config just saved for
+        // the shown mesh is the template for all of them.
+        const { meshes } = this.buildBatchRequest();
+        const nJobs = meshes.reduce((n, m) => n + m.ranks.length, 0);
+
         statusEl.className = 'status visible running';
-        statusEl.textContent = 'Submitting to Karolina...';
+        statusEl.textContent = `Submitting ${nJobs} job${nJobs === 1 ? '' : 's'} to ${this.clusterLabel()}...`;
 
-        const configFile = this.configManager.configFile || 'input_pepe36_colored.yml';
         const conditions = this.getConditionsSnapshot();
-
-        const options = {
-            config: configFile,
-            nodes: document.getElementById('karolina-nodes').value.trim(),
-            ntasks_per_node: parseInt(document.getElementById('karolina-ntasks').value) || 128,
-            walltime: document.getElementById('karolina-walltime').value || '01:00:00',
-            partition: document.getElementById('karolina-partition').value || 'qcpu_exp',
-            account: document.getElementById('karolina-account').value || 'eu-26-11',
+        const result = await this.clusterRunner.submitBatch({
+            config: this.configManager.configFile || 'input_pepe36_colored.yml',
+            meshes,
+            max_tasks_per_node: this.batchMaxTasksPerNode(),
+            walltime: document.getElementById('cluster-walltime').value || '01:00:00',
+            // Empty values fall back to the cluster's configured defaults server-side
+            partition: document.getElementById('cluster-partition').value || '',
+            account: document.getElementById('cluster-account').value || '',
             solver_backend: document.getElementById('solver-backend').value || 'petsc',
             conditions,
-        };
+            folder: this.batchFolderName(),
+        });
+        const jobs = result.jobs || [];
 
-        const result = await this.karolinaRunner.submit(options);
-        const jobs = result.jobs || [result];
-        const meshName = this.meshLoader.currentMesh || null;
-
-        jobSection.style.display = 'block';
+        if (jobs.length) jobSection.style.display = 'block';
         for (const job of jobs) {
             const jobId = job.job_id;
-            this.karolinaJobs[jobId] = {
+            this.clusterJobs[jobId] = {
                 ...job,
                 conditions_hash: job.conditions_hash,
-                mesh_name: meshName,
+                mesh_name: job.mesh,
                 solver_backend: conditions.solver,
                 preconditioner: conditions.preconditioner,
                 localSolver: conditions.localSolver,
             };
-            this.renderJobEntry(job);
-            this.ensureMeshInFilter(meshName);
-            this.karolinaRunner.startPolling(jobId, (data) => {
+            // The stored entry, not the server's: only it carries solver/precond.
+            this.renderJobEntry(this.clusterJobs[jobId]);
+            this.ensureMeshInFilter(job.mesh);
+            this.clusterRunner.startPolling(jobId, (data) => {
                 this.updateJobStatus(jobId, data);
-                if (data.out_name) {
-                    this.karolinaJobs[jobId].out_name = data.out_name;
-                }
-            });
+            }, job.out_name);
         }
-        this.saveKarolinaJobs();
+        this.saveClusterJobs();
         this.renderMeshFilter();
         this.applyMeshFilter();
+        this.loadRunIndex({ refresh: true });  // new run folders, filed into their folder
 
-        const jobIds = jobs.map(j => j.job_id).join(', ');
-        statusEl.className = 'status visible success';
-        statusEl.textContent = jobs.length === 1
-            ? `Job ${jobIds} submitted!`
-            : `${jobs.length} jobs submitted: ${jobIds}`;
+        const failed = result.failed || [];
+        statusEl.className = 'status visible ' + (failed.length ? 'error' : 'success');
+        statusEl.textContent = result.message
+            || `${jobs.length} job(s) submitted: ${jobs.map(j => j.job_id).join(', ')}`;
 
     } catch (error) {
         statusEl.className = 'status visible error';
@@ -346,14 +353,9 @@ App.prototype.getConditionsSnapshot = function() {
         localSolver = document.getElementById('petsc-bddc-local-solver').value;
     }
 
-    const nodesEl = document.getElementById('karolina-nodes');
-    const ntasksEl = document.getElementById('karolina-ntasks');
+    // Cluster batches overwrite mesh/nRanks/boundingBox per job server-side.
     const mpiRanksEl = document.getElementById('mpi-ranks');
-    // For comma-separated node counts, use the first value for the base snapshot
-    const nodesVal = nodesEl ? parseInt(nodesEl.value.split(',')[0]) || 1 : 1;
-    const nRanks = nodesEl && ntasksEl
-        ? nodesVal * (parseInt(ntasksEl.value) || 1)
-        : (mpiRanksEl ? parseInt(mpiRanksEl.value) || 1 : 1);
+    const nRanks = mpiRanksEl ? parseInt(mpiRanksEl.value) || 1 : 1;
 
     const conditions = {
         mesh: this.meshLoader.currentMesh,

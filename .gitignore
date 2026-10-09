@@ -181,3 +181,6 @@ exp_*/
 *.bak
 .DS_Store
 SESSION_SUMMARY.md
+
+# Runs browser: cached cluster listings (machine-local, regenerated on refresh)
+viz/run_index_cache.json

@@ -164,6 +164,7 @@ App.prototype.loadMeshConfig = function() {
             document.getElementById(`${axis}-min-val`).textContent = parseFloat(minSlider.value).toFixed(1);
             document.getElementById(`${axis}-max-val`).textContent = parseFloat(maxSlider.value).toFixed(1);
         });
+        this.applyStimulusSnaps();  // ticked ends follow this mesh, not the saved values
     }
 
     // Restore voltage controls

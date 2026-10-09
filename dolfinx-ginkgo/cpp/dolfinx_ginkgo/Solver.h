@@ -637,6 +637,14 @@ private:
                     .on(exec_);
                 break;
             }
+            case BDDCConfig::CoarseSolver::MUMPS: {
+                // Exact coarse solve, factorized jointly by the ranks holding
+                // the (distributed) coarse matrix.
+                coarse_solver_factory =
+                    gko::experimental::solver::Mumps<ValueType, LocalIndexType>::build()
+                        .on(exec_);
+                break;
+            }
             case BDDCConfig::CoarseSolver::GMRES: {
                 coarse_solver_factory = gko::solver::Gmres<ValueType>::build()
                     .with_krylov_dim(30u)
@@ -824,19 +832,15 @@ private:
                 break;
             }
             case BDDCConfig::CoarseSolver::SCHWARZ: {
-                // One-shot additive Schwarz: MUMPS on rank 0 only (where the
-                // gathered coarse problem lives), Identity on every other rank.
+                // One-shot additive Schwarz: MUMPS on the local block of every
+                // rank holding part of the coarse problem (only rank 0 unless
+                // distributed_coarse); ranks without coarse dofs have an empty
+                // block, which MUMPS skips.
                 // Uses local_schwarz_type because the coarse matrix carries
                 // <LocalIndexType, LocalIndexType> (see local_bddc_type comment above).
-                std::shared_ptr<gko::LinOpFactory> schwarz_local_factory;
-                if (comm_->rank() == 0) {
-                    schwarz_local_factory =
-                        gko::experimental::solver::Mumps<ValueType, LocalIndexType>::build()
-                            .on(exec_);
-                } else {
-                    schwarz_local_factory =
-                        gko::matrix::IdentityFactory<ValueType>::create(exec_);
-                }
+                std::shared_ptr<gko::LinOpFactory> schwarz_local_factory =
+                    gko::experimental::solver::Mumps<ValueType, LocalIndexType>::build()
+                        .on(exec_);
                 coarse_solver_factory =
                     local_schwarz_type::build()
                         .with_local_solver(std::move(schwarz_local_factory))
@@ -865,6 +869,11 @@ private:
             .with_faces(bddc_cfg.faces)
             .with_scaling(scaling)
             .with_repartition_coarse(bddc_cfg.repartition_coarse)
+            .with_distributed_coarse(bddc_cfg.distributed_coarse)
+            // Finest level only; a nested coarse BDDC keeps the default (off)
+            // so it doesn't overwrite the same IF_<rank>.txt files.
+            .with_write_interfaces(bddc_cfg.write_interfaces)
+            .with_unanimous_connectivity(bddc_cfg.unanimous_connectivity)
             ;
         // Optional fill-reducing reordering of the local matrices (A_LL/A_II).
         // BDDC permutes those blocks before handing them to the local and inner

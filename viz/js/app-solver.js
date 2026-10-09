@@ -55,7 +55,9 @@ App.prototype.setupSolverSettings = function() {
                 vertices: true,
                 edges: true,
                 faces: true,
-                repartitionCoarse: true,
+                distributedCoarse: false,
+                writeInterfaces: true,
+                unanimousConnectivity: true,
                 localAmg: {
                     coarsening: 'pgm',
                     strengthThreshold: 0.25,
@@ -303,8 +305,15 @@ App.prototype.setupSolverSettings = function() {
     document.getElementById('bddc-faces').addEventListener('change', (e) => {
         this.solverConfig.ginkgo.bddc.faces = e.target.checked;
     });
-    document.getElementById('bddc-repartition-coarse').addEventListener('change', (e) => {
-        this.solverConfig.ginkgo.bddc.repartitionCoarse = e.target.checked;
+    document.getElementById('bddc-unanimous-connectivity').addEventListener('change', (e) => {
+        this.solverConfig.ginkgo.bddc.unanimousConnectivity = e.target.checked;
+    });
+    document.getElementById('bddc-write-interfaces').addEventListener('change', (e) => {
+        this.solverConfig.ginkgo.bddc.writeInterfaces = e.target.checked;
+    });
+    // Where the (always repartitioned) coarse problem lives.
+    document.getElementById('bddc-coarse-placement').addEventListener('change', (e) => {
+        this.solverConfig.ginkgo.bddc.distributedCoarse = e.target.value === 'distributed';
     });
 
     // BDDC local AMG options
@@ -460,6 +469,9 @@ App.prototype.loadConfigFromYaml = async function() {
         setVal('solver-atol', config.ksp_atol || '1e-12');
         setVal('solver-max-iter', config.max_iterations || 1000);
 
+        // Benchmark mode: random RHS each timestep instead of the ionic-model one
+        setChecked('random-rhs', config.random_rhs);
+
         // Simulation parameters
         if (config.dt !== undefined) {
             setVal('dt-input', config.dt);
@@ -519,7 +531,9 @@ App.prototype.loadConfigFromYaml = async function() {
         if (bddc.vertices !== undefined) setChecked('bddc-vertices', bddc.vertices);
         if (bddc.edges !== undefined) setChecked('bddc-edges', bddc.edges);
         if (bddc.faces !== undefined) setChecked('bddc-faces', bddc.faces);
-        if (bddc.repartition_coarse !== undefined) setChecked('bddc-repartition-coarse', bddc.repartition_coarse);
+        if (bddc.distributed_coarse !== undefined) setVal('bddc-coarse-placement', bddc.distributed_coarse ? 'distributed' : 'rank0');
+        if (bddc.unanimous_connectivity !== undefined) setChecked('bddc-unanimous-connectivity', bddc.unanimous_connectivity);
+        if (bddc.write_interfaces !== undefined) setChecked('bddc-write-interfaces', bddc.write_interfaces);
 
         // Ginkgo BDDC Local AMG options
         const localAmg = bddc.local_amg || {};

@@ -8,7 +8,9 @@ Handles:
 """
 
 import os
+import collections
 import json
+import pickle
 import subprocess
 import re
 import threading
@@ -205,6 +207,11 @@ def update_config():
                 'pc_type': 'lu',
                 'ksp_rtol': '1e-4',
                 'ksp_atol': '1e-8',
+                # Same as essential_defaults above: utils.py treats a missing
+                # save_output as False, so without it the first run from a
+                # freshly viewed cluster mesh wrote no results at all.
+                'save_output': True,
+                'save_interval': 10,
             }
             # Apply updates
             for key, value in updates.items():
@@ -407,7 +414,10 @@ def update_ginkgo_config():
                 'vertices': bddc_config.get('vertices', True),
                 'edges': bddc_config.get('edges', True),
                 'faces': bddc_config.get('faces', True),
-                'repartition_coarse': bddc_config.get('repartitionCoarse', True)
+                'repartition_coarse': True,  # always on, see main.py
+                'distributed_coarse': bddc_config.get('distributedCoarse', False),
+                'write_interfaces': bddc_config.get('writeInterfaces', True),
+                'unanimous_connectivity': bddc_config.get('unanimousConnectivity', True)
             }
             # Inner (interior A_II) solver: only emit when explicitly chosen;
             # omitting it makes the inner solve reuse local_solver (Ginkgo default).
@@ -600,6 +610,47 @@ def create_config_for_mesh(mesh_name, base_config=None):
 
     return new_config_name
 
+def get_mesh_tag_counts(mesh_name):
+    """Tag/rank-target counts for 'Tag based' (component) partitioning.
+
+    `numTags` is read straight from the mesh's own tags_dictionary_file. A
+    `_colored` mesh's own file only has the ~4 coloring tags, so the numbers
+    that matter for partitioning instead come from the original uncolored
+    mesh's tag pickle (tags come in even/odd ECS+cell pairs - see
+    mesh_partition.py):
+      - `numOriginalTags`: one rank per individual tag (component_granularity
+        "tag" - e.g. to match a BDDC convergence theory stated per volume tag)
+      - `numComponents`: one rank per ECS+cell pair (component_granularity
+        "component", the default - numOriginalTags // 2)
+
+    Both are left None for a non-colored mesh: main.py's "component"
+    partition_mode derives `original_mesh_file` by stripping "_colored" off
+    `mesh_file`, so it only works out of the box on a colored mesh - there is
+    nothing to point rank-matching at otherwise.
+    """
+    data_dir = PROJECT_ROOT / 'data'
+
+    def _tag_count(name):
+        p = data_dir / f'{name}.pickle'
+        if not p.exists():
+            return None
+        with open(p, 'rb') as f:
+            return len(pickle.load(f))
+
+    num_tags = _tag_count(mesh_name)
+    num_original_tags = None
+    num_components = None
+    if mesh_name.endswith('_colored'):
+        num_original_tags = _tag_count(mesh_name[:-len('_colored')])
+        num_components = num_original_tags // 2 if num_original_tags is not None else None
+
+    return {
+        'numTags': num_tags,
+        'numOriginalTags': num_original_tags,
+        'numComponents': num_components,
+    }
+
+
 @app.route('/api/meshes')
 def list_meshes():
     """List available mesh files from data/ directory."""
@@ -616,7 +667,8 @@ def list_meshes():
             'file': h5_file.name,
             'size': h5_file.stat().st_size,
             'converted': (converted_dir / 'mesh_metadata.json').exists(),
-            'configFile': config_file
+            'configFile': config_file,
+            **get_mesh_tag_counts(name)
         })
 
     # Also list available config files
@@ -725,7 +777,8 @@ def select_mesh():
         'success': True,
         'message': f'Selected mesh: {mesh_name}',
         'metadata': metadata,
-        'configFile': mesh_state['currentConfig']
+        'configFile': mesh_state['currentConfig'],
+        **get_mesh_tag_counts(mesh_name)
     })
 
 @app.route('/api/meshes/current')
@@ -743,21 +796,76 @@ def get_current_mesh():
 
     return jsonify({
         'name': mesh_name,
-        'metadata': metadata
+        'metadata': metadata,
+        **get_mesh_tag_counts(mesh_name)
     })
 
 # --------------------- Weak-scaling meshes ---------------------
 
-# Canonical name: plus_<nx>x<ny>x<nz>_n<n>_L<L>[_p<pad>]  (L: '.' -> 'p';
-# trailing _p<pad> present only when pad > 0, so legacy unpadded names still parse)
-WS_NAME_RE = re.compile(r'^plus_(\d+)x(\d+)x(\d+)_n(\d+)_L([0-9p]+?)(?:_p(\d+))?$')
+# Canonical name: <plus|cell>_<nx>x<ny>x<nz>_n<n>_L<L>[_p<pad>][_a<ax>]
+# (L: '.' -> 'p'; the optional suffixes are omitted at their defaults, so legacy
+# unpadded cubic 'plus' names still parse). 'cell' is the myocyte-like shape,
+# whose boxes are stretched to ax*L in x; 'plus' is the original cubic geometry.
+WS_NAME_RE = re.compile(
+    r'^(plus|cell)_(\d+)x(\d+)x(\d+)_n(\d+)_L([0-9p]+?)(?:_p(\d+))?'
+    r'(?:_a(\d+))?(?:_s(\d+)t(\d+)(?:u(\d+))?)?'
+    r'(?:_d(\d+)(?:z(\d+))?)?(?:_r(\d+))?(?:_g(\d+))?$')
 
 
-def weak_scaling_name(nx, ny, nz, n, L, pad=0):
+def _generator_reason(lines):
+    """Pull the actionable line out of the mesh generator's output.
+
+    Its failures are raised as ValueError/RuntimeError with a message naming the
+    parameter to change, so the last exception line is what the user needs; a
+    bare traceback frame is not.
+    """
+    text = [l.strip() for l in lines if l.strip()]
+    for line in reversed(text):
+        for marker in ('ValueError:', 'RuntimeError:', 'Error:'):
+            if marker in line:
+                return line.split(marker, 1)[1].strip() or line
+    # No exception line (killed, or failed without raising): the last line of
+    # output is still more use than the exit code.
+    return text[-1] if text else None
+
+
+def resolve_ws_shift(ax, d_y, d_z, max_slabs=24):
+    """Common denominator and numerators for the two lateral shifts.
+
+    Mirrors CellShape.resolve: each direction's shift is Lx - 2d, and both have
+    to be expressed over one denominator because a box's offset is
+    (J*step_y + K*step_z)/slabs of the box length.
+    """
+    want = [(ax - 2 * d) / ax for d in (d_y, d_z)]
+    best, best_err = (2, 1, 1), float('inf')
+    for q in range(2, max_slabs + 1):
+        ps = [min(q - 1, max(1, int(round(w * q)))) for w in want]
+        err = max(abs(w - p / q) for w, p in zip(want, ps))
+        if err < best_err - 1e-12:
+            best, best_err = (q, ps[0], ps[1]), err
+    return best
+
+
+def weak_scaling_name(nx, ny, nz, n, L, pad=0, shape='cell', ax=1, slabs=0,
+                      step_y=1, step_z=1, d_y=0.0, d_z=0.0, lat_r=0.0, lean=0.0):
     Ls = ('%g' % L).replace('.', 'p')
-    name = f'plus_{nx}x{ny}x{nz}_n{n}_L{Ls}'
+    name = f'{shape}_{nx}x{ny}x{nz}_n{n}_L{Ls}'
     if pad:
         name += f'_p{pad}'
+    if shape != 'plus' and ax != 1:
+        name += f'_a{ax}'
+    if shape != 'plus' and slabs:
+        name += f'_s{slabs}t{step_y}'
+        if step_z != step_y:
+            name += f'u{step_z}'
+    if shape != 'plus' and (d_y or d_z):
+        name += f'_d{int(round((d_y or d_z) * 100))}'
+        if d_z and d_z != d_y:
+            name += f'z{int(round(d_z * 100))}'
+    if shape != 'plus' and lat_r:
+        name += f'_r{int(round(lat_r * 100))}'
+    if shape != 'plus' and lean:
+        name += f'_g{int(round(lean))}'
     return name
 
 
@@ -765,12 +873,40 @@ def parse_weak_scaling_name(name):
     m = WS_NAME_RE.match(name)
     if not m:
         return None
+    def num(i, scale=1.0, dflt=0.0):
+        return int(m.group(i)) / scale if m.group(i) else dflt
     return {
-        'name': name,
-        'nx': int(m.group(1)), 'ny': int(m.group(2)), 'nz': int(m.group(3)),
-        'n': int(m.group(4)), 'L': float(m.group(5).replace('p', '.')),
-        'pad': int(m.group(6)) if m.group(6) else 0,
+        'name': name, 'shape': m.group(1),
+        'nx': int(m.group(2)), 'ny': int(m.group(3)), 'nz': int(m.group(4)),
+        'n': int(m.group(5)), 'L': float(m.group(6).replace('p', '.')),
+        'pad': int(num(7, 1.0, 0)), 'ax': int(num(8, 1.0, 1)),
+        'slabs': int(num(9, 1.0, 0)), 'step_y': int(num(10, 1.0, 1)),
+        'step_z': int(num(11, 1.0, 0)) or int(num(10, 1.0, 1)),
+        'd_y': num(12, 100.0), 'd_z': num(13, 100.0),
+        'lat_r': num(14, 100.0), 'lean': num(15, 1.0),
     }
+
+
+def validate_weak_scaling(nx, ny, nz, n, L, pad, shape, ax, slabs=0):
+    """Return an error string, or None if the parameters are generatable."""
+    if shape not in ('cell', 'plus'):
+        return "shape must be 'cell' or 'plus'"
+    if min(nx, ny, nz) < 1:
+        return 'Require nx, ny, nz >= 1'
+    if L <= 0 or pad < 0:
+        return 'Require L > 0 and pad >= 0'
+    if shape == 'plus':
+        if n < 4 or n % 4 != 0:
+            return 'The plus shape needs n a multiple of 4 (>= 4)'
+    else:
+        if n < 4:
+            return 'The cell shape needs n >= 4 elements per L'
+        if ax < 2:
+            # Both the near-face and far-face connectors must fit along x.
+            return 'The cell shape needs an x aspect of at least 2'
+        if slabs and slabs < 2:
+            return 'Slabs per box must be >= 2 (the lattice shift is Lx/slabs)'
+    return None
 
 
 @app.route('/api/weak-scaling/list')
@@ -780,17 +916,21 @@ def weak_scaling_list():
     viz_data_dir = Path(__file__).parent / 'data'
 
     items = []
-    for h5_file in sorted(data_dir.glob('plus_*_n*_L*.h5')):
-        info = parse_weak_scaling_name(h5_file.stem)
-        if not info:
-            continue
-        info['converted'] = (viz_data_dir / h5_file.stem / 'mesh_metadata.json').exists()
-        info['size'] = h5_file.stat().st_size
-        items.append(info)
+    seen = set()
+    for pattern in ('plus_*_n*_L*.h5', 'cell_*_n*_L*.h5'):
+        for h5_file in sorted(data_dir.glob(pattern)):
+            info = parse_weak_scaling_name(h5_file.stem)
+            if not info or h5_file.stem in seen:
+                continue
+            seen.add(h5_file.stem)
+            info['converted'] = (viz_data_dir / h5_file.stem / 'mesh_metadata.json').exists()
+            info['size'] = h5_file.stat().st_size
+            items.append(info)
 
     return jsonify({
-        'meshes': items,
-        'defaults': {'n': 16, 'L': 25.0, 'pad': 4},
+        'meshes': sorted(items, key=lambda i: i['name']),
+        'defaults': {'n': 12, 'L': 25.0, 'pad': 0, 'shape': 'cell', 'ax': 4,
+                     'slabs': 2},
     })
 
 
@@ -803,15 +943,29 @@ def weak_scaling_generate():
     data = request.json or {}
     try:
         nx = int(data['nx']); ny = int(data['ny']); nz = int(data['nz'])
-        n = int(data.get('n', 16)); L = float(data.get('L', 25.0))
-        pad = int(data.get('pad', 4))
+        n = int(data.get('n', 12)); L = float(data.get('L', 25.0))
+        pad = int(data.get('pad', 0))
+        shape = str(data.get('shape', 'cell'))
+        ax = int(data.get('ax', 4)) if shape != 'plus' else 1
+        cell = shape != 'plus'
+        d_y = float(data.get('d_y', 0.5) or 0.5) if cell else 0.0
+        d_z = float(data.get('d_z', 0) or 0) if cell else 0.0
+        lean = float(data.get('lean', 55) or 55) if cell else 0.0
+        lat_r = float(data.get('lat_r', 0.26) or 0.26) if cell else 0.0
+        slabs = step_y = step_z = 0
+        if cell:
+            slabs, step_y, step_z = resolve_ws_shift(ax, d_y, d_z or d_y)
+            d_y = 0.5 * (ax - ax * step_y / slabs)
+            d_z = 0.5 * (ax - ax * step_z / slabs)
     except (KeyError, ValueError, TypeError) as e:
         return jsonify({'error': f'Invalid parameters: {e}'}), 400
 
-    if min(nx, ny, nz) < 1 or n < 4 or n % 4 != 0 or L <= 0 or pad < 0:
-        return jsonify({'error': 'Require nx,ny,nz >= 1, n a multiple of 4 (>=4), L > 0, pad >= 0'}), 400
+    err = validate_weak_scaling(nx, ny, nz, n, L, pad, shape, ax, slabs)
+    if err:
+        return jsonify({'error': err}), 400
 
-    name = weak_scaling_name(nx, ny, nz, n, L, pad)
+    name = weak_scaling_name(nx, ny, nz, n, L, pad, shape, ax, slabs,
+                             step_y, step_z, d_y, d_z, lat_r, lean)
 
     def generate():
         if mesh_state['converting']:
@@ -834,18 +988,27 @@ def weak_scaling_generate():
                     str(PROJECT_ROOT / 'geometry' / 'generate_weak_scaling_mesh.py'),
                     '--nx', str(nx), '--ny', str(ny), '--nz', str(nz),
                     '--n', str(n), '--L', str(L), '--pad', str(pad),
-                    '--prefix', str(prefix),
+                    '--shape', shape, '--ax', str(ax), '--no-preview',
+                    '--dist', str(d_y), '--dist-z', str(d_z),
+                    '--lean', str(lean), '--lat-r', str(lat_r),
+                    '--slabs', str(slabs), '--prefix', str(prefix),
                 ]
                 proc = subprocess.Popen(
                     cmd, cwd=str(PROJECT_ROOT),
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                tail = collections.deque(maxlen=40)
                 for line in proc.stdout:
                     line = line.rstrip()
                     if line:
+                        tail.append(line)
                         yield f"data: {json.dumps({'type': 'progress', 'percent': 40, 'message': line})}\n\n"
                 proc.wait()
                 if proc.returncode != 0 or not h5_path.exists():
-                    yield f"data: {json.dumps({'type': 'error', 'message': f'Mesh generation failed (exit {proc.returncode})'})}\n\n"
+                    # "exit 1" on its own tells the user nothing, and the
+                    # generator's own messages say exactly which knob to move --
+                    # so hand the reason back rather than the return code.
+                    why = _generator_reason(tail)
+                    yield f"data: {json.dumps({'type': 'error', 'message': why or f'Mesh generation failed (exit {proc.returncode})'})}\n\n"
                     return
 
             # --- 2. Convert for the viewer (skip if already done) ---
@@ -861,7 +1024,7 @@ def weak_scaling_generate():
             # --- 3. Ensure a matching config exists ---
             cfg = find_config_for_mesh(name)
             if not cfg:
-                base = 'input_plus_weak_scaling.yml'
+                base = f'input_{shape}_weak_scaling.yml'
                 base = base if (PROJECT_ROOT / base).exists() else None
                 cfg = create_config_for_mesh(name, base_config=base)
 
@@ -1090,10 +1253,190 @@ def list_simulations():
         'simulations': sorted(simulations, key=lambda x: x['name'])
     })
 
+# --------------------- Run / category names (Compare runs) ---------------------
+
+try:
+    import run_index
+except ImportError:
+    from viz import run_index
+
+# User-assigned run names, virtual folders and heading names (viz/run_labels.json);
+# see run_index.py for the format.
+_load_run_labels = run_index.load_labels
+_save_run_labels = run_index.save_labels
+_forget_run_labels = run_index.forget_runs
+
+
+@app.route('/api/simulations/labels', methods=['GET'])
+def get_run_labels():
+    """Every user-assigned run and category name."""
+    return jsonify(_load_run_labels())
+
+
+@app.route('/api/simulations/labels', methods=['POST'])
+def set_run_labels():
+    """Merge in renamed runs / categories; an empty value restores the default.
+
+    Body: {"runs":       {"<sim>": {"label": str|null}},
+           "categories": {"<kind>:<key>": str|null}}
+    Folders are changed through /api/runs/move and /api/runs/folder.
+    """
+    data = request.json or {}
+    labels = _load_run_labels()
+
+    for name, patch in (data.get('runs') or {}).items():
+        if not isinstance(patch, dict):
+            continue
+        entry = dict(labels['runs'].get(name) or {})
+        for field in ('label',):
+            if field not in patch:
+                continue
+            value = (patch[field] or '').strip()
+            if value:
+                entry[field] = value
+            else:
+                entry.pop(field, None)
+        if entry:
+            labels['runs'][name] = entry
+        else:
+            labels['runs'].pop(name, None)
+
+    for key, value in (data.get('categories') or {}).items():
+        value = (value or '').strip()
+        if value:
+            labels['categories'][key] = value
+        else:
+            labels['categories'].pop(key, None)
+
+    _save_run_labels(labels)
+    return jsonify(labels)
+
+
+# --------------------- Runs browser (virtual folders) ---------------------
+
+@app.route('/api/runs')
+def list_runs():
+    """Every run, local and on every cluster, with its folder and label.
+
+    ?refresh=1 re-lists every reachable cluster (one ssh each, in parallel);
+    without it the clusters' last listings come from the on-disk cache, so the
+    tree renders instantly; a cluster whose last refresh failed shows as stale.
+    """
+    errors = run_index.refresh_remote(cluster_registry) if request.args.get('refresh') else {}
+    return jsonify(run_index.build_index(PROJECT_ROOT, cluster_registry, errors,
+                                         parse_ws_name=parse_weak_scaling_name))
+
+
+@app.route('/api/runs/move', methods=['POST'])
+def move_runs():
+    """File runs into a folder. Body: {"names": [...], "folder": "a/b"} ('' = unfiled)."""
+    data = request.json or {}
+    names = [n for n in data.get('names') or [] if run_index.is_run_name(n)]
+    try:
+        run_index.file_runs(names, data.get('folder') or '')
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    return jsonify({'success': True})
+
+
+@app.route('/api/runs/folder', methods=['POST'])
+def edit_folder():
+    """Body: {"op": "create", "path"} or {"op": "move", "path", "new_path"}.
+    "move" covers renaming and dragging a folder into another one."""
+    data = request.json or {}
+    try:
+        if data.get('op') == 'create':
+            run_index.create_folder(data.get('path'))
+        elif data.get('op') == 'move':
+            run_index.rename_folder(data.get('path'), data.get('new_path'))
+        else:
+            return jsonify({'error': 'op must be create or move'}), 400
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    return jsonify({'success': True})
+
+
+@app.route('/api/runs/delete', methods=['POST'])
+def delete_runs():
+    """Delete runs everywhere: local folder, viz cache, every cluster copy, label.
+
+    Body: {"names": [...], "folders": [...], "only_if_empty": bool,
+           "copies": [{"cluster": id, "name": run}]}
+    - folders: every run filed in them (recursively) is deleted, then the
+      folders themselves.
+    - only_if_empty: leave anything holding iterations or results - checked
+      where the data lives, so a stale index can't cause a wrong delete.
+    - copies: empty cluster-side copies of runs that have data elsewhere (old
+      sync artifacts); only that copy goes, and only if it is still empty.
+    Runs with a queued or running SLURM job are skipped.
+    """
+    data = request.json or {}
+    only_if_empty = bool(data.get('only_if_empty'))
+    folders = data.get('folders') or []
+    index = run_index.build_index(PROJECT_ROOT, cluster_registry)
+    by_name = {r['name']: r for r in index['runs']}
+
+    names = {n for n in data.get('names') or [] if run_index.is_run_name(n)}
+    names |= set(run_index.runs_in_folders(folders, list(by_name)))
+    skipped = sorted(n for n in names if by_name.get(n, {}).get('active'))
+    names -= set(skipped)
+    touched = {by_name[n]['folder'] for n in names if n in by_name and by_name[n]['folder']}
+
+    removed = set()
+    errors = []
+    local_removed, local_errors = run_index.delete_local(
+        PROJECT_ROOT, [n for n in names if n in by_name and by_name[n]['local']], only_if_empty)
+    removed |= set(local_removed)
+    errors += local_errors
+
+    targets = {}  # cluster id -> [(name, only_if_empty)]
+    for n in names:
+        for cid in (by_name.get(n) or {}).get('remote', {}):
+            targets.setdefault(cid, []).append((n, only_if_empty))
+    for copy in data.get('copies') or []:
+        n, cid = copy.get('name'), copy.get('cluster')
+        if run_index.is_run_name(n) and cid and n not in skipped:
+            targets.setdefault(cid, []).append((n, True))
+
+    copies_removed = []
+    for cid, items in targets.items():
+        cl = _get_cluster(cid)
+        if cl is None:
+            continue
+        done = []
+        for guarded in (False, True):
+            batch = [n for n, g in items if g == guarded]
+            if not batch:
+                continue
+            try:
+                got, err = cl.delete_runs(batch, only_if_empty=guarded)
+            except Exception as e:
+                got, err = [], str(e)
+            done += got
+            if err:
+                errors.append(f'{cl.label}: {err}')
+        run_index.forget_remote(cid, done)
+        removed |= {n for n in done if n in names}
+        copies_removed += [f'{cid}:{n}' for n in done if n not in names]
+        for job_id in [j for j, info in cl.jobs.items() if info.get('out_name') in done]:
+            cl.jobs.pop(job_id, None)
+
+    # A name only disappears from the labels once no copy of it is left.
+    after = {r['name'] for r in run_index.build_index(PROJECT_ROOT, cluster_registry)['runs']}
+    run_index.forget_runs([n for n in removed if n not in after])
+    if folders:
+        run_index.drop_folders(folders)
+    # A folder whose last run was just deleted goes too (with emptied parents).
+    pruned = run_index.prune_emptied_folders(touched, after)
+    return jsonify({'removed': sorted(removed), 'copies_removed': copies_removed,
+                    'skipped': skipped, 'errors': errors, 'folders_removed': pruned})
+
+
 @app.route('/api/simulations/with-iterations')
 def list_simulations_with_iterations():
     """List simulation directories that have iterations.pickle (for comparison)."""
     simulations = []
+    run_labels = _load_run_labels()['runs']
     for item in PROJECT_ROOT.iterdir():
         if item.is_dir() and '_sim' in item.name:
             iters_file = item / 'iterations.pickle'
@@ -1112,6 +1455,7 @@ def list_simulations_with_iterations():
                             'preconditioner': cond.get('preconditioner'),
                             'localSolver': cond.get('localSolver'),
                             'nRanks': cond.get('nRanks'),
+                            'mesh': cond.get('mesh'),
                         }
                         # Physical conditions hash (same keys used in JS warning)
                         phys = {k: cond.get(k) for k in (
@@ -1121,10 +1465,27 @@ def list_simulations_with_iterations():
                         physical_hash = json.dumps(phys, sort_keys=True)
                     except Exception:
                         pass
+                named = run_labels.get(item.name) or {}
+
+                # Weak-scaling geometry, for the "avg iterations vs. subdomains / H/h"
+                # scaling plot: number of DD subdomains (2 per cube - cell + ECS
+                # remainder) and H/h = voxels per cube edge (cube side / element
+                # size), recovered from the plus_<nx>x<ny>x<nz>_n<n>_L<L> mesh name.
+                mesh_name = solver_info.get('mesh')
+                if not mesh_name:
+                    m = re.match(r'^(.+?)_sim', item.name)
+                    mesh_name = m.group(1) if m else None
+                ws_geom = parse_weak_scaling_name(mesh_name) if mesh_name else None
+                if ws_geom:
+                    solver_info['nSubdomains'] = 2 * ws_geom['nx'] * ws_geom['ny'] * ws_geom['nz']
+                    solver_info['hRatio'] = ws_geom['n']
+
                 simulations.append({
                     'name': item.name,
                     'conditions_hash': conditions_hash,
                     'physical_hash': physical_hash,
+                    'label': named.get('label'),
+                    'folder': named.get('folder'),
                     **solver_info,
                 })
     return jsonify({
@@ -1161,6 +1522,50 @@ def delete_simulations_by_mesh():
             except OSError as exc:
                 errors.append(f'viz/data/{item.name}: {exc}')
 
+    _forget_run_labels(removed)
+    return jsonify({'removed': removed, 'errors': errors})
+
+
+@app.route('/api/simulations/delete_by_names', methods=['POST'])
+def delete_simulations_by_names():
+    """Delete exactly the named local *_sim* outputs, plus their viz/data caches.
+
+    Used by a compare-section group's "Delete all": a group can be a user-named
+    collection rather than a whole mesh, so deleting by mesh would take runs the
+    group does not show.
+    """
+    import shutil
+    data = request.json or {}
+    names = data.get('names') or []
+    if not isinstance(names, list) or not names:
+        return jsonify({'error': 'no simulation names given'}), 400
+
+    viz_data_root = Path(__file__).parent / 'data'
+    project_root = PROJECT_ROOT.resolve()
+    removed = []
+    errors = []
+    for name in names:
+        name = (name or '').strip()
+        if not re.fullmatch(r'[A-Za-z0-9_.\-]+', name) or '_sim' not in name:
+            errors.append(f'{name}: invalid simulation name')
+            continue
+        item = (PROJECT_ROOT / name).resolve()
+        if item.parent != project_root or not item.is_dir():
+            errors.append(f'{name}: not a simulation directory')
+            continue
+        try:
+            shutil.rmtree(item)
+            removed.append(name)
+        except OSError as exc:
+            errors.append(f'{name}: {exc}')
+        viz_cache = viz_data_root / name
+        if viz_cache.exists():
+            try:
+                shutil.rmtree(viz_cache)
+            except OSError as exc:
+                errors.append(f'viz/data/{name}: {exc}')
+
+    _forget_run_labels(removed)
     return jsonify({'removed': removed, 'errors': errors})
 
 
@@ -1194,22 +1599,32 @@ def delete_all_simulations():
             except OSError as exc:
                 errors.append(f'viz/data/{child.name}: {exc}')
 
-    # 3. Remote sim dirs (best-effort, only if Karolina backend is available)
+    # 3. Remote sim dirs on every configured cluster (best-effort)
     remote_cleared = False
     try:
-        from karolina import _run_ssh, REMOTE_PATH
-        # Glob is built server-side; no user input flows into the SSH command.
-        _, ssh_err, rc = _run_ssh(
-            f'rm -rf -- {REMOTE_PATH}/*_sim*',
-            timeout=60,
-        )
-        if rc == 0:
-            remote_cleared = True
-        else:
-            errors.append(f'remote rm: {ssh_err}')
+        try:
+            from cluster import registry as _registry
+        except ImportError:
+            from viz.cluster import registry as _registry
+        for _cl in _registry.clusters():
+            try:
+                # Glob is built server-side; no user input flows into the SSH command.
+                _, ssh_err, rc = _cl._run_ssh(
+                    f'rm -rf -- {_cl.remote_path}/*_sim*',
+                    timeout=60,
+                )
+                if rc == 0:
+                    remote_cleared = True
+                else:
+                    errors.append(f'remote rm ({_cl.id}): {ssh_err}')
+            except Exception as exc:
+                errors.append(f'remote rm ({_cl.id}): {exc}')
     except Exception as exc:
         errors.append(f'remote rm: {exc}')
 
+    _forget_run_labels(removed_local)
+    if remote_cleared and run_index.CACHE_FILE.exists():
+        run_index.CACHE_FILE.unlink()  # the cached listings name runs that are gone
     return jsonify({
         'removed_local': removed_local,
         'viz_cleared': viz_cleared,
@@ -2324,252 +2739,430 @@ def download_video(filename):
     videos_dir = Path(__file__).parent / 'videos'
     return send_from_directory(videos_dir, filename, as_attachment=True)
 
-# --------------------- Karolina API ---------------------
+# --------------------- Cluster API ---------------------
+#
+# Every remote-cluster operation is addressed as /api/cluster/<cid>/... where
+# <cid> is an id from viz/clusters.yml. /api/clusters manages the registry.
 
 try:
-    from karolina import (
-        karolina_state, karolina_jobs, mesh_convert_state,
-        check_ssh, check_containers, upload_config, submit_job, submit_jobs,
-        check_job_status, cancel_job, delete_job_data, tail_remote_log,
-        get_cached_status,
-        download_results_streaming, download_iterations,
-        list_remote_simulations,
-        list_remote_meshes, fetch_mesh_metadata,
-        convert_remote_mesh, generate_remote_weak_scaling_mesh, finish_conversion,
-        download_mesh_data,
-        generate_remote_video, check_video_job, download_video,
-        generate_remote_viz, check_viz_job, download_viz_data_streaming
-    )
+    from cluster import registry as cluster_registry, TERMINAL_STATES
 except ImportError:
-    from viz.karolina import (
-        karolina_state, karolina_jobs, mesh_convert_state,
-        check_ssh, check_containers, upload_config, submit_job, submit_jobs,
-        check_job_status, cancel_job, delete_job_data, tail_remote_log,
-        get_cached_status,
-        download_results_streaming, download_iterations,
-        list_remote_simulations,
-        list_remote_meshes, fetch_mesh_metadata,
-        convert_remote_mesh, generate_remote_weak_scaling_mesh, finish_conversion,
-        download_mesh_data,
-        generate_remote_video, check_video_job, download_video,
-        generate_remote_viz, check_viz_job, download_viz_data_streaming
-    )
+    from viz.cluster import registry as cluster_registry, TERMINAL_STATES
 
-@app.route('/api/karolina/check')
-def karolina_check():
-    """Test SSH connectivity to Karolina and check container availability."""
-    available = check_ssh()
-    containers = check_containers() if available else {}
-    return jsonify({'available': available, 'containers': containers})
 
-@app.route('/api/karolina/submit', methods=['POST'])
-def karolina_submit():
-    """Upload config and submit SLURM job(s) to Karolina.
-
-    Accepts 'nodes' as a single int or comma-separated string (e.g. "1,2,4")
-    to submit multiple jobs with different node counts in one go.
-    """
-    data = request.json
-    config_file = data.get('config', 'input_pepe36_colored.yml')
-    nodes_raw = data.get('nodes', 1)
-    ntasks_per_node = data.get('ntasks_per_node', 128)
-    walltime = data.get('walltime', '01:00:00')
-    partition = data.get('partition', 'qcpu_exp')
-    account = data.get('account', 'eu-26-11')
-    solver_backend = data.get('solver_backend', 'petsc')
-    conditions = data.get('conditions')
-
-    # Parse node counts: single int or comma-separated string
-    if isinstance(nodes_raw, str):
-        node_counts = [int(n.strip()) for n in nodes_raw.split(',') if n.strip()]
-    elif isinstance(nodes_raw, list):
-        node_counts = [int(n) for n in nodes_raw]
-    else:
-        node_counts = [int(nodes_raw)]
-
+def _get_cluster(cluster_id):
     try:
-        config_path = PROJECT_ROOT / config_file
-        if not config_path.exists():
-            return jsonify({'error': f'Config file not found: {config_file}'}), 404
+        return cluster_registry.get(cluster_id)
+    except KeyError:
+        return None
 
-        if len(node_counts) == 1:
-            # Single job: use original path
-            job_info = submit_job(
-                config_file, node_counts[0], ntasks_per_node,
-                walltime, partition, account,
-                solver_backend=solver_backend,
-                conditions=conditions,
-                local_config_path=str(config_path)
-            )
-            return jsonify({
-                'success': True,
-                'jobs': [job_info],
-                **job_info,
-                'message': f'Job {job_info["job_id"]} submitted to Karolina'
-            })
-        else:
-            # Multiple node counts: batch submit
-            job_infos = submit_jobs(
-                config_file, node_counts, ntasks_per_node,
-                walltime, partition, account,
-                solver_backend=solver_backend,
-                conditions=conditions,
-                local_config_path=str(config_path)
-            )
-            job_ids = [j['job_id'] for j in job_infos]
-            return jsonify({
-                'success': True,
-                'jobs': job_infos,
-                # Legacy compat: expose first job at top level
-                **(job_infos[0] if job_infos else {}),
-                'message': f'{len(job_infos)} jobs submitted: {", ".join(job_ids)}'
-            })
+
+@app.route('/api/clusters')
+def clusters_list():
+    """List configured clusters (with cheap local master-connection status)."""
+    out = []
+    for cid in cluster_registry.ids():
+        try:
+            cl = cluster_registry.get(cid)
+            out.append(cl.to_dict(connected=cl.master_alive()))
+        except Exception as e:
+            out.append({'id': cid, 'error': str(e)})
+    return jsonify({'clusters': out})
+
+
+@app.route('/api/clusters', methods=['POST'])
+def clusters_save():
+    """Create or update a cluster entry in clusters.yml."""
+    data = request.json or {}
+    cluster_id = (data.get('id') or '').strip().lower()
+    cfg = data.get('cfg') or {}
+    try:
+        cl = cluster_registry.save(cluster_id, cfg)
+        return jsonify({'success': True, 'cluster': cl.to_dict()})
+    except (ValueError, KeyError) as e:
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/karolina/jobs')
-def karolina_list_jobs():
-    """List all tracked Karolina jobs."""
-    return jsonify({'jobs': list(karolina_jobs.values())})
 
-@app.route('/api/karolina/status')
-@app.route('/api/karolina/status/<job_id>')
-def karolina_status(job_id=None):
+@app.route('/api/clusters/<cluster_id>', methods=['DELETE'])
+def clusters_delete(cluster_id):
+    try:
+        cluster_registry.delete(cluster_id)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cluster/<cluster_id>/check')
+def cluster_check(cluster_id):
+    """Test SSH connectivity and check container availability."""
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+    connected = cl.master_alive()
+    available = connected or cl.check_ssh()
+    containers = cl.check_containers() if available else {}
+    return jsonify({
+        'available': available,
+        'connected': connected or available,
+        'needs_otp': cl.needs_otp,
+        'containers': containers,
+        'label': cl.label,
+    })
+
+
+# --------------------- Interactive connect (OTP/2FA) ---------------------
+
+@app.route('/api/cluster/<cluster_id>/connect', methods=['POST'])
+def cluster_connect(cluster_id):
+    """Start establishing the persistent (ControlMaster) connection."""
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+    state = cl.connect_start()
+    return jsonify(state)
+
+
+@app.route('/api/cluster/<cluster_id>/connect/state')
+def cluster_connect_state(cluster_id):
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+    return jsonify(cl.connect_state)
+
+
+@app.route('/api/cluster/<cluster_id>/connect/cancel', methods=['POST'])
+def cluster_connect_cancel(cluster_id):
+    """Abandon a login in progress (the OTP window was closed)."""
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+    return jsonify(cl.connect_cancel())
+
+
+@app.route('/api/cluster/<cluster_id>/connect/input', methods=['POST'])
+def cluster_connect_input(cluster_id):
+    """Deliver the user's OTP/password answer to the waiting ssh."""
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+    data = request.json or {}
+    state = cl.connect_send(data.get('text', ''))
+    return jsonify(state)
+
+
+@app.route('/api/cluster/<cluster_id>/disconnect', methods=['POST'])
+def cluster_disconnect(cluster_id):
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+    cl.disconnect()
+    return jsonify({'success': True})
+
+
+@app.route('/api/cluster/<cluster_id>/install', methods=['POST'])
+def cluster_install(cluster_id):
+    """Set up the cluster (dirs, code sync, container SIFs) as an SSE stream."""
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+
+    def generate():
+        try:
+            for event in cl.install_stream(PROJECT_ROOT, cluster_registry):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return Response(generate(), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache',
+                             'Connection': 'keep-alive',
+                             'X-Accel-Buffering': 'no'})
+
+
+# --------------------- Jobs ---------------------
+
+@app.route('/api/cluster/<cluster_id>/submit-batch', methods=['POST'])
+def cluster_submit_batch(cluster_id):
+    """Submit one SLURM job per (mesh, rank count) from one template config.
+
+    Body: {"config": "<template yml>",
+           "meshes": [{"mesh": str, "ranks": [int, ...], "walltime": str|null,
+                       "config_overrides": {...}, "conditions_overrides": {...}}],
+           "max_tasks_per_node", "partition", "account", "solver_backend",
+           "conditions", "folder"}
+
+    A single mesh with a single rank count is just a batch of one. With a
+    folder path ('a/b'), every submitted run is filed there in the Runs
+    browser (virtual folders in run_labels.json, created as needed).
+    """
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+
+    data = request.json or {}
+    config_file = data.get('config')
+    config_path = PROJECT_ROOT / (config_file or '')
+    if not config_file or not config_path.is_file():
+        return jsonify({'error': f'Template config not found: {config_file}'}), 404
+
+    jobs = []
+    for entry in data.get('meshes') or []:
+        mesh = entry.get('mesh')
+        if not mesh or not re.fullmatch(r'[A-Za-z0-9_.\-]+', mesh):
+            return jsonify({'error': f'Invalid mesh name: {mesh!r}'}), 400
+        try:
+            ranks = sorted({int(r) for r in entry.get('ranks') or []})
+        except (TypeError, ValueError):
+            return jsonify({'error': f'{mesh}: rank counts must be integers'}), 400
+        if not ranks or ranks[0] < 1:
+            return jsonify({'error': f'{mesh}: needs at least one positive rank count'}), 400
+        for r in ranks:
+            jobs.append({
+                'mesh': mesh, 'ranks': r,
+                'walltime': entry.get('walltime') or data.get('walltime') or cl.default_walltime,
+                'config_overrides': entry.get('config_overrides') or {},
+                'conditions_overrides': entry.get('conditions_overrides') or {},
+            })
+    if not jobs:
+        return jsonify({'error': 'No meshes selected'}), 400
+
+    try:
+        submitted, failed, err = cl.submit_batch(
+            config_path, jobs,
+            max_tasks_per_node=data.get('max_tasks_per_node') or cl.default_ntasks_per_node,
+            partition=data.get('partition') or cl.default_partition,
+            account=data.get('account') or cl.default_account,
+            solver_backend=data.get('solver_backend', 'petsc'),
+            conditions=data.get('conditions'))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    msg = f'{len(submitted)} job(s) submitted to {cl.label}'
+    folder = (data.get('folder') or '').strip()
+    if folder and submitted:
+        try:
+            run_index.file_runs([job['out_name'] for job in submitted], folder)
+        except ValueError as e:
+            msg += f' (not filed into a folder: {e})'
+    if failed:
+        msg += f'; {len(failed)} failed: {", ".join(failed)}' + (f' ({err})' if err else '')
+    return jsonify({'success': True, 'jobs': submitted, 'failed': failed, 'message': msg})
+
+
+@app.route('/api/cluster/<cluster_id>/jobs')
+def cluster_list_jobs(cluster_id):
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+    return jsonify({'jobs': list(cl.jobs.values())})
+
+
+@app.route('/api/cluster/<cluster_id>/status')
+@app.route('/api/cluster/<cluster_id>/status/<job_id>')
+def cluster_status(cluster_id, job_id=None):
     """Poll SLURM job status and tail log output."""
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+
     if job_id is None:
-        job_id = request.args.get('job_id') or karolina_state.get('job_id')
+        job_id = request.args.get('job_id') or cl.legacy_state.get('job_id')
     if not job_id:
-        return jsonify({
-            'status': None,
-            'job_id': None,
-            'log': '',
-            'message': 'No job submitted'
-        })
+        return jsonify({'status': None, 'job_id': None, 'log': '',
+                        'message': 'No job submitted'})
 
-    job = karolina_jobs.get(job_id, {})
+    job = cl.jobs.get(job_id, {})
+    # The caller names the run: after a server restart this server no longer
+    # knows the job, and guessing (the last submitted run) mislabels it.
+    out_name = request.args.get('out_name') or job.get('out_name') or ''
 
-    # Use cached status from background poller (non-blocking)
-    cached_status, cached_log = get_cached_status(job_id)
-    if cached_status is not None:
+    cached_status, cached_log = cl.get_cached_status(job_id)
+    if cached_status is not None and (cached_log or cached_status not in TERMINAL_STATES):
         return jsonify({
             'job_id': job_id,
             'status': cached_status,
-            'out_name': job.get('out_name', karolina_state.get('out_name', '')),
+            'out_name': out_name,
             'conditions_hash': job.get('conditions_hash'),
             'log': cached_log or ''
         })
 
-    # Fallback for jobs not yet in cache (e.g. from before poller started)
     try:
-        status = check_job_status(job_id)
-        log = tail_remote_log(job_id)
-
+        status = cl.check_job_status(job_id)
+        log = cl.tail_remote_log(job_id, out_name=out_name or None)
         return jsonify({
             'job_id': job_id,
             'status': status,
-            'out_name': job.get('out_name', karolina_state.get('out_name', '')),
+            'out_name': out_name,
             'conditions_hash': job.get('conditions_hash'),
             'log': log
         })
     except Exception as e:
         return jsonify({
             'job_id': job_id,
-            'status': job.get('status', karolina_state.get('status', 'UNKNOWN')),
+            'status': job.get('status', cl.legacy_state.get('status', 'UNKNOWN')),
             'log': '',
             'error': str(e)
         })
 
-@app.route('/api/karolina/cancel', methods=['POST'])
-def karolina_cancel():
-    """Cancel a SLURM job."""
+
+@app.route('/api/cluster/<cluster_id>/cancel', methods=['POST'])
+def cluster_cancel(cluster_id):
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
     data = request.json or {}
-    job_id = data.get('job_id') or karolina_state.get('job_id')
+    job_id = data.get('job_id') or cl.legacy_state.get('job_id')
     if not job_id:
         return jsonify({'error': 'No job to cancel'}), 400
-
     try:
-        cancel_job(job_id)
+        cl.cancel_job(job_id)
         return jsonify({'success': True, 'message': f'Job {job_id} cancelled'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/karolina/delete', methods=['POST'])
-def karolina_delete():
-    """Cancel a job (if running), then remove its remote dir and local download."""
-    data = request.json or {}
-    job_id = data.get('job_id')
-    out_name = data.get('out_name')
-    if not job_id and not out_name:
-        return jsonify({'error': 'job_id or out_name required'}), 400
 
-    try:
-        errors = delete_job_data(job_id, out_name, str(PROJECT_ROOT))
-        return jsonify({'success': True, 'errors': errors})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/karolina/download-iterations', methods=['POST'])
-def karolina_download_iterations():
-    """Download just iterations.pickle + conditions.json from a remote simulation."""
+@app.route('/api/cluster/<cluster_id>/download-iterations', methods=['POST'])
+def cluster_download_iterations(cluster_id):
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
     data = request.json
     remote_dir = data.get('remote_dir')
     if not remote_dir:
         return jsonify({'error': 'No remote directory specified'}), 400
-
     local_dest = PROJECT_ROOT / remote_dir
     try:
-        download_iterations(remote_dir, local_dest)
+        cl.download_iterations(remote_dir, local_dest)
         return jsonify({'success': True, 'out_name': remote_dir})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/karolina/download', methods=['POST'])
-def karolina_download():
-    """Download simulation results from Karolina via SCP (SSE stream with byte progress)."""
-    data = request.json
-    remote_dir = data.get('remote_dir') or karolina_state.get('out_name')
 
+@app.route('/api/cluster/<cluster_id>/download', methods=['POST'])
+def cluster_download(cluster_id):
+    """Download simulation results (SSE stream with byte progress)."""
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+    data = request.json
+    remote_dir = data.get('remote_dir') or cl.legacy_state.get('out_name')
     if not remote_dir:
         return jsonify({'error': 'No remote directory specified'}), 400
 
     local_dest = PROJECT_ROOT / remote_dir
 
     def generate():
-        for status in download_results_streaming(remote_dir, local_dest):
+        for status in cl.download_results_streaming(remote_dir, local_dest):
             yield f"data: {json.dumps(status)}\n\n"
 
     return Response(generate(), mimetype='text/event-stream')
 
-@app.route('/api/karolina/remote-simulations')
-def karolina_remote_simulations():
-    """List simulation output directories on Karolina."""
-    try:
-        dirs = list_remote_simulations()
-        return jsonify({'simulations': dirs})
-    except Exception as e:
-        return jsonify({'error': str(e), 'simulations': []}), 500
 
-@app.route('/api/karolina/meshes')
-def karolina_meshes():
-    """List mesh families available on Karolina."""
+@app.route('/api/cluster/<cluster_id>/meshes')
+def cluster_meshes(cluster_id):
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
     try:
-        families = list_remote_meshes()
+        families = cl.list_remote_meshes()
         return jsonify({'families': families})
     except Exception as e:
         return jsonify({'error': str(e), 'families': []}), 500
 
-@app.route('/api/karolina/meshes/metadata/<mesh_name>')
-def karolina_mesh_metadata(mesh_name):
-    """Fetch mesh bounding box and metadata from Karolina without downloading."""
+
+@app.route('/api/cluster/<cluster_id>/meshes/batch-info', methods=['POST'])
+def cluster_mesh_batch_info(cluster_id):
+    """Bounds + partition-unit counts for several remote meshes at once.
+
+    Body: {"meshes": [name, ...]} -> {"meshes": {name: {bounds,
+    mesh_conversion_factor, num_tags, num_original_tags, num_components,
+    cube_subdomains} | {error}}}. cube_subdomains (2*nx*ny*nz) comes from the
+    weak-scaling filename, so it is known even without the ssh round trip.
+    """
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+    names = [n for n in (request.json or {}).get('meshes') or []
+             if isinstance(n, str) and re.fullmatch(r'[A-Za-z0-9_.\-]+', n)]
+    if not names:
+        return jsonify({'meshes': {}})
     try:
-        metadata = fetch_mesh_metadata(mesh_name)
+        info = cl.fetch_batch_mesh_info(names)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    for name in names:
+        entry = info.setdefault(name, {'error': 'no data returned'})
+        ws = parse_weak_scaling_name(name.removesuffix('_colored'))
+        entry['cube_subdomains'] = 2 * ws['nx'] * ws['ny'] * ws['nz'] if ws else None
+    return jsonify({'meshes': info})
+
+
+_preview_locks = {}
+_preview_locks_guard = threading.Lock()
+
+
+@app.route('/api/cluster/<cluster_id>/meshes/preview', methods=['POST'])
+def cluster_mesh_preview(cluster_id):
+    """Membrane-only preview of a mesh that only exists on the cluster.
+
+    Body: {"mesh": name, "max_facets": int (default 1e6), "force": bool}.
+    Built next to the mesh (Cluster.build_mesh_preview), cached on the cluster
+    and in viz/data/_preview/<mesh>/ - apart from real conversions in
+    viz/data/<mesh>/, since its vertices are a decimated subset. Returns the
+    path the viewer loads it from.
+    """
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+    data = request.json or {}
+    mesh = data.get('mesh') or ''
+    if not re.fullmatch(r'[A-Za-z0-9_.\-]+', mesh):
+        return jsonify({'error': f'invalid mesh name: {mesh!r}'}), 400
+    max_facets = int(data.get('max_facets') or 1_000_000)
+    local_dir = Path(__file__).parent / 'data' / '_preview' / mesh
+    path = f'data/_preview/{mesh}'
+
+    def local_meta():
+        try:
+            with open(local_dir / 'mesh_metadata.json') as f:
+                meta = json.load(f)
+            return meta if meta.get('preview', {}).get('max_facets') == max_facets else None
+        except (OSError, ValueError):
+            return None
+
+    with _preview_locks_guard:
+        lock = _preview_locks.setdefault((cluster_id, mesh), threading.Lock())
+    with lock:  # a second request for the same mesh waits and then hits the cache
+        meta = None if data.get('force') else local_meta()
+        if meta:
+            return jsonify({'path': path, 'metadata': meta, 'cached': 'local'})
+        try:
+            meta, on_cluster = cl.build_mesh_preview(mesh, local_dir, max_facets)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    return jsonify({'path': path, 'metadata': meta, 'cached': 'cluster' if on_cluster else None})
+
+
+@app.route('/api/cluster/<cluster_id>/meshes/metadata/<mesh_name>')
+def cluster_mesh_metadata(cluster_id, mesh_name):
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+    try:
+        metadata = cl.fetch_mesh_metadata(mesh_name)
         return jsonify(metadata)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/karolina/meshes/convert', methods=['POST'])
-def karolina_convert_mesh():
-    """Convert a remote mesh on Karolina inside the DOLFINx container (SSE stream)."""
+
+@app.route('/api/cluster/<cluster_id>/meshes/convert', methods=['POST'])
+def cluster_convert_mesh(cluster_id):
+    """Convert a remote mesh inside the DOLFINx container (SSE stream)."""
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
     data = request.json
     family = data.get('family')
     pts_file = data.get('pts')
@@ -2582,164 +3175,171 @@ def karolina_convert_mesh():
 
     def generate():
         try:
-            yield f"data: {json.dumps({'type': 'output', 'text': f'Starting conversion of {output_prefix} on Karolina...\\n'})}\n\n"
+            yield f"data: {json.dumps({'type': 'output', 'text': f'Starting conversion of {output_prefix} on {cl.label}...\\n'})}\n\n"
             if color:
                 yield f"data: {json.dumps({'type': 'output', 'text': 'Graph coloring enabled (--color-intracellular)\\n'})}\n\n"
 
-            process = convert_remote_mesh(family, pts_file, elem_file, output_prefix, color)
+            process = cl.convert_remote_mesh(family, pts_file, elem_file, output_prefix, color)
 
             for line in iter(process.stdout.readline, ''):
                 if line:
                     yield f"data: {json.dumps({'type': 'output', 'text': line})}\n\n"
 
             process.wait()
-            finish_conversion()
+            cl.finish_conversion()
 
             if process.returncode == 0:
                 yield f"data: {json.dumps({'type': 'complete', 'success': True})}\n\n"
             else:
                 yield f"data: {json.dumps({'type': 'error', 'message': f'Conversion failed with exit code {process.returncode}'})}\n\n"
-
         except Exception as e:
-            finish_conversion()
+            cl.finish_conversion()
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
-    return Response(
-        generate(),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'X-Accel-Buffering': 'no'
-        }
-    )
+    return Response(generate(), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache',
+                             'Connection': 'keep-alive',
+                             'X-Accel-Buffering': 'no'})
 
-@app.route('/api/karolina/meshes/download', methods=['POST'])
-def karolina_download_mesh():
-    """Download converted mesh data from Karolina to local data/ directory."""
+
+@app.route('/api/cluster/<cluster_id>/meshes/download', methods=['POST'])
+def cluster_download_mesh(cluster_id):
+    """Download converted mesh data to the local data/ directory."""
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
     data = request.json
     mesh_name = data.get('mesh_name')
-
     if not mesh_name:
         return jsonify({'error': 'No mesh name specified'}), 400
-
     try:
-        local_data_dir = PROJECT_ROOT / 'data'
-        download_mesh_data(mesh_name, local_data_dir)
-        return jsonify({
-            'success': True,
-            'message': f'Downloaded {mesh_name} mesh data to data/'
-        })
+        cl.download_mesh_data(mesh_name, PROJECT_ROOT / 'data')
+        return jsonify({'success': True,
+                        'message': f'Downloaded {mesh_name} mesh data to data/'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/karolina/weak-scaling/generate', methods=['POST'])
-def karolina_weak_scaling_generate():
-    """Generate (or reuse) a weak-scaling mesh on Karolina (SSE stream).
 
-    The mesh is created in Karolina's data/ directory, so it subsequently
-    appears in the remote mesh list and can be run there.
-    """
+@app.route('/api/cluster/<cluster_id>/weak-scaling/generate', methods=['POST'])
+def cluster_weak_scaling_generate(cluster_id):
+    """Generate (or reuse) a weak-scaling mesh on the cluster (SSE stream)."""
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
     data = request.json or {}
     try:
         nx = int(data['nx']); ny = int(data['ny']); nz = int(data['nz'])
-        n = int(data.get('n', 16)); L = float(data.get('L', 25.0))
-        pad = int(data.get('pad', 4))
+        n = int(data.get('n', 12)); L = float(data.get('L', 25.0))
+        pad = int(data.get('pad', 0))
+        shape = str(data.get('shape', 'cell'))
+        ax = int(data.get('ax', 4)) if shape != 'plus' else 1
+        cell = shape != 'plus'
+        d_y = float(data.get('d_y', 0.5) or 0.5) if cell else 0.0
+        d_z = float(data.get('d_z', 0) or 0) if cell else 0.0
+        lean = float(data.get('lean', 55) or 55) if cell else 0.0
+        lat_r = float(data.get('lat_r', 0.26) or 0.26) if cell else 0.0
+        slabs = step_y = step_z = 0
+        if cell:
+            slabs, step_y, step_z = resolve_ws_shift(ax, d_y, d_z or d_y)
+            d_y = 0.5 * (ax - ax * step_y / slabs)
+            d_z = 0.5 * (ax - ax * step_z / slabs)
     except (KeyError, ValueError, TypeError) as e:
         return jsonify({'error': f'Invalid parameters: {e}'}), 400
 
-    if min(nx, ny, nz) < 1 or n < 4 or n % 4 != 0 or L <= 0 or pad < 0:
-        return jsonify({'error': 'Require nx,ny,nz >= 1, n a multiple of 4 (>=4), L > 0, pad >= 0'}), 400
+    err = validate_weak_scaling(nx, ny, nz, n, L, pad, shape, ax, slabs)
+    if err:
+        return jsonify({'error': err}), 400
 
-    name = weak_scaling_name(nx, ny, nz, n, L, pad)
+    name = weak_scaling_name(nx, ny, nz, n, L, pad, shape, ax, slabs,
+                             step_y, step_z, d_y, d_z, lat_r, lean)
 
     def generate():
         try:
-            yield f"data: {json.dumps({'type': 'output', 'text': f'Generating {name} on Karolina ({nx}x{ny}x{nz} cubes, pad {pad})...\\n'})}\n\n"
+            yield f"data: {json.dumps({'type': 'output', 'text': f'Generating {name} on {cl.label} ({nx}x{ny}x{nz} cubes, pad {pad})...\\n'})}\n\n"
 
-            process = generate_remote_weak_scaling_mesh(nx, ny, nz, n, L, pad, name)
+            process = cl.generate_remote_weak_scaling_mesh(nx, ny, nz, n, L, pad, name,
+                                                           shape=shape, ax=ax,
+                                                           slabs=slabs, d_y=d_y,
+                                                           d_z=d_z, lean=lean,
+                                                           lat_r=lat_r)
 
             for line in iter(process.stdout.readline, ''):
                 if line:
                     yield f"data: {json.dumps({'type': 'output', 'text': line})}\n\n"
 
             process.wait()
-            finish_conversion()
+            cl.finish_conversion()
 
             if process.returncode == 0:
                 yield f"data: {json.dumps({'type': 'complete', 'success': True, 'name': name})}\n\n"
             else:
                 yield f"data: {json.dumps({'type': 'error', 'message': f'Generation failed with exit code {process.returncode}'})}\n\n"
-
         except Exception as e:
-            finish_conversion()
+            cl.finish_conversion()
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
-    return Response(
-        generate(),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'X-Accel-Buffering': 'no'
-        }
-    )
+    return Response(generate(), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache',
+                             'Connection': 'keep-alive',
+                             'X-Accel-Buffering': 'no'})
+
 
 # --------------------- Remote Video API ---------------------
 
-# In-memory tracking for remote video jobs
+# In-memory tracking for remote video jobs (job_id -> info incl. cluster)
 remote_video_jobs = {}
 
-@app.route('/api/karolina/video/generate', methods=['POST'])
-def karolina_generate_video():
-    """Submit a video generation job on Karolina."""
+
+@app.route('/api/cluster/<cluster_id>/video/generate', methods=['POST'])
+def cluster_generate_video(cluster_id):
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
     data = request.json
     sim_name = data.get('sim_name')
     if not sim_name:
         return jsonify({'error': 'No simulation name specified'}), 400
-
     try:
-        result = generate_remote_video(
+        result = cl.generate_remote_video(
             sim_name,
             width=data.get('width', 1920),
             height=data.get('height', 1080),
             fps=data.get('fps', 30),
             camera_config=data.get('camera'),
             colormap=data.get('colormap', 'coolwarm'),
-            partition=data.get('partition', 'qcpu_exp'),
-            account=data.get('account', 'eu-26-11'),
-        )
+            partition=data.get('partition'),
+            account=data.get('account'))
         remote_video_jobs[result['job_id']] = result
         return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/karolina/video/status/<job_id>')
-def karolina_video_status(job_id):
-    """Check status of a remote video generation job."""
+
+@app.route('/api/cluster/<cluster_id>/video/status/<job_id>')
+def cluster_video_status(cluster_id, job_id):
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
     job = remote_video_jobs.get(job_id, {})
-    log_file = job.get('log_file')
     try:
-        result = check_video_job(job_id, log_file)
+        result = cl.check_video_job(job_id, job.get('log_file'))
         return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/karolina/video/download/<job_id>', methods=['POST'])
-def karolina_download_video(job_id):
-    """Download a generated video from Karolina."""
-    job = remote_video_jobs.get(job_id, {})
-    log_file = job.get('log_file')
 
-    # Get video filename from job log
+@app.route('/api/cluster/<cluster_id>/video/download/<job_id>', methods=['POST'])
+def cluster_download_video(cluster_id, job_id):
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
+    job = remote_video_jobs.get(job_id, {})
     try:
-        status = check_video_job(job_id, log_file)
+        status = cl.check_video_job(job_id, job.get('log_file'))
         video_filename = status.get('video_filename')
         if not video_filename:
             return jsonify({'error': 'Video file not found in job output'}), 404
-
-        local_dir = PROJECT_ROOT / 'viz' / 'videos'
-        local_path = download_video(video_filename, local_dir)
+        cl.download_video(video_filename, PROJECT_ROOT / 'viz' / 'videos')
         return jsonify({
             'success': True,
             'filename': video_filename,
@@ -2748,37 +3348,47 @@ def karolina_download_video(job_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
 # --------------------- Remote Viz Data API ---------------------
 
 remote_viz_jobs = {}
 
-@app.route('/api/karolina/viz/generate', methods=['POST'])
-def karolina_generate_viz():
-    """Submit a viz data generation job on Karolina."""
+
+@app.route('/api/cluster/<cluster_id>/viz/generate', methods=['POST'])
+def cluster_generate_viz(cluster_id):
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
     data = request.json
     sim_name = data.get('sim_name')
     if not sim_name:
         return jsonify({'error': 'No simulation name specified'}), 400
     try:
-        result = generate_remote_viz(sim_name)
+        result = cl.generate_remote_viz(sim_name)
         remote_viz_jobs[result['job_id']] = result
         return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/karolina/viz/status/<job_id>')
-def karolina_viz_status(job_id):
-    """Check status of a remote viz generation job."""
+
+@app.route('/api/cluster/<cluster_id>/viz/status/<job_id>')
+def cluster_viz_status(cluster_id, job_id):
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
     job = remote_viz_jobs.get(job_id, {})
     try:
-        result = check_viz_job(job_id, job.get('log_file'))
+        result = cl.check_viz_job(job_id, job.get('log_file'))
         return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/karolina/viz/download', methods=['POST'])
-def karolina_download_viz():
-    """Download viz data from Karolina as streaming SSE."""
+
+@app.route('/api/cluster/<cluster_id>/viz/download', methods=['POST'])
+def cluster_download_viz(cluster_id):
+    cl = _get_cluster(cluster_id)
+    if cl is None:
+        return jsonify({'error': f'unknown cluster {cluster_id}'}), 404
     data = request.json
     sim_name = data.get('sim_name')
     if not sim_name:
@@ -2787,10 +3397,11 @@ def karolina_download_viz():
     local_dest = PROJECT_ROOT / 'viz' / 'data' / sim_name
 
     def stream():
-        for event in download_viz_data_streaming(sim_name, local_dest):
+        for event in cl.download_viz_data_streaming(sim_name, local_dest):
             yield f"data: {json.dumps(event)}\n\n"
 
     return Response(stream(), mimetype='text/event-stream')
+
 
 # --------------------- Main ---------------------
 

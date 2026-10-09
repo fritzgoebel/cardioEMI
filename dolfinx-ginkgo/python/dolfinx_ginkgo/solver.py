@@ -61,14 +61,29 @@ class GinkgoSolver:
         - local_max_iterations: int (default: 100)
         - local_tolerance: float (default: 1e-12)
         - local_amg: dict with local AMG config (max_levels, smoother, coarse_solver, etc.)
-        - coarse_solver: "cg", "gmres", "bddc", or "schwarz" (default: "cg").
+        - coarse_solver: "cg", "gmres", "bddc", "schwarz", or "mumps" (default: "cg").
           "schwarz" applies an additive Schwarz preconditioner directly as the
           coarse solve (no outer Krylov); local subproblems use MUMPS.
+          "mumps" solves the coarse problem exactly with MUMPS, distributed
+          over the ranks holding it.
         - coarse_max_iterations: int (default: 100)
         - coarse_tolerance: float (default: 1e-10)
         - coarse_bddc_local_solver: "direct", "direct_lu", "ilu", "ic", or "amg" (default: "direct")
-        - repartition_coarse: bool (default: True)
+        - repartition_coarse: bool (default: True). Should stay on: without it
+          no rank holds a purely local part of the coarse matrix.
+        - distributed_coarse: bool (default: False). False assembles the
+          repartitioned coarse problem on rank 0 only, True on an
+          automatically chosen number of ranks spread over the communicator.
+        - write_interfaces: bool (default: True). Write IF_<rank>.txt with the
+          global dofs of every interface, on the finest level only.
+        - unanimous_connectivity: bool (default: True)
         - constant_nullspace: bool (default: False)
+    pure_neumann : bool, optional
+        Singular system with the constant vector in the nullspace (no Dirichlet
+        BCs anywhere). Attaches the constant nullspace to the operator, which
+        Ginkgo's CG then projects out of the initial residual, the search
+        directions and the final solution (PETSc MatSetNullSpace semantics).
+        Applies to all operator paths (PETSc Mat, COO, DdMatrix). Default: False
     verbose : bool, optional
         Print convergence info. Default: False
 
@@ -248,6 +263,8 @@ class GinkgoSolver:
         )
         self._A_petsc = A
 
+        self._maybe_set_constant_nullspace()
+
         if self._solver is None:
             self._solver = _cpp.DistributedSolver(self._exec, self._gko_comm, self._config)
         self._solver.set_operator(self._A_gko)
@@ -298,6 +315,8 @@ class GinkgoSolver:
         )
         self._row_ranges = row_ranges
         self._A_petsc = None
+
+        self._maybe_set_constant_nullspace()
 
         if self._solver is None:
             self._solver = _cpp.DistributedSolver(self._exec, self._gko_comm, self._config)
@@ -379,13 +398,39 @@ class GinkgoSolver:
         self._A_petsc = None
         self._is_dd_matrix = True
 
-        # Set constant nullspace for pure Neumann problems
-        if self._config.pure_neumann:
-            _cpp.set_dd_matrix_constant_null_space(self._A_gko, row_ranges)
+        self._maybe_set_constant_nullspace()
 
         if self._solver is None:
             self._solver = _cpp.DistributedSolver(self._exec, self._gko_comm, self._config)
         self._solver.set_operator_dd(self._A_gko)
+
+    def _maybe_set_constant_nullspace(self) -> None:
+        """
+        Attach the constant nullspace to the operator when pure_neumann is set.
+
+        Ginkgo normalizes the all-ones vector and stores it on the operator as
+        metadata (PETSc MatSetNullSpace semantics); CG then projects it out of
+        the initial residual, the search directions and the final solution, so a
+        singular (pure Neumann) system is solved for the minimum-norm solution.
+        Supported by both the regular distributed matrix and the DdMatrix, so
+        this applies to all operator paths.
+
+        Note the projection currently lives in Ginkgo's CG only - with
+        solver="gmres"/"bicgstab"/... the nullspace is attached but nothing
+        projects, so the RHS must already be consistent.
+        """
+        if not self._config.pure_neumann:
+            return
+
+        if not hasattr(self._cpp, "set_constant_null_space"):
+            raise RuntimeError(
+                "pure_neumann requires Ginkgo's nullspace removal support. The "
+                "loaded dolfinx_ginkgo._cpp has no set_constant_null_space - "
+                "rebuild dolfinx-ginkgo against a Ginkgo with the nullspace "
+                "removal mixin."
+            )
+
+        self._cpp.set_constant_null_space(self._A_gko)
 
     def _configure_amg(self, amg, cfg: dict, _cpp) -> None:
         """Apply user AMG configuration."""
@@ -499,11 +544,12 @@ class GinkgoSolver:
             bddc.local_tolerance = cfg["local_tolerance"]
 
         if "coarse_solver" in cfg:
-            coarse_map = {"cg": "CG", "gmres": "GMRES", "bddc": "BDDC", "schwarz": "SCHWARZ"}
+            coarse_map = {"cg": "CG", "gmres": "GMRES", "bddc": "BDDC", "schwarz": "SCHWARZ",
+                          "mumps": "MUMPS"}
             coarse = cfg["coarse_solver"].lower()
             if coarse not in coarse_map:
                 raise ValueError(f"Unknown coarse solver: {cfg['coarse_solver']}. "
-                               f"Available: cg, gmres, bddc, schwarz")
+                               f"Available: cg, gmres, bddc, schwarz, mumps")
             bddc.coarse_solver = getattr(_cpp.BDDCConfig.CoarseSolver, coarse_map[coarse])
 
         if "coarse_max_iterations" in cfg:
@@ -522,6 +568,15 @@ class GinkgoSolver:
 
         if "repartition_coarse" in cfg:
             bddc.repartition_coarse = cfg["repartition_coarse"]
+
+        if "distributed_coarse" in cfg:
+            bddc.distributed_coarse = cfg["distributed_coarse"]
+
+        if "write_interfaces" in cfg:
+            bddc.write_interfaces = cfg["write_interfaces"]
+
+        if "unanimous_connectivity" in cfg:
+            bddc.unanimous_connectivity = cfg["unanimous_connectivity"]
 
         if "constant_nullspace" in cfg:
             bddc.constant_nullspace = cfg["constant_nullspace"]

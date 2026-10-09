@@ -1,68 +1,12 @@
 // app-results.js - Results loading, viz data generation, time stepping, simulation list
 
-App.prototype.loadSimulationList = async function() {
-    const simSelector = document.getElementById('simulation-selector');
-
-    try {
-        const response = await fetch('/api/simulations');
-        const data = await response.json();
-        const localNames = new Set(data.simulations.map(s => s.name));
-
-        simSelector.innerHTML = '<option value="">Select simulation...</option>';
-
-        data.simulations.forEach(sim => {
-            const option = document.createElement('option');
-            option.value = sim.name;
-            const label = (sim.solver || sim.mesh)
-                ? this.formatSimulationLabelInline(sim)
-                : sim.name;
-            option.textContent = label + (sim.has_viz_data ? '' : ' (will generate viz data)');
-            option.title = sim.name;
-            simSelector.appendChild(option);
-        });
-
-        // If in Karolina mode, also fetch remote simulations
-        if (this.runTarget === 'karolina') {
-            try {
-                const remoteResp = await fetch('/api/karolina/remote-simulations');
-                const remoteData = await remoteResp.json();
-                if (remoteData.simulations) {
-                    for (const entry of remoteData.simulations) {
-                        // Backwards-compat: tolerate legacy bare-string entries.
-                        const sim = (typeof entry === 'string') ? { name: entry } : entry;
-                        if (!sim.name) continue;
-                        if (localNames.has(sim.name)) continue;
-                        const option = document.createElement('option');
-                        option.value = sim.name;
-                        const label = (sim.solver || sim.mesh)
-                            ? this.formatSimulationLabelInline(sim)
-                            : sim.name;
-                        option.textContent = label + ' (remote)';
-                        option.title = sim.name;
-                        simSelector.appendChild(option);
-                    }
-                }
-            } catch (e) {
-                console.warn('Failed to load remote simulations:', e);
-            }
-        }
-
-        if (data.simulations.length > 0) {
-            simSelector.value = data.simulations[0].name;
-            this.selectedSimulation = data.simulations[0].name;
-        }
-
-        this.updateCompareSelector();
-    } catch (error) {
-        console.error('Failed to load simulation list:', error);
-    }
-};
+// The run list lives in the Runs browser (app-runs.js).
 
 App.prototype.deleteAllResults = async function() {
     const first = window.confirm(
         'Delete ALL simulation results?\n\n' +
         'This wipes every local *_sim* directory, every viz/data cache, ' +
-        'AND every remote *_sim* directory on Karolina.\n\n' +
+        'AND every remote *_sim* directory on every configured cluster.\n\n' +
         'This cannot be undone.'
     );
     if (!first) return;
@@ -150,10 +94,21 @@ App.prototype.loadResults = async function() {
     const statusEl = document.getElementById('results-status');
     const originalText = loadBtn.textContent;
 
-    const simName = this.selectedSimulation || document.getElementById('simulation-selector').value;
+    const simName = this.selectedSimulation;
     if (!simName) {
         statusEl.className = 'mesh-status error';
-        statusEl.textContent = 'Please select a simulation first';
+        statusEl.textContent = 'Click a run in Runs first';
+        statusEl.style.display = 'block';
+        return;
+    }
+    const run = this.runByName && this.runByName[simName];
+    if (run && !(run.local && run.local.results)) {
+        const where = Object.keys(run.remote).filter(c => run.remote[c].results)
+            .map(c => (this.runClusters[c] || { label: c }).label);
+        statusEl.className = 'mesh-status error';
+        statusEl.textContent = where.length
+            ? `The results of this run are on ${where.join(' and ')} - download them first`
+            : 'This run has no full results to load';
         statusEl.style.display = 'block';
         return;
     }
@@ -274,7 +229,7 @@ App.prototype.loadResults = async function() {
 
         // Iterations data
         if (data.iterations && data.iterations.length > 0) {
-            this.setIterationsData(data.iterations);
+            this.setIterationsData(data.iterations, simName);
             this.showIterationsChart();
             this.highlightIterationStep(0, this.resultsTimeSteps.length);
         } else {

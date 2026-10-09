@@ -1,4 +1,4 @@
-// app-video.js - Video export (local + remote Karolina)
+// app-video.js - Video export (local + remote cluster)
 
 App.prototype.setupVideoExport = function() {
     const exportBtn = document.getElementById('export-video');
@@ -9,8 +9,8 @@ App.prototype.setupVideoExport = function() {
     const statusEl = document.getElementById('video-status');
     const downloadLink = document.getElementById('video-download');
 
-    // Show remote button when in Karolina mode
-    if (this.runTarget === 'karolina') {
+    // Show remote button when a cluster target is selected
+    if (this.isRemote()) {
         remoteBtn.style.display = 'block';
     }
 
@@ -107,10 +107,10 @@ App.prototype.exportVideoRemote = async function() {
     const statusEl = document.getElementById('video-status');
     const downloadLink = document.getElementById('video-download');
 
-    const simName = this.selectedSimulation || document.getElementById('simulation-selector').value;
+    const simName = this.selectedSimulation;
     if (!simName) {
         statusEl.className = 'mesh-status error';
-        statusEl.textContent = 'Select a simulation first';
+        statusEl.textContent = 'Click a run in Runs first';
         statusEl.style.display = 'block';
         return;
     }
@@ -128,9 +128,9 @@ App.prototype.exportVideoRemote = async function() {
         const vizExists = checkResp.ok;
 
         if (!vizExists) {
-            // Step 1a: Generate viz data on Karolina
-            progressText.textContent = 'Generating viz data on Karolina...';
-            const vizJob = await this.karolinaRunner.generateRemoteViz(simName);
+            // Step 1a: Generate viz data on the cluster
+            progressText.textContent = `Generating viz data on ${this.clusterLabel()}...`;
+            const vizJob = await this.clusterRunner.generateRemoteViz(simName);
             const vizJobId = vizJob.job_id;
 
             statusEl.className = 'mesh-status';
@@ -139,7 +139,7 @@ App.prototype.exportVideoRemote = async function() {
 
             // Wait for viz generation to complete
             await new Promise((resolve, reject) => {
-                this.karolinaRunner.startVizPolling(vizJobId, (status) => {
+                this.clusterRunner.startVizPolling(vizJobId, (status) => {
                     const pct = Math.round(status.progress * 0.2);
                     progressFill.style.width = `${pct}%`;
                     progressText.textContent = status.message || `Generating viz data (${status.status})...`;
@@ -154,9 +154,9 @@ App.prototype.exportVideoRemote = async function() {
 
             progressFill.style.width = '20%';
 
-            // Step 1b: Download viz data from Karolina
+            // Step 1b: Download viz data from the cluster
             progressText.textContent = 'Downloading viz data...';
-            await this.karolinaRunner.downloadVizData(simName, (data) => {
+            await this.clusterRunner.downloadVizData(simName, (data) => {
                 const pct = data.bytes_total > 0
                     ? 20 + Math.round(20 * data.bytes_done / data.bytes_total) : 20;
                 progressFill.style.width = `${pct}%`;
@@ -168,8 +168,7 @@ App.prototype.exportVideoRemote = async function() {
 
         // Step 2: Load results into viewer
         progressText.textContent = 'Loading results into viewer...';
-        this.selectedSimulation = simName;
-        document.getElementById('simulation-selector').value = simName;
+        this.setCurrentRun(simName);
         await this.loadResults();
         progressFill.style.width = '50%';
 

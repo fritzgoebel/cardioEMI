@@ -1,8 +1,10 @@
-// karolina-runner.js - Karolina supercomputer job management via polling
+// cluster-runner.js - remote HPC cluster job management via polling.
+// One instance per cluster; all endpoints live under /api/cluster/<id>/.
 
-class KarolinaRunner {
-    constructor(apiBase = '/api/karolina') {
-        this.apiBase = apiBase;
+class ClusterRunner {
+    constructor(clusterId) {
+        this.clusterId = clusterId;
+        this.apiBase = `/api/cluster/${clusterId}`;
         this.pollIntervals = {};  // jobId -> intervalId
         this.pollIntervalMs = 5000;
     }
@@ -13,8 +15,9 @@ class KarolinaRunner {
         return data;  // { available, containers: { dolfinx, ginkgo } }
     }
 
-    async submit(options) {
-        const response = await fetch(`${this.apiBase}/submit`, {
+    // One job per (mesh, rank count); see /submit-batch in server.py.
+    async submitBatch(options) {
+        const response = await fetch(`${this.apiBase}/submit-batch`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(options)
@@ -23,7 +26,18 @@ class KarolinaRunner {
         if (!response.ok) {
             throw new Error(data.error || 'Submission failed');
         }
-        return data;
+        return data;  // { jobs, failed, message }
+    }
+
+    async fetchBatchMeshInfo(meshNames) {
+        const response = await fetch(`${this.apiBase}/meshes/batch-info`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ meshes: meshNames })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Failed to fetch mesh info');
+        return data.meshes || {};
     }
 
     async listJobs() {
@@ -32,17 +46,24 @@ class KarolinaRunner {
         return data.jobs || [];
     }
 
-    startPolling(jobId, onStatusUpdate) {
+    // outName: the job's run folder, so the server finds its log even after a
+    // restart (when it no longer knows the job).
+    startPolling(jobId, onStatusUpdate, outName) {
         this.stopPolling(jobId);
-        const poll = () => this._poll(jobId, onStatusUpdate);
+        const poll = () => this._poll(jobId, onStatusUpdate, outName);
         poll();
         this.pollIntervals[jobId] = setInterval(poll, this.pollIntervalMs);
     }
 
-    async _poll(jobId, onStatusUpdate) {
+    async fetchStatus(jobId, outName) {
+        const q = outName ? `?out_name=${encodeURIComponent(outName)}` : '';
+        const response = await fetch(`${this.apiBase}/status/${jobId}${q}`);
+        return await response.json();
+    }
+
+    async _poll(jobId, onStatusUpdate, outName) {
         try {
-            const response = await fetch(`${this.apiBase}/status/${jobId}`);
-            const data = await response.json();
+            const data = await this.fetchStatus(jobId, outName);
             onStatusUpdate(data);
 
             const terminal = ['COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY'];
@@ -50,7 +71,7 @@ class KarolinaRunner {
                 this.stopPolling(jobId);
             }
         } catch (error) {
-            console.error(`Karolina status poll failed for job ${jobId}:`, error);
+            console.error(`[${this.clusterId}] status poll failed for job ${jobId}:`, error);
         }
     }
 
@@ -138,12 +159,6 @@ class KarolinaRunner {
         return data;
     }
 
-    async listRemoteSimulations() {
-        const response = await fetch(`${this.apiBase}/remote-simulations`);
-        const data = await response.json();
-        return data.simulations || [];
-    }
-
     async listRemoteMeshes() {
         const response = await fetch(`${this.apiBase}/meshes`);
         const data = await response.json();
@@ -219,6 +234,19 @@ class KarolinaRunner {
             }
         }
         return { success: true, name };
+    }
+
+    // Membrane-only (possibly coarsened) preview of a cluster mesh; resolves
+    // to {path, metadata, cached} with path loadable by MeshLoader.loadFrom.
+    async fetchMeshPreview(meshName, opts = {}) {
+        const response = await fetch(`${this.apiBase}/meshes/preview`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mesh: meshName, ...opts })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Preview failed');
+        return data;
     }
 
     async fetchMeshMetadata(meshName) {
@@ -367,4 +395,72 @@ class KarolinaRunner {
         }
         return { message: 'Download complete' };
     }
+
+    // --- Connection (persistent ControlMaster; OTP for 2FA clusters) ---
+
+    async connect() {
+        const response = await fetch(`${this.apiBase}/connect`, { method: 'POST' });
+        return await response.json();  // {phase, prompt, error}
+    }
+
+    async connectState() {
+        const response = await fetch(`${this.apiBase}/connect/state`);
+        return await response.json();
+    }
+
+    async connectInput(text) {
+        const response = await fetch(`${this.apiBase}/connect/input`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text })
+        });
+        return await response.json();
+    }
+
+    // Abandon a login in progress (OTP window closed), so the next Connect
+    // starts a fresh one instead of reusing a prompt the server has dropped.
+    async connectCancel() {
+        const response = await fetch(`${this.apiBase}/connect/cancel`, { method: 'POST' });
+        return await response.json();
+    }
+
+    async disconnect() {
+        const response = await fetch(`${this.apiBase}/disconnect`, { method: 'POST' });
+        return await response.json();
+    }
+
+    // --- Install (dirs + code sync + container SIFs), SSE stream ---
+
+    async install(onOutput) {
+        const response = await fetch(`${this.apiBase}/install`, { method: 'POST' });
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let result = null;
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                try {
+                    const data = JSON.parse(line.slice(6));
+                    if (data.type === 'output' && onOutput) {
+                        onOutput(data.text);
+                    } else if (data.type === 'complete') {
+                        result = data;
+                    } else if (data.type === 'error') {
+                        throw new Error(data.message);
+                    }
+                } catch (e) {
+                    if (e.message && !e.message.includes('Unexpected')) throw e;
+                }
+            }
+        }
+        return result || { success: false };
+    }
 }
+

@@ -1,0 +1,51 @@
+clusters:
+  karolina:
+    label: Karolina
+    host: karolina
+    needs_otp: false
+    remote_path: /scratch/project/eu-26-11/fritz/cardioEMI
+    env_unset:
+    - SINGULARITY_BINDPATH
+    - SINGULARITYENV_LD_PRELOAD
+    - LD_PRELOAD
+    job_env:
+      FI_PROVIDER: tcp
+      OMP_NUM_THREADS: '1'
+    srun_flags: --cpu-bind=cores --distribution=block:block
+    slurm:
+      account: eu-26-11
+      partition: qcpu_exp
+      partitions:
+      - qcpu_exp
+      - qcpu
+      - qgpu_exp
+      - qgpu
+      ntasks_per_node: 128
+      cores_per_node: 128
+      walltime: 01:00:00
+  vega:
+    label: Vega
+    host: login.vega.izum.si
+    user: eufritzg
+    identity_file: ~/.ssh/fgoebel_vega
+    needs_otp: true
+    remote_path: /ceph/hpc/home/eufritzg/cardioEMI
+    slurm:
+      account: d2026d09-189-users
+      partition: cpu
+      partitions:
+      - cpu
+      - dev
+      - longcpu
+      - largemem
+      - gpu
+      ntasks_per_node: 128
+      cores_per_node: 128
+      walltime: 01:00:00
+    env_unset: []
+    job_env:
+      FI_PROVIDER: tcp
+      OMP_NUM_THREADS: '1'
+    # Vega's SLURM has MpiDefault=none (Karolina: pmi2); without PMI the
+    # container's MPICH starts every rank as its own size-1 MPI world.
+    srun_flags: --mpi=pmi2 --cpu-bind=cores --distribution=block:block

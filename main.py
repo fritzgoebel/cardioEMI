@@ -16,13 +16,17 @@ from ionic_model       import *
 from native_assembly   import assemble_block_to_coo
 from matis_assembly    import assemble_block_to_matis
 
+# Paths next to this script, not the working directory: cluster jobs run with
+# their own run folder as cwd (Ginkgo's BDDC writes IF_<rank>.txt there).
+_HERE = Path(__file__).resolve().parent
+
 # Optional Ginkgo solver backend
 try:
     import sys
     import glob
     import importlib.util
-    sys.path.insert(0, 'dolfinx-ginkgo/python')
-    sys.path.insert(0, 'dolfinx-ginkgo/build')
+    sys.path.insert(0, str(_HERE / 'dolfinx-ginkgo/python'))
+    sys.path.insert(0, str(_HERE / 'dolfinx-ginkgo/build'))
     # Preload system-installed _cpp.so if available (e.g. Apptainer container
     # where the .so is at /usr/local but Python wrappers are on the bind mount)
     _sys_cpp = glob.glob('/usr/local/dolfinx_ginkgo/_cpp*.so')
@@ -36,7 +40,7 @@ try:
 except (ImportError, OSError):
     # Fall back to loading _cpp from local build directory (Docker dev setup)
     try:
-        _cpp_modules = glob.glob('dolfinx-ginkgo/build/_cpp*.so')
+        _cpp_modules = glob.glob(str(_HERE / 'dolfinx-ginkgo/build/_cpp*.so'))
         if _cpp_modules:
             _spec = importlib.util.spec_from_file_location("_cpp", _cpp_modules[0])
             _cpp = importlib.util.module_from_spec(_spec)
@@ -50,7 +54,7 @@ except (ImportError, OSError):
         GINKGO_AVAILABLE = False
 
 # Options for the fenicsx form compiler optimization
-cache_dir       = f"{str(Path.cwd())}/.cache"
+cache_dir       = f"{str(_HERE)}/.cache"
 compile_options = ["-Ofast","-march=native"]
 jit_parameters  = {"cffi_extra_compile_args"  : compile_options,
                     "cache_dir"               : cache_dir,
@@ -123,8 +127,13 @@ if partition_mode == "component":
                 "Please specify original_mesh_file explicitly for component partitioning."
             )
 
+    # 'component' (default) keeps each ECS+cell tag pair on one rank; 'tag'
+    # gives every individual tag its own rank (e.g. to match a BDDC
+    # convergence theory stated per volume tag rather than per ECS+cell pair).
+    component_granularity = params.get("component_granularity", "component")
+
     if comm.rank == 0:
-        print(f"Using component-based partitioning (METIS)")
+        print(f"Using component-based partitioning (METIS, granularity={component_granularity})")
         print(f"  Colored mesh: {mesh_file}")
         print(f"  Original mesh (for components): {original_mesh_file}")
 
@@ -132,6 +141,26 @@ if partition_mode == "component":
         comm,
         colored_mesh_file=mesh_file,
         original_mesh_file=original_mesh_file,
+        ghost_mode=dfx.mesh.GhostMode.shared_facet,
+        granularity=component_granularity,
+    )
+
+    # Create additional connectivity
+    mesh.topology.create_connectivity(mesh.topology.dim, mesh.topology.dim)
+elif partition_mode == "cube":
+    # Weak-scaling meshes: one subdomain per plus cell, one per the ECS
+    # remainder of the same cube (2 * nx*ny*nz subdomains in total).
+    from mesh_partition import load_mesh_with_cube_partitioning
+
+    if comm.rank == 0:
+        print(f"Using cube-based partitioning (cell / cube-ECS subdomains)")
+        print(f"  Mesh: {mesh_file}")
+
+    mesh, subdomains, boundaries = load_mesh_with_cube_partitioning(
+        comm,
+        mesh_file=mesh_file,
+        geometry_params=params.get("cube_partition"),
+        ecs_tag=ECS_TAG,
         ghost_mode=dfx.mesh.GhostMode.shared_facet,
     )
 
@@ -431,6 +460,12 @@ ginkgo_cfg = params.get("ginkgo", {}) if use_ginkgo else {}
 # timestep solve, persisted into residuals.pickle['iter_history']. Opt-in because
 # Ginkgo's Record clones b/x/r each iter and PETSc's monitor pays an extra matvec.
 track_iter_residuals = bool(params.get("track_iter_residuals", False))
+
+# Benchmark mode: assemble the system matrix from the physics as usual, but
+# solve against a freshly drawn random vector each timestep instead of the
+# ionic-model RHS (weak/strong-scaling and solver studies).
+random_rhs      = bool(params.get("random_rhs", False))
+random_rhs_seed = int(params.get("random_rhs_seed", 0))
 use_native_assembly = use_ginkgo and ginkgo_cfg.get("native_assembly", False)
 
 use_dd_matrix = use_ginkgo and ginkgo_cfg.get("dd_matrix", False)
@@ -533,6 +568,14 @@ if not Dirichletbc:
 if use_ginkgo:
     if comm.rank == 0:
         print(f"Using Ginkgo solver backend")
+        if not Dirichletbc:
+            # No Dirichlet BCs anywhere -> singular system with the constant in
+            # the nullspace. Attached to the operator (Matrix and DdMatrix
+            # alike) and projected out by Ginkgo's CG, mirroring what
+            # A.setNullSpace() does on the PETSc side. Only CG projects, so
+            # gmres/bicgstab rely on b already being consistent (it is: the RHS
+            # is projected below via nullspace.remove(b)).
+            print("  pure Neumann: attaching constant nullspace to the operator")
 
     # Get Ginkgo-specific configuration (already loaded above for native_assembly check)
     gko_backend = ginkgo_cfg.get("backend", "omp")
@@ -562,6 +605,9 @@ if use_ginkgo:
         # Coarse nullspace: true only if ALL ranks have no Dirichlet BCs
         all_have_nullspace = comm.allreduce(int(local_nullspace), op=MPI.MIN)
         coarse_nullspace = bool(all_have_nullspace)
+        if bddc_cfg.get("repartition_coarse", True) is False and comm.rank == 0:
+            print("WARNING: ginkgo.bddc.repartition_coarse: false is ignored; "
+                  "the coarse problem is always repartitioned")
         bddc_config = {
             "local_solver": bddc_cfg.get("local_solver", "direct"),
             "inner_solver": bddc_cfg.get("inner_solver", None),
@@ -575,7 +621,12 @@ if use_ginkgo:
             "vertices": bddc_cfg.get("vertices", True),
             "edges": bddc_cfg.get("edges", True),
             "faces": bddc_cfg.get("faces", True),
-            "repartition_coarse": bddc_cfg.get("repartition_coarse", False),
+            # Always on: without it no rank holds a purely local part of the
+            # coarse matrix. A YAML asking for false is overridden (warned below).
+            "repartition_coarse": True,
+            "distributed_coarse": bddc_cfg.get("distributed_coarse", False),
+            "write_interfaces": bddc_cfg.get("write_interfaces", True),
+            "unanimous_connectivity": bddc_cfg.get("unanimous_connectivity", True),
             "constant_nullspace": bool(bddc_cfg.get("constant_nullspace", local_nullspace)),
             "coarse_constant_nullspace": False,
         }
@@ -894,7 +945,7 @@ if params["save_output"]:
         contrib_type = "nonzero matrix entries" if use_native_assembly else "local index set"
         print(f"Saved DOF contribution data ({len(vertex_contributors)} DOFs, based on {contrib_type})")
 
-    if matrix_to_vertex_local:
+    if use_native_assembly:
         # Native assembly: use matrix row ownership to determine vertex ranks
         # Each rank's matrix_to_vertex_local maps matrix_row -> mesh_vertex for owned rows
         # So we create (mesh_vertex, rank) pairs from each rank's mapping
@@ -1016,6 +1067,24 @@ residual_rel = []  # Relative residual norms (||r|| / ||b||) (final per timestep
 iter_history = []  # Per-timestep dict of per-iter residual trajectories (opt-in)
 #I_ion = dict()
 
+# Random-RHS mode has no linear form to assemble: build a zero-valued one just
+# to get the block vector layout (function spaces + restriction), then fill the
+# vector directly each timestep. Entries at Dirichlet DOFs stay random - those
+# rows are identity rows, so they only show up in the solution, not in the
+# solver behaviour.
+if random_rhs:
+    zero_source = dfx.fem.Constant(mesh, PETSc.ScalarType(0.0))
+    L = dfx.fem.form([inner(zero_source, v_dict[i]) * dx(i) for i in TAGS],
+                     jit_options=jit_parameters)
+
+    b       = multiphenicsx.fem.petsc.create_vector_block(L, restriction=restriction)
+    sol_vec = multiphenicsx.fem.petsc.create_vector_block(L, restriction=restriction)
+    rng     = np.random.default_rng(random_rhs_seed + comm.rank)
+
+    if comm.rank == 0:
+        print(f"Random RHS mode: matrix assembled from the physics, "
+              f"RHS redrawn every timestep (seed {random_rhs_seed})")
+
 if comm.rank == 0: print("\n#-----------SOLVE----------#")
 
 for time_step in range(params["time_steps"]):
@@ -1031,80 +1100,92 @@ for time_step in range(params["time_steps"]):
     else:
         stim_amp.value = 0.0
 
-    # init data structure for linear form
-    L_list = []
-
     # Update and assemble vector that is the RHS of the linear system
-    t1 = time.perf_counter() # Timestamp for assembly time-lapse      
+    t1 = time.perf_counter() # Timestamp for assembly time-lapse
+
+    if random_rhs:
+        # Benchmark mode: no ionic-model right-hand side. Draw a fresh random
+        # vector every timestep (owned entries only, one independent stream per
+        # rank) and refresh the ghost entries from their owners.
+        b.array[:] = rng.uniform(-1.0, 1.0, size=b.array.size)
+        b.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+
+        # Increment time
+        t += float(dt)
+
+    else:
+        # init data structure for linear form
+        L_list = []
+
     
-    for i in TAGS:
+        for i in TAGS:
 
-        membrane_i = membrane_tags[i]
+            membrane_i = membrane_tags[i]
         
-        v_i = v_dict[i]
+            v_i = v_dict[i]
 
-        L_i = 0    
+            L_i = 0    
 
-        for j in TAGS:                        
+            for j in TAGS:                        
             
-            if i != j:
+                if i != j:
             
-                membrane_ij = tuple(common_elements(membrane_i,membrane_tags[j]))   
+                    membrane_ij = tuple(common_elements(membrane_i,membrane_tags[j]))   
                 
-                if i < j:
-                    ij_tuple = (i,j)                                        
-                    L_coeff  = 1
-                    with vij_dict[ij_tuple].x.petsc_vec.localForm() as v_local:
+                    if i < j:
+                        ij_tuple = (i,j)                                        
+                        L_coeff  = 1
+                        with vij_dict[ij_tuple].x.petsc_vec.localForm() as v_local:
 
-                        t_ODE = time.perf_counter()
+                            t_ODE = time.perf_counter()
                         
-                        I_ion[ij_tuple] = ionic_models[ij_tuple]._eval(v_local[:])          
+                            I_ion[ij_tuple] = ionic_models[ij_tuple]._eval(v_local[:])          
 
-                        ODEs_time += time.perf_counter() - t_ODE 
-                else:
-                    ij_tuple = (j,i)
-                    L_coeff  = -1                    
+                            ODEs_time += time.perf_counter() - t_ODE 
+                    else:
+                        ij_tuple = (j,i)
+                        L_coeff  = -1                    
                     
-                with fg_dict[ij_tuple].x.petsc_vec.localForm() as fg_local, vij_dict[ij_tuple].x.petsc_vec.localForm() as v_local:
+                    with fg_dict[ij_tuple].x.petsc_vec.localForm() as fg_local, vij_dict[ij_tuple].x.petsc_vec.localForm() as v_local:
 
-                    fg_local[:] = v_local[:] - tau * I_ion[ij_tuple]
+                        fg_local[:] = v_local[:] - tau * I_ion[ij_tuple]
 
-                L_i += L_coeff * inner(fg_dict[ij_tuple], v_i('+')) * dS(membrane_ij)
+                    L_i += L_coeff * inner(fg_dict[ij_tuple], v_i('+')) * dS(membrane_ij)
 
-                # external stimulus (time-switched by Constant)
-                if ECS_TAG in (i, j):
-                    L_i += L_coeff * tau * stim_amp * inner(stim_fun[i], v_i('+')) * dS(membrane_ij)
+                    # external stimulus (time-switched by Constant)
+                    if ECS_TAG in (i, j):
+                        L_i += L_coeff * tau * stim_amp * inner(stim_fun[i], v_i('+')) * dS(membrane_ij)
 
                                 
-        L_list.append(L_i)
+            L_list.append(L_i)
 
-    # Increment time
-    t += float(dt)
+        # Increment time
+        t += float(dt)
 
-    t_test = time.perf_counter()
+        t_test = time.perf_counter()
     
-    # create some data structures
-    if time_step == 0:
+        # create some data structures
+        if time_step == 0:
 
-        # Convert form to dolfinx form                    
-        L = dfx.fem.form(L_list, jit_options=jit_parameters) 
+            # Convert form to dolfinx form                    
+            L = dfx.fem.form(L_list, jit_options=jit_parameters) 
 
-        # Create right-hand side and solution vectors        
-        b       = multiphenicsx.fem.petsc.create_vector_block(L, restriction=restriction)
-        sol_vec = multiphenicsx.fem.petsc.create_vector_block(L, restriction=restriction)                
+            # Create right-hand side and solution vectors        
+            b       = multiphenicsx.fem.petsc.create_vector_block(L, restriction=restriction)
+            sol_vec = multiphenicsx.fem.petsc.create_vector_block(L, restriction=restriction)                
 
     
-    # Clear RHS vector to avoid accumulation and assemble RHS
-    b.array[:] = 0
-    b.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
-    multiphenicsx.fem.petsc.assemble_vector_block(b, L, a, bcs=bcs, restriction=restriction) # Assemble RHS vector        
+        # Clear RHS vector to avoid accumulation and assemble RHS
+        b.array[:] = 0
+        b.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+        multiphenicsx.fem.petsc.assemble_vector_block(b, L, a, bcs=bcs, restriction=restriction) # Assemble RHS vector        
         
-    # dump(b, 'output/bvec')
+        # dump(b, 'output/bvec')
         
-    # Neumann BC
-    if time_step == 0:
-        # Create solution vector
-        sol_vec = multiphenicsx.fem.petsc.create_vector_block(L, restriction=restriction)
+        # Neumann BC
+        if time_step == 0:
+            # Create solution vector
+            sol_vec = multiphenicsx.fem.petsc.create_vector_block(L, restriction=restriction)
 
     if not Dirichletbc:
         # if the timestep is not zero, b changes anyway and the nullspace must be removed
@@ -1169,28 +1250,32 @@ for time_step in range(params["time_steps"]):
         sys.stdout.write(f"RESIDUAL:{time_step}:{res_abs:.6e}:{res_rel:.6e}\n")
         sys.stdout.flush()
 
-    # Update ghost values
-    sol_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+    # Unpack the solution into the per-tag functions. With a random RHS the
+    # solution carries no physics (and v_ij feeds no ionic model), so this is
+    # only done when the fields are actually written out.
+    if not random_rhs or params["save_output"]:
+        # Update ghost values
+        sol_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
     
-    # Extract sub-components of solution
-    dofmap_list = (N_TAGS) * [V.dofmap]
-    with multiphenicsx.fem.petsc.BlockVecSubVectorWrapper(sol_vec, dofmap_list, restriction) as uij_wrapper:
-        for ui_ue_wrapper_local, component in zip(uij_wrapper, tuple(uh_dict.values())): 
-            with component.x.petsc_vec.localForm() as component_local:
-                component_local[:] = ui_ue_wrapper_local
+        # Extract sub-components of solution
+        dofmap_list = (N_TAGS) * [V.dofmap]
+        with multiphenicsx.fem.petsc.BlockVecSubVectorWrapper(sol_vec, dofmap_list, restriction) as uij_wrapper:
+            for ui_ue_wrapper_local, component in zip(uij_wrapper, tuple(uh_dict.values())): 
+                with component.x.petsc_vec.localForm() as component_local:
+                    component_local[:] = ui_ue_wrapper_local
 
-    for i in TAGS:
-        for j in TAGS:
-            if i < j:                
-                vij_dict[(i,j)].x.array[:] = uh_dict[i].x.array - uh_dict[j].x.array # TODO test other order?
+        for i in TAGS:
+            for j in TAGS:
+                if i < j:                
+                    vij_dict[(i,j)].x.array[:] = uh_dict[i].x.array - uh_dict[j].x.array # TODO test other order?
                 
     
-    # fill v for visualization
-    v.x.array[:] = uh_dict[ECS_TAG].x.array
+        # fill v for visualization
+        v.x.array[:] = uh_dict[ECS_TAG].x.array
 
-    for i in TAGS:
-        if i != ECS_TAG:
-            v.x.array[:] -= uh_dict[i].x.array
+        for i in TAGS:
+            if i != ECS_TAG:
+                v.x.array[:] -= uh_dict[i].x.array
 
 
     solve_time += time.perf_counter() - t1 # Add time lapsed to total solver time
@@ -1248,7 +1333,9 @@ if comm.rank == 0:
             pickle.dump({'abs': residual_abs, 'rel': residual_rel,
                          'iter_history': iter_history}, f)
     
-    if isinstance(params["ionic_model"], dict):
+    if random_rhs:
+        print(f"Ionic models: none (random RHS, seed {random_rhs_seed})")
+    elif isinstance(params["ionic_model"], dict):
         print("Ionic models:")
         for key, value in params["ionic_model"].items():
             print(f"  {key}: {value}")
